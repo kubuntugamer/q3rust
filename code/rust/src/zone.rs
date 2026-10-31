@@ -509,9 +509,9 @@ mod tests {
     #[test]
     fn free_tags_only_releases_matching_blocks() {
         let mut zone = Zone::new(ZONE_SIZE);
-        let a = zone.alloc(100, TAG_RENDERER).unwrap();
+        zone.alloc(100, TAG_RENDERER).unwrap();
         let b = zone.alloc(100, TAG_GENERAL).unwrap();
-        let c = zone.alloc(100, TAG_RENDERER).unwrap();
+        zone.alloc(100, TAG_RENDERER).unwrap();
 
         assert_eq!(zone.free_tags(TAG_RENDERER), 2);
         assert_eq!(zone.free_tags(TAG_RENDERER), 0);
