@@ -248,6 +248,11 @@ typedef struct searchpath_s {
 
 static	char		fs_gamedir[MAX_OSPATH];	// this will be a single file name with no separators
 static	cvar_t		*fs_debug;
+static	cvar_t		*fs_useUring;
+
+#if defined(__linux__)
+int Sys_UringHandleRead( void *vf, void *buf, int len );
+#endif
 static	cvar_t		*fs_homepath;
 static	cvar_t		*fs_basepath;
 static	cvar_t		*fs_basegame;
@@ -1269,6 +1274,12 @@ int FS_Read( void *buffer, int len, fileHandle_t f ) {
 	fs_readCount += len;
 
 	if (fsh[f].zipFile == qfalse) {
+#if defined(__linux__)
+		if ( fs_useUring && fs_useUring->integer &&
+			Sys_UringHandleRead( fsh[f].handleFiles.file.o, buf, len ) ) {
+			return len;
+		}
+#endif
 		remaining = len;
 		tries = 0;
 		while (remaining) {
@@ -2744,6 +2755,7 @@ static void FS_Startup( const char *gameName ) {
 	Com_Printf( "----- FS_Startup -----\n" );
 
 	fs_debug = Cvar_Get( "fs_debug", "0", 0 );
+	fs_useUring = Cvar_Get( "fs_useUring", "0", CVAR_ARCHIVE );
 	fs_copyfiles = Cvar_Get( "fs_copyfiles", "0", CVAR_INIT );
 	fs_cdpath = Cvar_Get ("fs_cdpath", Sys_DefaultCDPath(), CVAR_INIT );
 	fs_basepath = Cvar_Get ("fs_basepath", Sys_DefaultInstallPath(), CVAR_INIT );

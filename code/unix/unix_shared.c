@@ -441,3 +441,167 @@ unsigned int Sys_ProcessorCount()
   return sysconf(_SC_NPROCESSORS_ONLN);
 }
 #endif
+
+/*
+=============================================================================
+io_uring file reads (opt-in via fs_useUring, default 0)
+
+Ported from kubuntugamer/vkq3ng code/unix/linux_uring.c, stage 1 only:
+synchronous pread-style reads through a raw io_uring ring with no liburing
+dependency. Any failure returns 0 so FS_Read falls back to fread.
+No performance claim is made; this path is unbenchmarked.
+=============================================================================
+*/
+#include <linux/io_uring.h>
+#include <sys/syscall.h>
+#include <stdint.h>
+
+#ifdef SYS_io_uring_setup
+
+#define URING_QD 32
+
+typedef struct {
+	int ring_fd;
+	unsigned *sq_tail;
+	unsigned *sq_mask;
+	unsigned *sq_array;
+	struct io_uring_sqe *sqes;
+	unsigned *cq_head;
+	unsigned *cq_tail;
+	unsigned *cq_mask;
+	struct io_uring_cqe *cqes;
+	int ready;
+} uring_t;
+
+static uring_t uring;
+
+static unsigned uring_load_acquire(const unsigned *p) {
+	unsigned v;
+	__atomic_load(p, &v, __ATOMIC_ACQUIRE);
+	return v;
+}
+
+static void uring_store_release(unsigned *p, unsigned v) {
+	__atomic_store(p, &v, __ATOMIC_RELEASE);
+}
+
+static int Sys_UringInit(void) {
+	static int tried = 0;
+	struct io_uring_params params;
+	size_t sq_ring_sz, cq_ring_sz, sqes_sz;
+	void *sq_ptr, *cq_ptr;
+	long fd;
+
+	if (uring.ready) {
+		return 1;
+	}
+	if (tried) {
+		return 0;
+	}
+	tried = 1;
+
+	memset(&params, 0, sizeof(params));
+	fd = syscall(SYS_io_uring_setup, URING_QD, &params);
+	if (fd < 0) {
+		return 0;
+	}
+	uring.ring_fd = (int)fd;
+
+	sq_ring_sz = params.sq_off.array + params.sq_entries * sizeof(unsigned);
+	cq_ring_sz = params.cq_off.cqes + params.cq_entries * sizeof(struct io_uring_cqe);
+	sqes_sz = params.sq_entries * sizeof(struct io_uring_sqe);
+
+	sq_ptr = mmap(0, sq_ring_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, uring.ring_fd, IORING_OFF_SQ_RING);
+	cq_ptr = mmap(0, cq_ring_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, uring.ring_fd, IORING_OFF_CQ_RING);
+	if (sq_ptr == MAP_FAILED || cq_ptr == MAP_FAILED) {
+		if (sq_ptr != MAP_FAILED) munmap(sq_ptr, sq_ring_sz);
+		if (cq_ptr != MAP_FAILED) munmap(cq_ptr, cq_ring_sz);
+		close(uring.ring_fd);
+		return 0;
+	}
+	uring.sqes = mmap(0, sqes_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, uring.ring_fd, IORING_OFF_SQES);
+	if (uring.sqes == MAP_FAILED) {
+		munmap(sq_ptr, sq_ring_sz);
+		munmap(cq_ptr, cq_ring_sz);
+		close(uring.ring_fd);
+		return 0;
+	}
+
+	uring.sq_tail = (unsigned *)((char *)sq_ptr + params.sq_off.tail);
+	uring.sq_mask = (unsigned *)((char *)sq_ptr + params.sq_off.ring_mask);
+	uring.sq_array = (unsigned *)((char *)sq_ptr + params.sq_off.array);
+	uring.cq_head = (unsigned *)((char *)cq_ptr + params.cq_off.head);
+	uring.cq_tail = (unsigned *)((char *)cq_ptr + params.cq_off.tail);
+	uring.cq_mask = (unsigned *)((char *)cq_ptr + params.cq_off.ring_mask);
+	uring.cqes = (struct io_uring_cqe *)((char *)cq_ptr + params.cq_off.cqes);
+	uring.ready = 1;
+	return 1;
+}
+
+/* One ring round-trip: read len bytes at off into buf. Returns bytes or -1. */
+static long Sys_UringPReadOnce(int fd, void *buf, unsigned len, unsigned long long off) {
+	unsigned tail = uring_load_acquire(uring.sq_tail);
+	unsigned index = tail & *uring.sq_mask;
+	struct io_uring_sqe *sqe = &uring.sqes[index];
+	unsigned head;
+	long res;
+
+	memset(sqe, 0, sizeof(*sqe));
+	sqe->opcode = IORING_OP_READ;
+	sqe->fd = fd;
+	sqe->off = off;
+	sqe->addr = (unsigned long long)(uintptr_t)buf;
+	sqe->len = len;
+	uring.sq_array[index] = index;
+	uring_store_release(uring.sq_tail, tail + 1);
+
+	if (syscall(SYS_io_uring_enter, uring.ring_fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0) < 0) {
+		return -1;
+	}
+
+	head = uring_load_acquire(uring.cq_head);
+	res = uring.cqes[head & *uring.cq_mask].res;
+	uring_store_release(uring.cq_head, head + 1);
+	return res;
+}
+
+/*
+Reads exactly len bytes from stdio FILE *vf through the ring. Returns 1 on
+success with the stdio position advanced by len. Returns 0 on any shortfall
+or error, with the position restored so the caller can fread instead.
+*/
+int Sys_UringHandleRead(void *vf, void *buf, int len) {
+	FILE *f = (FILE *)vf;
+	char *p = (char *)buf;
+	long off;
+	int fd, total = 0;
+
+	if (len <= 0) {
+		return 1;
+	}
+	if (!Sys_UringInit()) {
+		return 0;
+	}
+	fd = fileno(f);
+	off = ftell(f);
+	if (fd < 0 || off < 0) {
+		return 0;
+	}
+	while (total < len) {
+		long r = Sys_UringPReadOnce(fd, p + total, (unsigned)(len - total), (unsigned long long)(off + total));
+		if (r <= 0) {
+			fseek(f, off, SEEK_SET);
+			return 0;
+		}
+		total += (int)r;
+	}
+	return fseek(f, off + total, SEEK_SET) == 0;
+}
+
+#else
+
+int Sys_UringHandleRead(void *vf, void *buf, int len) {
+	return 0;
+}
+
+#endif
