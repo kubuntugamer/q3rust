@@ -7,6 +7,7 @@ pub mod cbuf;
 pub mod cmd;
 pub mod cvar;
 pub mod fs;
+pub mod hunk;
 pub mod pak;
 pub mod zone;
 
