@@ -317,7 +317,7 @@ fn u32_from(bytes: &[u8]) -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn u16v(out: &mut Vec<u8>, v: u16) {
@@ -331,7 +331,7 @@ mod tests {
     /// Builds a classic single-disk zip with the given entries. `method` is
     /// written to the headers but the payload is always the raw bytes, which
     /// is only meaningful for stored entries.
-    fn build_zip(prefix: &[u8], files: &[(&str, &[u8], u16)]) -> Vec<u8> {
+    pub(crate) fn build_zip(prefix: &[u8], files: &[(&str, &[u8], u16)]) -> Vec<u8> {
         let mut out = prefix.to_vec();
         let mut central = Vec::new();
 

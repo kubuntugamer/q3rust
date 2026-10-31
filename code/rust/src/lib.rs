@@ -6,6 +6,7 @@
 pub mod cbuf;
 pub mod cmd;
 pub mod cvar;
+pub mod fs;
 pub mod pak;
 pub mod zone;
 
