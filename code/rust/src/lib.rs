@@ -8,6 +8,7 @@ pub mod cmd;
 pub mod cvar;
 pub mod fs;
 pub mod hunk;
+pub mod model;
 pub mod pak;
 pub mod ref_types;
 pub mod refexport;
