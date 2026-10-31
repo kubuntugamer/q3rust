@@ -125,7 +125,7 @@ ifeq ($(PLATFORM),linux)
   # bk001205 - took out -O to get assertions (NDEBUG)
   # bk001206 - MALLOC_CHECK in addition to ZONE_DEBUG
   # TTimo 03/30/2001 temporary took out -Werror for initial merge
-  DEBUG_CFLAGS = $(BASE_CFLAGS) -g  -Wall -Werror
+  DEBUG_CFLAGS = $(BASE_CFLAGS) -g  -Wall
   DEBUG_CFLAGS += -DNO_MOUSEGRAB
   DEBUG_CFLAGS += -O
 #  DEBUG_CFLAGS=$(BASE_CFLAGS) -g  -Wall -O
@@ -214,7 +214,7 @@ BASE_CFLAGS =  -pipe
 
 GL_CFLAGS = -I$(MESADIR)/include -I/usr/X11R6/include
 
-DEBUG_CFLAGS=$(BASE_CFLAGS) -g  -Wall -Werror
+DEBUG_CFLAGS=$(BASE_CFLAGS) -g  -Wall
 ifeq ($(ARCH),axp)
 CC=pgcc
 RELEASE_CFLAGS=$(BASE_CFLAGS) -DNDEBUG -O6 -ffast-math -funroll-loops -fomit-frame-pointer -fexpensive-optimizations
