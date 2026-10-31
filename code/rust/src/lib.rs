@@ -6,6 +6,7 @@
 pub mod cbuf;
 pub mod cmd;
 pub mod cvar;
+pub mod zone;
 
 /// Maximum length of a path, matching `MAX_OSPATH` in the C code.
 pub const MAX_OSPATH: usize = 256;
