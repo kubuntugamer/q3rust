@@ -56,7 +56,7 @@ fn atof(s: &str) -> f32 {
 }
 
 /// Parses a leading integer the way C `atoi` does, returning 0 on bad input.
-fn atoi(s: &str) -> i32 {
+pub(crate) fn atoi(s: &str) -> i32 {
     let t = s.trim_start();
     let end = t
         .char_indices()

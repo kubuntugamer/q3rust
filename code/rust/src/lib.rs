@@ -4,6 +4,7 @@
 //! replace any of it yet. Modules are added one at a time in later phases.
 
 pub mod cbuf;
+pub mod cmd;
 pub mod cvar;
 
 /// Maximum length of a path, matching `MAX_OSPATH` in the C code.
