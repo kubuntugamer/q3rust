@@ -3,6 +3,8 @@
 //! Phase 1 scaffold: this crate builds beside the C code and does not
 //! replace any of it yet. Modules are added one at a time in later phases.
 
+pub mod cbuf;
+
 /// Maximum length of a path, matching `MAX_OSPATH` in the C code.
 pub const MAX_OSPATH: usize = 256;
 
