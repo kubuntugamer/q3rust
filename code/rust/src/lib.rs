@@ -9,6 +9,8 @@ pub mod cvar;
 pub mod fs;
 pub mod hunk;
 pub mod pak;
+pub mod ref_types;
+pub mod refexport;
 pub mod zone;
 
 /// Maximum length of a path, matching `MAX_OSPATH` in the C code.
