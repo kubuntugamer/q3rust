@@ -1,0 +1,8 @@
+[package]
+name = "q3rust"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "Rust port of the Quake III Arena engine core (Phase 1 scaffold)"
+
+[dependencies]
