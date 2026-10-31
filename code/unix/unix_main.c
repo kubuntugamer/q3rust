@@ -494,7 +494,7 @@ void Sys_ConsoleInputInit()
               characters  EOF,  EOL,  EOL2, ERASE, KILL, REPRINT,
               STATUS, and WERASE, and buffers by lines.
      ISIG: when any of the characters  INTR,  QUIT,  SUSP,  or
-              DSUSP are received, generate the corresponding sig­
+              DSUSP are received, generate the corresponding sigï¿½
               nal
     */              
     tc.c_lflag &= ~(ECHO | ICANON);
@@ -730,6 +730,8 @@ void *Sys_LoadDll( const char *name, char *fqpath ,
   snprintf (fname, sizeof(fname), "%saxp.so", name);
 #elif defined __mips__
   snprintf (fname, sizeof(fname), "%smips.so", name);
+#elif defined __x86_64__
+  snprintf (fname, sizeof(fname), "%sx86_64.so", name);
 #else
 #error Unknown arch
 #endif
