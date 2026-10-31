@@ -6,8 +6,12 @@
 //! and the name-to-value tables), and [`Parser::parse_shader`] is the
 //! `ParseShader` driver with the shader-level directives
 //! (`deformVertexes`, `skyParms`, `sort`, `surfaceparm`, `q3map_sun`,
-//! ...). What happens *after* parsing — the `FinishShader` optimisation
-//! pass — is not ported yet.
+//! ...). [`ShaderTextIndex`] is the last piece: `COM_Compress`,
+//! `generateHashValue`, and `ScanAndLoadShaderFiles`'s combined-text
+//! table as queried by `FindShaderInShaderText`, so a shader name finds
+//! its definition and hands it straight to [`Parser::parse_shader`].
+//! What happens *after* parsing — the `FinishShader` optimisation pass
+//! — is not ported yet.
 //!
 //! Two deliberate differences from the C:
 //!
@@ -62,6 +66,10 @@ pub const GLS_ATEST_GE_80: u32 = 0x4000_0000;
 
 /// `MAX_SHADER_DEFORMS` from `tr_local.h`.
 pub const MAX_SHADER_DEFORMS: usize = 3;
+/// `MAX_SHADERTEXT_HASH` from `tr_shader.c` — the label hash buckets.
+pub const MAX_SHADERTEXT_HASH: usize = 2048;
+/// `MAX_SHADER_FILES` from `tr_shader.c`.
+pub const MAX_SHADER_FILES: usize = 4096;
 
 // Contents and surface flags from code/game/surfaceflags.h — the subset
 // the `surfaceparm` table references.
@@ -565,6 +573,34 @@ impl<'a> Parser<'a> {
             let c = self.data[self.pos];
             self.pos += 1;
             if c == b'\n' {
+                break;
+            }
+        }
+    }
+
+    /// The current byte offset into the text — the `oldp` the C keeps
+    /// around `COM_ParseExt` calls.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// `SkipBracedSection`: run tokens until the brace depth returns to
+    /// zero. The C's do-while runs at least once, so text with no
+    /// opening brace consumes exactly one token — and a stray `}`
+    /// before any `{` drives the depth negative until a `{` balances
+    /// it, both reproduced by the signed depth here.
+    pub fn skip_braced_section(&mut self) {
+        let mut depth: i32 = 0;
+        loop {
+            let token = self.next(true);
+            if token.len() == 1 {
+                if token == "{" {
+                    depth += 1;
+                } else if token == "}" {
+                    depth -= 1;
+                }
+            }
+            if depth == 0 || self.at_end() {
                 break;
             }
         }
@@ -1473,6 +1509,174 @@ impl<'a> Parser<'a> {
                 b.sin() as f32,
             ],
         });
+    }
+}
+
+/// `COM_Compress`: strips both comment styles, collapses runs of
+/// newlines to one `\n` and runs of spaces/tabs to one space ahead of
+/// the next token, keeps quoted strings verbatim, and drops trailing
+/// whitespace. `ScanAndLoadShaderFiles` runs it over each file as it is
+/// appended.
+pub fn compress_text(text: &str) -> String {
+    let data = text.as_bytes();
+    // Bytes are only ever deleted, and always at ASCII boundaries that
+    // cannot sit inside a multi-byte character, so the result is still
+    // valid UTF-8.
+    let mut out: Vec<u8> = Vec::with_capacity(text.len());
+    let mut i = 0;
+    let mut newline = false;
+    let mut whitespace = false;
+
+    while i < data.len() {
+        let c = data[i];
+        if c == b'/' && data.get(i + 1) == Some(&b'/') {
+            while i < data.len() && data[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == b'/' && data.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i < data.len() && !(data[i] == b'*' && data.get(i + 1) == Some(&b'/')) {
+                i += 1;
+            }
+            if i < data.len() {
+                i += 2;
+            }
+        } else if c == b'\n' || c == b'\r' {
+            newline = true;
+            i += 1;
+        } else if c == b' ' || c == b'\t' {
+            whitespace = true;
+            i += 1;
+        } else {
+            if newline {
+                out.push(b'\n');
+                newline = false;
+                whitespace = false;
+            }
+            if whitespace {
+                out.push(b' ');
+                whitespace = false;
+            }
+            if c == b'"' {
+                out.push(b'"');
+                i += 1;
+                while i < data.len() && data[i] != b'"' {
+                    out.push(data[i]);
+                    i += 1;
+                }
+                if i < data.len() {
+                    out.push(b'"');
+                    i += 1;
+                }
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+/// `generateHashValue`: the renderer's name hash — lowercased, stopping
+/// at the extension, `\` folded to `/`, `letter * (i + 119)` summed in
+/// `long`, folded by `hash ^ hash>>10 ^ hash>>20`, then masked to
+/// `size`. (`PATH_SEP` is `/` on this platform, so its conversion is a
+/// no-op after the backslash fold; `tolower` on non-ASCII bytes is
+/// skipped — shader names are ASCII.)
+pub fn generate_hash_value(name: &str, size: usize) -> usize {
+    let bytes = name.as_bytes();
+    let mut hash: i64 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let mut letter = bytes[i].to_ascii_lowercase();
+        if letter == b'.' {
+            break;
+        }
+        if letter == b'\\' {
+            letter = b'/';
+        }
+        hash += letter as i64 * (i as i64 + 119);
+        i += 1;
+    }
+    hash ^= hash >> 10;
+    hash ^= hash >> 20;
+    (hash & (size as i64 - 1)) as usize
+}
+
+/// The combined text of every `.shader` file plus its label hash table:
+/// `ScanAndLoadShaderFiles` builds this, `FindShaderInShaderText`
+/// queries it.
+pub struct ShaderTextIndex {
+    text: String,
+    /// Per-bucket label offsets into `text`, in text order.
+    buckets: Vec<Vec<usize>>,
+}
+
+impl ShaderTextIndex {
+    /// `ScanAndLoadShaderFiles`: the files are concatenated in the C's
+    /// order — reverse, each preceded by a newline and `COM_Compress`ed
+    /// — then every label is indexed. The C's per-file boundary guard
+    /// trips on that reversed layout and indexes only the first shader
+    /// of all but one file, which `FindShaderInShaderText`'s linear
+    /// fallback masks; the port simply indexes everything.
+    pub fn build(files: &[&str]) -> ShaderTextIndex {
+        let files = &files[..files.len().min(MAX_SHADER_FILES)];
+
+        let mut text = String::new();
+        for file in files.iter().rev() {
+            text.push('\n');
+            text.push_str(&compress_text(file));
+        }
+
+        let mut buckets = vec![Vec::new(); MAX_SHADERTEXT_HASH];
+        let mut parser = Parser::new(&text);
+        loop {
+            let old = parser.position();
+            let token = parser.next(true);
+            if token.is_empty() {
+                break;
+            }
+            buckets[generate_hash_value(token, MAX_SHADERTEXT_HASH)].push(old);
+            parser.skip_braced_section();
+        }
+
+        ShaderTextIndex { text, buckets }
+    }
+
+    /// The combined shader text.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// `FindShaderInShaderText`: the text following the shader's name
+    /// label — where `ParseShader` picks up — or `None`. The hash
+    /// bucket is tried first and the whole text scanned as the
+    /// fallback, exactly as the C walks it; names are matched
+    /// case-insensitively (`Q_stricmp`).
+    pub fn find(&self, name: &str) -> Option<&str> {
+        for &offset in &self.buckets[generate_hash_value(name, MAX_SHADERTEXT_HASH)] {
+            let mut parser = Parser {
+                data: self.text.as_bytes(),
+                pos: offset,
+                warnings: Vec::new(),
+            };
+            let token = parser.next(true);
+            if token.eq_ignore_ascii_case(name) {
+                return Some(&self.text[parser.position()..]);
+            }
+        }
+
+        let mut parser = Parser::new(&self.text);
+        loop {
+            let token = parser.next(true);
+            if token.is_empty() {
+                return None;
+            }
+            if token.eq_ignore_ascii_case(name) {
+                return Some(&self.text[parser.position()..]);
+            }
+            parser.skip_braced_section();
+        }
     }
 }
 
@@ -2483,5 +2687,141 @@ mod tests {
         assert_eq!(sun.light, [0.0, 0.0, 3.0]);
         assert!(sun.direction[0].abs() < 1e-6 && sun.direction[1].abs() < 1e-6);
         assert!((sun.direction[2] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn compress_collapses_whitespace_and_strips_comments() {
+        let input = "// header\n\n\n   textures/x   {\n\tmap textures/x // inline\n}\n\n\n";
+        assert_eq!(compress_text(input), "\ntextures/x {\nmap textures/x\n}");
+
+        assert_eq!(compress_text("a /* c */ b"), "a b");
+        // Trailing whitespace is dropped with nothing left to emit it.
+        assert_eq!(compress_text("x  \n\n"), "x");
+        // Newlines and spaces collapse independently: one newline, one
+        // space, and a newline swallows the spaces after it.
+        assert_eq!(compress_text("a\n\n   \nb   c"), "a\nb c");
+    }
+
+    #[test]
+    fn compress_keeps_quoted_strings_verbatim() {
+        assert_eq!(compress_text("a \"b   c\" d"), "a \"b   c\" d");
+        // Comment markers inside quotes are not comments.
+        assert_eq!(
+            compress_text("\"// not a comment\""),
+            "\"// not a comment\""
+        );
+    }
+
+    #[test]
+    fn hash_value_matches_the_c_formula() {
+        // Case, extension and backslash folding all happen before the
+        // sum, as in generateHashValue.
+        assert_eq!(
+            generate_hash_value("Textures/Foo", MAX_SHADERTEXT_HASH),
+            generate_hash_value("textures/foo", MAX_SHADERTEXT_HASH)
+        );
+        assert_eq!(
+            generate_hash_value("foo.shader", MAX_SHADERTEXT_HASH),
+            generate_hash_value("foo", MAX_SHADERTEXT_HASH)
+        );
+        assert_eq!(
+            generate_hash_value("foo\\bar", MAX_SHADERTEXT_HASH),
+            generate_hash_value("foo/bar", MAX_SHADERTEXT_HASH)
+        );
+        assert_eq!(generate_hash_value("", MAX_SHADERTEXT_HASH), 0);
+        for name in ["a", "textures/foo", "very/long/shader/name"] {
+            assert!(
+                generate_hash_value(name, MAX_SHADERTEXT_HASH) < MAX_SHADERTEXT_HASH,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_index_finds_and_parses_shaders() {
+        let one = "textures/one\n{\n{\n    map textures/one\n}\n}\n";
+        let two = "// a comment\ntextures/two\n{\n{\nmap textures/two\n}\n}\n";
+        let index = ShaderTextIndex::build(&[one, two]);
+
+        // The found text starts where ParseShader expects the '{'.
+        let found = index.find("textures/one").expect("textures/one");
+        let mut script = ShaderScript {
+            name: "textures/one".into(),
+            ..Default::default()
+        };
+        let mut parser = Parser::new(found);
+        parser.parse_shader(&mut script).unwrap();
+        assert_eq!(script.stages.len(), 1);
+        assert_eq!(
+            script.stages[0].bundle.map,
+            Some(TextureMap::File {
+                name: "textures/one".into(),
+                clamp: false
+            })
+        );
+
+        // Nested braces in the stage body walk correctly.
+        let found = index.find("textures/two").expect("textures/two");
+        let mut script = ShaderScript {
+            name: "textures/two".into(),
+            ..Default::default()
+        };
+        let mut parser = Parser::new(found);
+        parser.parse_shader(&mut script).unwrap();
+        assert_eq!(script.stages.len(), 1);
+
+        // Names compare case-insensitively (Q_stricmp).
+        assert!(index.find("TEXTURES/ONE").is_some());
+
+        // The extension drops out of the hash but not out of the
+        // comparison, so a filename never matches a shader name...
+        assert_eq!(index.find("textures/one.tga"), None);
+        // ...and neither does a name that was never defined.
+        assert_eq!(index.find("textures/missing"), None);
+    }
+
+    #[test]
+    fn duplicate_labels_resolve_in_combined_text_order() {
+        // ScanAndLoadShaderFiles appends the files in reverse, so the
+        // last-listed file's definition comes first in the combined
+        // text — and wins, as it does in the C's linear fallback.
+        let first = "textures/dup\n{\n{\nmap textures/from_a\n}\n}\n";
+        let second = "textures/dup\n{\n{\nmap textures/from_b\n}\n}\n";
+        let index = ShaderTextIndex::build(&[first, second]);
+
+        let found = index.find("textures/dup").expect("textures/dup");
+        let mut script = ShaderScript {
+            name: "textures/dup".into(),
+            ..Default::default()
+        };
+        let mut parser = Parser::new(found);
+        parser.parse_shader(&mut script).unwrap();
+        assert_eq!(
+            script.stages[0].bundle.map,
+            Some(TextureMap::File {
+                name: "textures/from_b".into(),
+                clamp: false
+            })
+        );
+    }
+
+    #[test]
+    fn the_index_tolerates_stray_tokens_and_caps_the_file_list() {
+        // A label with no braces: SkipBracedSection consumes exactly
+        // one token (its do-while runs once), and the scan carries on
+        // to the next label — as in the C.
+        let index = ShaderTextIndex::build(&["orphan textures/x\nreal\n{\nmap textures/y\n}\n"]);
+        assert!(index.find("orphan").is_some());
+        assert!(index.find("real").is_some());
+
+        // Files beyond MAX_SHADER_FILES are dropped, as the C's
+        // buffers[MAX_SHADER_FILES] cap drops them.
+        let filler = "textures/filler\n{\nmap textures/filler\n}\n";
+        let extra = "textures/overflow\n{\nmap textures/overflow\n}\n";
+        let mut files = vec![filler; MAX_SHADER_FILES];
+        files.push(extra);
+        let index = ShaderTextIndex::build(&files);
+        assert!(index.find("textures/filler").is_some());
+        assert_eq!(index.find("textures/overflow"), None);
     }
 }
