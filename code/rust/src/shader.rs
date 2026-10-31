@@ -1,14 +1,13 @@
 //! Shader script parsing, ported from `code/renderer/tr_shader.c`.
 //!
-//! This phase ports the tokenizer and the *stage* half of the shader
-//! parser: [`Parser::next`] is `COM_ParseExt`, and [`Parser::parse_stage`]
-//! is `ParseStage` together with everything under it — `ParseVector`,
-//! `ParseWaveForm`, `ParseTexMod` and the name-to-value tables
-//! (`NameToAFunc`, `NameToSrcBlendMode`, `NameToDstBlendMode`,
-//! `NameToGenFunc`). The shader-level directives (`deformVertexes`,
-//! `skyParms`, `sort`, `surfaceparm`, ...) and the `ParseShader` driver
-//! arrive with the next phase, which is why [`ShaderScript`] currently
-//! only carries the fields stage parsing touches.
+//! The tokenizer — [`Parser::next`] is `COM_ParseExt` — drives both
+//! halves of the port. [`Parser::parse_stage`] is `ParseStage` with
+//! everything under it (`ParseVector`, `ParseWaveForm`, `ParseTexMod`
+//! and the name-to-value tables), and [`Parser::parse_shader`] is the
+//! `ParseShader` driver with the shader-level directives
+//! (`deformVertexes`, `skyParms`, `sort`, `surfaceparm`, `q3map_sun`,
+//! ...). What happens *after* parsing — the `FinishShader` optimisation
+//! pass — is not ported yet.
 //!
 //! Two deliberate differences from the C:
 //!
@@ -60,6 +59,82 @@ pub const GLS_DEPTHFUNC_EQUAL: u32 = 0x0002_0000;
 pub const GLS_ATEST_GT_0: u32 = 0x1000_0000;
 pub const GLS_ATEST_LT_80: u32 = 0x2000_0000;
 pub const GLS_ATEST_GE_80: u32 = 0x4000_0000;
+
+/// `MAX_SHADER_DEFORMS` from `tr_local.h`.
+pub const MAX_SHADER_DEFORMS: usize = 3;
+
+// Contents and surface flags from code/game/surfaceflags.h — the subset
+// the `surfaceparm` table references.
+pub const CONTENTS_LAVA: u32 = 8;
+pub const CONTENTS_SLIME: u32 = 16;
+pub const CONTENTS_WATER: u32 = 32;
+pub const CONTENTS_FOG: u32 = 64;
+pub const CONTENTS_AREAPORTAL: u32 = 0x8000;
+pub const CONTENTS_PLAYERCLIP: u32 = 0x1_0000;
+pub const CONTENTS_MONSTERCLIP: u32 = 0x2_0000;
+pub const CONTENTS_CLUSTERPORTAL: u32 = 0x10_0000;
+pub const CONTENTS_DONOTENTER: u32 = 0x20_0000;
+pub const CONTENTS_ORIGIN: u32 = 0x100_0000;
+pub const CONTENTS_DETAIL: u32 = 0x800_0000;
+pub const CONTENTS_STRUCTURAL: u32 = 0x1000_0000;
+pub const CONTENTS_TRANSLUCENT: u32 = 0x2000_0000;
+pub const CONTENTS_NODROP: u32 = 0x8000_0000;
+pub const SURF_NODAMAGE: u32 = 0x1;
+pub const SURF_SLICK: u32 = 0x2;
+pub const SURF_SKY: u32 = 0x4;
+pub const SURF_LADDER: u32 = 0x8;
+pub const SURF_NOIMPACT: u32 = 0x10;
+pub const SURF_NOMARKS: u32 = 0x20;
+pub const SURF_FLESH: u32 = 0x40;
+pub const SURF_NODRAW: u32 = 0x80;
+pub const SURF_HINT: u32 = 0x100;
+pub const SURF_NOLIGHTMAP: u32 = 0x400;
+pub const SURF_POINTLIGHT: u32 = 0x800;
+pub const SURF_METALSTEPS: u32 = 0x1000;
+pub const SURF_NOSTEPS: u32 = 0x2000;
+pub const SURF_NONSOLID: u32 = 0x4000;
+pub const SURF_LIGHTFILTER: u32 = 0x8000;
+pub const SURF_ALPHASHADOW: u32 = 0x1_0000;
+pub const SURF_NODLIGHT: u32 = 0x2_0000;
+pub const SURF_DUST: u32 = 0x4_0000;
+
+/// `infoParms[]` from `tr_shader.c` — the `surfaceparm` table, as
+/// `(name, surfaceFlags, contents)`. The C's `clearSolid` column is
+/// compiled out (`#if 0`), so it is not carried over.
+const INFO_PARMS: &[(&str, u32, u32)] = &[
+    ("water", 0, CONTENTS_WATER),
+    ("slime", 0, CONTENTS_SLIME),
+    ("lava", 0, CONTENTS_LAVA),
+    ("playerclip", 0, CONTENTS_PLAYERCLIP),
+    ("monsterclip", 0, CONTENTS_MONSTERCLIP),
+    ("nodrop", 0, CONTENTS_NODROP),
+    ("nonsolid", SURF_NONSOLID, 0),
+    ("origin", 0, CONTENTS_ORIGIN),
+    ("trans", 0, CONTENTS_TRANSLUCENT),
+    ("detail", 0, CONTENTS_DETAIL),
+    ("structural", 0, CONTENTS_STRUCTURAL),
+    ("areaportal", 0, CONTENTS_AREAPORTAL),
+    ("clusterportal", 0, CONTENTS_CLUSTERPORTAL),
+    ("donotenter", 0, CONTENTS_DONOTENTER),
+    ("fog", 0, CONTENTS_FOG),
+    ("sky", SURF_SKY, 0),
+    ("lightfilter", SURF_LIGHTFILTER, 0),
+    ("alphashadow", SURF_ALPHASHADOW, 0),
+    ("hint", SURF_HINT, 0),
+    ("slick", SURF_SLICK, 0),
+    ("noimpact", SURF_NOIMPACT, 0),
+    ("nomarks", SURF_NOMARKS, 0),
+    ("ladder", SURF_LADDER, 0),
+    ("nodamage", SURF_NODAMAGE, 0),
+    ("metalsteps", SURF_METALSTEPS, 0),
+    ("flesh", SURF_FLESH, 0),
+    ("nosteps", SURF_NOSTEPS, 0),
+    ("nodraw", SURF_NODRAW, 0),
+    ("pointlight", SURF_POINTLIGHT, 0),
+    ("nolightmap", SURF_NOLIGHTMAP, 0),
+    ("nodlight", SURF_NODLIGHT, 0),
+    ("dust", SURF_DUST, 0),
+];
 
 /// `genFunc_t`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -211,9 +286,9 @@ pub struct ShaderStage {
     pub is_detail: bool,
 }
 
-/// The parse result of one shader definition. Phase 4c fills the name,
-/// stages and `alphaGen portal` range; the remaining shader-level
-/// directives arrive with the `ParseShader` driver next phase.
+/// The parse result of one shader definition — everything `ParseShader`
+/// fills. (The `FinishShader` optimisation pass that runs over this
+/// afterwards is not ported yet.)
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ShaderScript {
     pub name: String,
@@ -221,14 +296,151 @@ pub struct ShaderScript {
     /// `shader.portalRange`, written by `alphaGen portal` (from inside
     /// stage parsing, exactly as the C writes the global).
     pub portal_range: Option<f32>,
+    /// `deformVertexes`, in file order; at most [`MAX_SHADER_DEFORMS`].
+    pub deforms: Vec<DeformStage>,
+    /// `skyParms` — set exactly where the C sets `is_sky`, i.e. only
+    /// after the whole line parsed.
+    pub sky: Option<SkyParms>,
+    /// `fogParms`.
+    pub fog: Option<FogParms>,
+    /// `sort`; defaults to `SS_BAD`, as `ParseShader` leaves it.
+    pub sort: ShaderSort,
+    /// `cull`; defaults to front-sided.
+    pub cull: CullType,
+    /// OR of every `surfaceparm`'s flags/contents.
+    pub surface_flags: u32,
+    pub content_flags: u32,
+    pub no_mip_maps: bool,
+    pub no_pic_mip: bool,
+    pub polygon_offset: bool,
+    pub entity_mergable: bool,
+    /// `clampTime`.
+    pub clamp_time: Option<f32>,
+    /// `q3map_sun`: normalized-then-scaled light and built direction.
+    pub sun: Option<SunParms>,
+    /// Set once the shader closed cleanly, as `explicitlyDefined`.
+    pub explicitly_defined: bool,
 }
 
-/// A shader script could not be parsed — the cases where `ParseStage`
-/// returns `qfalse` or `ri.Error` would abort the frame.
+/// `deform_t`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Deform {
+    #[default]
+    None = 0,
+    Wave = 1,
+    Normals = 2,
+    Bulge = 3,
+    Move = 4,
+    ProjectionShadow = 5,
+    Autosprite = 6,
+    Autosprite2 = 7,
+    Text0 = 8,
+    Text1 = 9,
+    Text2 = 10,
+    Text3 = 11,
+    Text4 = 12,
+    Text5 = 13,
+    Text6 = 14,
+    Text7 = 15,
+}
+
+/// `deformStage_t`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DeformStage {
+    pub deform: Deform,
+    pub move_vector: Vec3,
+    pub wave: WaveForm,
+    /// 1/divisor — 100.0 when the divisor was 0.
+    pub spread: f32,
+    pub bulge_width: f32,
+    pub bulge_height: f32,
+    pub bulge_speed: f32,
+}
+
+/// `cullType_t`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CullType {
+    #[default]
+    FrontSided = 0,
+    BackSided = 1,
+    TwoSided = 2,
+}
+
+/// `shaderSort_t`. The C assigns raw numbers too (`shader.sort =
+/// atof(token)`), so this is a newtype around the int the renderer
+/// sorts by, with `shaderSort_t`'s constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ShaderSort(pub i32);
+
+impl ShaderSort {
+    pub const BAD: ShaderSort = ShaderSort(0);
+    pub const PORTAL: ShaderSort = ShaderSort(1);
+    pub const ENVIRONMENT: ShaderSort = ShaderSort(2);
+    pub const OPAQUE: ShaderSort = ShaderSort(3);
+    pub const DECAL: ShaderSort = ShaderSort(4);
+    pub const SEE_THROUGH: ShaderSort = ShaderSort(5);
+    pub const BANNER: ShaderSort = ShaderSort(6);
+    pub const FOG: ShaderSort = ShaderSort(7);
+    pub const UNDERWATER: ShaderSort = ShaderSort(8);
+    pub const BLEND0: ShaderSort = ShaderSort(9);
+    pub const BLEND1: ShaderSort = ShaderSort(10);
+    pub const BLEND2: ShaderSort = ShaderSort(11);
+    pub const BLEND3: ShaderSort = ShaderSort(12);
+    pub const BLEND6: ShaderSort = ShaderSort(13);
+    pub const STENCIL_SHADOW: ShaderSort = ShaderSort(14);
+    pub const ALMOST_NEAREST: ShaderSort = ShaderSort(15);
+    pub const NEAREST: ShaderSort = ShaderSort(16);
+}
+
+/// `skyParms_t`: the two six-face boxes as name prefixes (lookups are
+/// deferred) and the cloud height.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SkyParms {
+    /// `prefix_{rt,bk,lf,ft,up,dn}.tga` names, or `None` for `-`.
+    pub outerbox: Option<[String; 6]>,
+    pub innerbox: Option<[String; 6]>,
+    pub cloud_height: f32,
+}
+
+impl SkyParms {
+    /// The C's `suf` table, in order.
+    fn box_names(prefix: &str) -> [String; 6] {
+        ["rt", "bk", "lf", "ft", "up", "dn"].map(|face| format!("{prefix}_{face}.tga"))
+    }
+}
+
+/// `fogParms_t`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FogParms {
+    pub color: Vec3,
+    pub depth_for_opaque: f32,
+}
+
+/// `tr.sunLight` / `tr.sunDirection` as one `q3map_sun` leaves them.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SunParms {
+    pub light: Vec3,
+    pub direction: Vec3,
+}
+
+/// A shader script could not be parsed — the cases where `ParseShader`
+/// or `ParseStage` return `qfalse`, or `ri.Error` would abort the frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShaderError {
     /// The text ended inside a stage (`no matching '}' found`).
     UnterminatedStage,
+    /// The definition never closed (`no concluding '}'`).
+    UnterminatedShader,
+    /// The definition did not open with `{`.
+    ExpectedOpenBrace(String),
+    /// An unrecognised shader-level directive, which fails the parse.
+    UnknownShaderParameter(String),
+    /// No stages, and neither a sky nor fog contents — the C refuses
+    /// shaders like this.
+    NoStages,
+    /// `fogParms`' colour vector failed to parse (the paren warning is
+    /// already in the warnings).
+    MissingVector,
     /// An unrecognised directive inside a stage, which fails the parse.
     UnknownStageParameter(String),
     /// A keyword's parameter was missing; the keyword is the C's.
@@ -381,7 +593,9 @@ impl<'a> Parser<'a> {
                 self.warn("no matching '}' found".to_string());
                 return Err(ShaderError::UnterminatedStage);
             }
-            if token == "}" {
+            // The C tests token[0] only, so anything starting with
+            // '}' closes the stage.
+            if token.starts_with('}') {
                 break;
             }
 
@@ -393,9 +607,11 @@ impl<'a> Parser<'a> {
                     let clamp = lower == "clampmap";
                     let image = self.next(false).to_string();
                     if image.is_empty() {
-                        return Err(ShaderError::MissingParameter {
-                            keyword: if clamp { "clampmap" } else { "map" },
-                        });
+                        let keyword = if clamp { "clampmap" } else { "map" };
+                        self.warn(format!(
+                            "missing parameter for '{keyword}' keyword in shader '{name}'"
+                        ));
+                        return Err(ShaderError::MissingParameter { keyword });
                     }
                     if !clamp && image.eq_ignore_ascii_case("$whiteimage") {
                         stage.bundle.map = Some(TextureMap::WhiteImage);
@@ -408,6 +624,10 @@ impl<'a> Parser<'a> {
                 "animmap" => {
                     let token = self.next(false).to_string();
                     if token.is_empty() {
+                        // The C's message says "animMmap" — kept as is.
+                        self.warn(format!(
+                            "missing parameter for 'animMmap' keyword in shader '{name}'"
+                        ));
                         return Err(ShaderError::MissingParameter { keyword: "animMap" });
                     }
                     let speed = atof(&token);
@@ -435,6 +655,10 @@ impl<'a> Parser<'a> {
                 "videomap" => {
                     let token = self.next(false).to_string();
                     if token.is_empty() {
+                        // The C's message says "videoMmap" — kept as is.
+                        self.warn(format!(
+                            "missing parameter for 'videoMmap' keyword in shader '{name}'"
+                        ));
                         return Err(ShaderError::MissingParameter {
                             keyword: "videoMap",
                         });
@@ -444,6 +668,9 @@ impl<'a> Parser<'a> {
                 "alphafunc" => {
                     let token = self.next(false);
                     if token.is_empty() {
+                        self.warn(format!(
+                            "missing parameter for 'alphaFunc' keyword in shader '{name}'"
+                        ));
                         return Err(ShaderError::MissingParameter {
                             keyword: "alphaFunc",
                         });
@@ -453,6 +680,9 @@ impl<'a> Parser<'a> {
                 "depthfunc" => {
                     let token = self.next(false).to_string();
                     if token.is_empty() {
+                        self.warn(format!(
+                            "missing parameter for 'depthfunc' keyword in shader '{name}'"
+                        ));
                         return Err(ShaderError::MissingParameter {
                             keyword: "depthfunc",
                         });
@@ -621,6 +851,7 @@ impl<'a> Parser<'a> {
                     continue;
                 }
                 _ => {
+                    self.warn(format!("unknown parameter '{token}' in shader '{name}'"));
                     return Err(ShaderError::UnknownStageParameter(token));
                 }
             }
@@ -845,6 +1076,403 @@ impl<'a> Parser<'a> {
             return false;
         }
         true
+    }
+
+    /// `ParseShader`: reads one shader body — the cursor sits where
+    /// the C's `FindShaderInShaderText` leaves it, on the opening `{`.
+    /// The name must already be set on `script`.
+    pub fn parse_shader(&mut self, script: &mut ShaderScript) -> Result<(), ShaderError> {
+        let name = script.name.clone();
+        let token = self.next(true).to_string();
+        if !token.starts_with('{') {
+            self.warn(format!(
+                "expecting '{{', found '{token}' instead in shader '{name}'"
+            ));
+            return Err(ShaderError::ExpectedOpenBrace(token));
+        }
+
+        loop {
+            let token = self.next(true).to_string();
+            if token.is_empty() {
+                self.warn(format!("no concluding '}}' in shader {name}"));
+                return Err(ShaderError::UnterminatedShader);
+            }
+            // The C tests token[0] only for the braces.
+            if token.starts_with('}') {
+                break;
+            }
+            if token.starts_with('{') {
+                self.parse_stage(script)?;
+                continue;
+            }
+
+            let lower = token.to_ascii_lowercase();
+
+            // Skip stuff that only the QuakeEdRadiant needs.
+            if lower.starts_with("qer") {
+                self.skip_rest_of_line();
+                continue;
+            }
+            if lower == "q3map_sun" {
+                self.parse_q3map_sun(script);
+                continue;
+            }
+            if lower == "deformvertexes" {
+                self.parse_deform(script, &name);
+                continue;
+            }
+            if lower == "tesssize" {
+                self.skip_rest_of_line();
+                continue;
+            }
+            if lower == "clamptime" {
+                let token = self.next(false).to_string();
+                if !token.is_empty() {
+                    script.clamp_time = Some(atof(&token));
+                }
+                continue;
+            }
+            // Skip stuff that only the q3map needs.
+            if lower.starts_with("q3map") {
+                self.skip_rest_of_line();
+                continue;
+            }
+            if lower == "surfaceparm" {
+                self.parse_surface_parm(script);
+                continue;
+            }
+            if lower == "nomipmaps" {
+                script.no_mip_maps = true;
+                script.no_pic_mip = true;
+                continue;
+            }
+            if lower == "nopicmip" {
+                script.no_pic_mip = true;
+                continue;
+            }
+            if lower == "polygonoffset" {
+                script.polygon_offset = true;
+                continue;
+            }
+            // Allow sprite surfaces from multiple entities to merge.
+            if lower == "entitymergable" {
+                script.entity_mergable = true;
+                continue;
+            }
+            if lower == "fogparms" {
+                let mut color = [0.0f32; 3];
+                if !self.parse_vector(3, &mut color, &name) {
+                    return Err(ShaderError::MissingVector);
+                }
+                script.fog = Some(FogParms {
+                    color,
+                    depth_for_opaque: 0.0,
+                });
+                let token = self.next(false).to_string();
+                if token.is_empty() {
+                    self.warn(format!(
+                        "missing parm for 'fogParms' keyword in shader '{name}'"
+                    ));
+                    // The C continues *without* SkipRestOfLine here.
+                    continue;
+                }
+                script.fog.as_mut().unwrap().depth_for_opaque = atof(&token);
+                // Skip any old gradient directions.
+                self.skip_rest_of_line();
+                continue;
+            }
+            if lower == "portal" {
+                script.sort = ShaderSort::PORTAL;
+                continue;
+            }
+            if lower == "skyparms" {
+                self.parse_sky_parms(script, &name);
+                continue;
+            }
+            // light <value> determines flaring in q3map.
+            if lower == "light" {
+                self.next(false);
+                continue;
+            }
+            if lower == "cull" {
+                let token = self.next(false).to_string();
+                if token.is_empty() {
+                    self.warn(format!("missing cull parms in shader '{name}'"));
+                    continue;
+                }
+                if ["none", "twosided", "disable"]
+                    .iter()
+                    .any(|k| token.eq_ignore_ascii_case(k))
+                {
+                    script.cull = CullType::TwoSided;
+                } else if ["back", "backside", "backsided"]
+                    .iter()
+                    .any(|k| token.eq_ignore_ascii_case(k))
+                {
+                    script.cull = CullType::BackSided;
+                } else {
+                    self.warn(format!("invalid cull parm '{token}' in shader '{name}'"));
+                }
+                continue;
+            }
+            if lower == "sort" {
+                self.parse_sort(script, &name);
+                continue;
+            }
+            self.warn(format!(
+                "unknown general shader parameter '{token}' in '{name}'"
+            ));
+            return Err(ShaderError::UnknownShaderParameter(token));
+        }
+
+        // Ignore shaders that don't have any stages, unless it is a sky
+        // or fog.
+        if script.stages.is_empty()
+            && script.sky.is_none()
+            && script.content_flags & CONTENTS_FOG == 0
+        {
+            return Err(ShaderError::NoStages);
+        }
+
+        script.explicitly_defined = true;
+        Ok(())
+    }
+
+    /// `ParseDeform` — `deformVertexes <subtype> ...`. As in C, the
+    /// subtype is read before the `MAX_SHADER_DEFORMS` check, and a
+    /// failure after the slot is reserved leaves a zeroed `Deform::None`
+    /// entry behind.
+    fn parse_deform(&mut self, script: &mut ShaderScript, name: &str) {
+        let token = self.next(false).to_string();
+        if token.is_empty() {
+            self.warn(format!("missing deform parm in shader '{name}'"));
+            return;
+        }
+        if script.deforms.len() >= MAX_SHADER_DEFORMS {
+            self.warn(format!("MAX_SHADER_DEFORMS in '{name}'"));
+            return;
+        }
+        script.deforms.push(DeformStage::default());
+        let slot = script.deforms.len() - 1;
+
+        if token.eq_ignore_ascii_case("projectionshadow") {
+            script.deforms[slot].deform = Deform::ProjectionShadow;
+            return;
+        }
+        if token.eq_ignore_ascii_case("autosprite") {
+            script.deforms[slot].deform = Deform::Autosprite;
+            return;
+        }
+        if token.eq_ignore_ascii_case("autosprite2") {
+            script.deforms[slot].deform = Deform::Autosprite2;
+            return;
+        }
+        if token.len() >= 4 && token.as_bytes()[..4].eq_ignore_ascii_case(b"text") {
+            // token[4] - '0' in C: past the end of the token reads as
+            // '\0', so plain "text" and out-of-range digits land on 0.
+            let n = token
+                .as_bytes()
+                .get(4)
+                .map_or(-1, |b| *b as i32 - b'0' as i32);
+            let n = if (0..=7).contains(&n) { n as usize } else { 0 };
+            script.deforms[slot].deform = match n {
+                0 => Deform::Text0,
+                1 => Deform::Text1,
+                2 => Deform::Text2,
+                3 => Deform::Text3,
+                4 => Deform::Text4,
+                5 => Deform::Text5,
+                6 => Deform::Text6,
+                _ => Deform::Text7,
+            };
+            return;
+        }
+        if token.eq_ignore_ascii_case("bulge") {
+            let Some(width) = self.deform_parm(name, "bulge ") else {
+                return;
+            };
+            script.deforms[slot].bulge_width = width;
+            let Some(height) = self.deform_parm(name, "bulge ") else {
+                return;
+            };
+            script.deforms[slot].bulge_height = height;
+            let Some(speed) = self.deform_parm(name, "bulge ") else {
+                return;
+            };
+            script.deforms[slot].bulge_speed = speed;
+            script.deforms[slot].deform = Deform::Bulge;
+            return;
+        }
+        if token.eq_ignore_ascii_case("wave") {
+            let Some(div) = self.deform_parm(name, "") else {
+                return;
+            };
+            if div != 0.0 {
+                script.deforms[slot].spread = 1.0 / div;
+            } else {
+                script.deforms[slot].spread = 100.0;
+                self.warn(format!(
+                    "illegal div value of 0 in deformVertexes command for shader '{name}'"
+                ));
+            }
+            script.deforms[slot].wave = self.parse_wave_form(name);
+            script.deforms[slot].deform = Deform::Wave;
+            return;
+        }
+        if token.eq_ignore_ascii_case("normal") {
+            let Some(amplitude) = self.deform_parm(name, "") else {
+                return;
+            };
+            script.deforms[slot].wave.amplitude = amplitude;
+            let Some(frequency) = self.deform_parm(name, "") else {
+                return;
+            };
+            script.deforms[slot].wave.frequency = frequency;
+            script.deforms[slot].deform = Deform::Normals;
+            return;
+        }
+        if token.eq_ignore_ascii_case("move") {
+            for axis in 0..3 {
+                let Some(value) = self.deform_parm(name, "") else {
+                    return;
+                };
+                script.deforms[slot].move_vector[axis] = value;
+            }
+            script.deforms[slot].wave = self.parse_wave_form(name);
+            script.deforms[slot].deform = Deform::Move;
+            return;
+        }
+        self.warn(format!(
+            "unknown deformVertexes subtype '{token}' found in shader '{name}'"
+        ));
+    }
+
+    /// One of `ParseDeform`'s float parameters: `None` after warning,
+    /// with the C's message (`what` inserts the subtype, if any).
+    fn deform_parm(&mut self, name: &str, what: &str) -> Option<f32> {
+        let token = self.next(false).to_string();
+        if token.is_empty() {
+            self.warn(format!(
+                "missing deformVertexes {what}parm in shader '{name}'"
+            ));
+            None
+        } else {
+            Some(atof(&token))
+        }
+    }
+
+    /// `ParseSkyParms` — `skyParms <outerbox> <cloudheight> <innerbox>`,
+    /// where `-` means no box. The sky flag goes on only at the very
+    /// end, which is where the C sets `is_sky`; `R_InitSkyTexCoords`
+    /// runs there in C and is deferred here.
+    fn parse_sky_parms(&mut self, script: &mut ShaderScript, name: &str) {
+        let mut sky = SkyParms::default();
+
+        let outer = self.next(false).to_string();
+        if outer.is_empty() {
+            self.warn(format!("'skyParms' missing parameter in shader '{name}'"));
+            return;
+        }
+        if outer != "-" {
+            sky.outerbox = Some(SkyParms::box_names(&outer));
+        }
+
+        let cloud = self.next(false).to_string();
+        if cloud.is_empty() {
+            self.warn(format!("'skyParms' missing parameter in shader '{name}'"));
+            return;
+        }
+        let height = atof(&cloud);
+        sky.cloud_height = if height == 0.0 { 512.0 } else { height };
+
+        let inner = self.next(false).to_string();
+        if inner.is_empty() {
+            self.warn(format!("'skyParms' missing parameter in shader '{name}'"));
+            return;
+        }
+        if inner != "-" {
+            sky.innerbox = Some(SkyParms::box_names(&inner));
+        }
+
+        script.sky = Some(sky);
+    }
+
+    /// `ParseSort`. Named keywords map to `shaderSort_t` constants;
+    /// anything else is stored as the raw number, exactly as
+    /// `shader.sort = atof(token)` stores it.
+    fn parse_sort(&mut self, script: &mut ShaderScript, name: &str) {
+        let token = self.next(false).to_string();
+        if token.is_empty() {
+            self.warn(format!("missing sort parameter in shader '{name}'"));
+            return;
+        }
+        script.sort = if token.eq_ignore_ascii_case("portal") {
+            ShaderSort::PORTAL
+        } else if token.eq_ignore_ascii_case("sky") {
+            ShaderSort::ENVIRONMENT
+        } else if token.eq_ignore_ascii_case("opaque") {
+            ShaderSort::OPAQUE
+        } else if token.eq_ignore_ascii_case("decal") {
+            ShaderSort::DECAL
+        } else if token.eq_ignore_ascii_case("seethrough") {
+            ShaderSort::SEE_THROUGH
+        } else if token.eq_ignore_ascii_case("banner") {
+            ShaderSort::BANNER
+        } else if token.eq_ignore_ascii_case("additive") {
+            ShaderSort::BLEND1
+        } else if token.eq_ignore_ascii_case("nearest") {
+            ShaderSort::NEAREST
+        } else if token.eq_ignore_ascii_case("underwater") {
+            ShaderSort::UNDERWATER
+        } else {
+            ShaderSort(atof(&token) as i32)
+        };
+    }
+
+    /// `ParseSurfaceParm` — ORs the `infoParms` entry into the shader.
+    /// Unknown names (and an empty token) are silently ignored, as in C.
+    fn parse_surface_parm(&mut self, script: &mut ShaderScript) {
+        let token = self.next(false).to_string();
+        for (parm, surface, contents) in INFO_PARMS {
+            if token.eq_ignore_ascii_case(parm) {
+                script.surface_flags |= surface;
+                script.content_flags |= contents;
+                break;
+            }
+        }
+    }
+
+    /// `q3map_sun <r> <g> <b> <intensity> <yaw> <pitch>` — the sun
+    /// globals `tr.sunLight`/`tr.sunDirection`, kept per shader. The
+    /// colour is normalized then scaled; the direction comes from the
+    /// two angles, whose trigonometry runs in `double` in the C, so it
+    /// does here too.
+    fn parse_q3map_sun(&mut self, script: &mut ShaderScript) {
+        let mut light = [0.0f32; 3];
+        for component in &mut light {
+            *component = atof(self.next(false));
+        }
+        let len = (light[0] * light[0] + light[1] * light[1] + light[2] * light[2]).sqrt();
+        if len > 0.0 {
+            for component in &mut light {
+                *component /= len;
+            }
+        }
+        let intensity = atof(self.next(false)) as f64;
+        for component in &mut light {
+            *component = (*component as f64 * intensity) as f32;
+        }
+
+        let a = atof(self.next(false)) as f64 / 180.0 * std::f64::consts::PI;
+        let b = atof(self.next(false)) as f64 / 180.0 * std::f64::consts::PI;
+        script.sun = Some(SunParms {
+            light,
+            direction: [
+                (a.cos() * b.cos()) as f32,
+                (a.sin() * b.cos()) as f32,
+                b.sin() as f32,
+            ],
+        });
     }
 }
 
@@ -1463,5 +2091,397 @@ mod tests {
             parser.parse_stage(&mut script),
             Err(ShaderError::TooManyStages)
         );
+    }
+
+    /// Parses one full shader body (braces included) under a fixed
+    /// name, the way `parse_shader` expects it.
+    fn shader(body: &str) -> Result<(ShaderScript, Vec<String>), ShaderError> {
+        let mut script = ShaderScript {
+            name: "tests/shader".into(),
+            ..Default::default()
+        };
+        let mut parser = Parser::new(body);
+        let result = parser.parse_shader(&mut script);
+        let warnings = parser.warnings;
+        result.map(|()| (script, warnings))
+    }
+
+    #[test]
+    fn a_full_shader_parses() {
+        let (script, warnings) = shader("{\n  {\n    map textures/foo/bar\n  }\n}").unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(script.stages.len(), 1);
+        assert!(script.explicitly_defined);
+        assert_eq!(script.sort, ShaderSort::BAD);
+        assert_eq!(script.cull, CullType::FrontSided);
+        assert_eq!(script.surface_flags, 0);
+        assert!(!script.no_mip_maps && !script.no_pic_mip);
+        assert!(!script.polygon_offset && !script.entity_mergable);
+        assert_eq!(script.clamp_time, None);
+        assert!(script.sun.is_none() && script.fog.is_none() && script.sky.is_none());
+    }
+
+    #[test]
+    fn the_driver_requires_an_opening_brace_and_a_closing_one() {
+        let mut script = ShaderScript {
+            name: "tests/shader".into(),
+            ..Default::default()
+        };
+        let mut parser = Parser::new("map foo }");
+        assert_eq!(
+            parser.parse_shader(&mut script),
+            Err(ShaderError::ExpectedOpenBrace("map".into()))
+        );
+        assert!(parser
+            .warnings
+            .iter()
+            .any(|w| w == "expecting '{', found 'map' instead in shader 'tests/shader'"));
+        let (err, warnings) = shader_err("{ qer_info \"x\"");
+        assert_eq!(err, ShaderError::UnterminatedShader);
+        assert!(parser_warnings_contain(
+            &warnings,
+            "no concluding '}' in shader tests/shader"
+        ));
+    }
+
+    /// Small helper: is `needle` in `warnings`?
+    fn parser_warnings_contain(warnings: &[String], needle: &str) -> bool {
+        warnings.iter().any(|w| w == needle)
+    }
+
+    /// Parses a shader body expected to fail, returning the error and
+    /// the warnings collected on the way.
+    fn shader_err(body: &str) -> (ShaderError, Vec<String>) {
+        let mut script = ShaderScript {
+            name: "tests/shader".into(),
+            ..Default::default()
+        };
+        let mut parser = Parser::new(body);
+        let result = parser.parse_shader(&mut script);
+        let warnings = parser.warnings;
+        (result.unwrap_err(), warnings)
+    }
+
+    #[test]
+    fn empty_shaders_are_refused_unless_sky_or_fog() {
+        assert_eq!(shader("{ }"), Err(ShaderError::NoStages));
+
+        // A sky needs no stages.
+        let (script, warnings) = shader("{ skyparms env/cloud - - }").unwrap();
+        assert!(warnings.is_empty());
+        assert!(script.sky.is_some());
+        assert!(script.stages.is_empty());
+        assert!(script.explicitly_defined);
+
+        // Neither does fog.
+        let (script, _) = shader("{ surfaceparm fog }").unwrap();
+        assert_eq!(script.content_flags & CONTENTS_FOG, CONTENTS_FOG);
+
+        // But an unknown directive fails before that check.
+        assert_eq!(
+            shader("{ frobnicate { map foo } }"),
+            Err(ShaderError::UnknownShaderParameter("frobnicate".into()))
+        );
+    }
+
+    #[test]
+    fn qer_q3map_and_the_light_tesssize_skips_work() {
+        let (script, warnings) =
+            shader("{\n  qer_info \"hello world\"\n  q3map_lightimage textures/x\n  {\n    map foo\n  }\n}")
+                .unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(script.stages.len(), 1);
+
+        // `light` eats exactly one token, so the map survives on the
+        // same line...
+        let (script, _) = shader("{ light 300 { map foo } }").unwrap();
+        assert_eq!(script.stages.len(), 1);
+        // ...while tesssize skips the rest of its line.
+        let (script, _) = shader("{ tesssize 64\n { map foo } }").unwrap();
+        assert_eq!(script.stages.len(), 1);
+    }
+
+    #[test]
+    fn shader_level_flags_are_recorded() {
+        let (script, _) = shader("{ nomipmaps { map foo } }").unwrap();
+        assert!(script.no_mip_maps && script.no_pic_mip);
+
+        let (script, _) = shader("{ nopicmip { map foo } }").unwrap();
+        assert!(!script.no_mip_maps && script.no_pic_mip);
+
+        let (script, _) = shader("{ polygonOffset entityMergable { map foo } }").unwrap();
+        assert!(script.polygon_offset && script.entity_mergable);
+
+        let (script, _) = shader("{ clampTime 4.5 { map foo } }").unwrap();
+        assert_eq!(script.clamp_time, Some(4.5));
+        // A clampTime with no value on its line reads nothing.
+        let (script, _) = shader("{ clampTime\n { map foo } }").unwrap();
+        assert_eq!(script.clamp_time, None);
+    }
+
+    #[test]
+    fn surfaceparm_accumulates_flags() {
+        let (script, _) = shader("{ surfaceparm sky surfaceparm nodraw { map foo } }").unwrap();
+        assert_eq!(script.surface_flags, SURF_SKY | SURF_NODRAW);
+
+        let (script, _) = shader("{ surfaceparm trans surfaceparm nonsolid { map foo } }").unwrap();
+        assert_eq!(script.surface_flags, SURF_NONSOLID);
+        assert_eq!(script.content_flags, CONTENTS_TRANSLUCENT);
+
+        // Unknown names are silently ignored, as in the C.
+        let (script, warnings) = shader("{ surfaceparm flurble { map foo } }").unwrap();
+        assert_eq!(script.surface_flags, 0);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn cull_and_sort_keywords_map_like_the_c() {
+        let (script, _) = shader("{ cull none { map foo } }").unwrap();
+        assert_eq!(script.cull, CullType::TwoSided);
+        let (script, _) = shader("{ cull twosided { map foo } }").unwrap();
+        assert_eq!(script.cull, CullType::TwoSided);
+        let (script, _) = shader("{ cull backside { map foo } }").unwrap();
+        assert_eq!(script.cull, CullType::BackSided);
+
+        // Unknown cull parms warn and keep the default; a missing one
+        // warns too.
+        let (script, warnings) = shader("{ cull sideways { map foo } }").unwrap();
+        assert_eq!(script.cull, CullType::FrontSided);
+        assert!(parser_warnings_contain(
+            &warnings,
+            "invalid cull parm 'sideways' in shader 'tests/shader'"
+        ));
+        let (_, warnings) = shader("{ cull\n { map foo } }").unwrap();
+        assert!(parser_warnings_contain(
+            &warnings,
+            "missing cull parms in shader 'tests/shader'"
+        ));
+
+        let (script, _) = shader("{ sort opaque { map foo } }").unwrap();
+        assert_eq!(script.sort, ShaderSort::OPAQUE);
+        let (script, _) = shader("{ sort sky { map foo } }").unwrap();
+        assert_eq!(script.sort, ShaderSort::ENVIRONMENT);
+        let (script, _) = shader("{ sort additive { map foo } }").unwrap();
+        assert_eq!(script.sort, ShaderSort::BLEND1);
+        let (script, _) = shader("{ sort underwater { map foo } }").unwrap();
+        assert_eq!(script.sort, ShaderSort::UNDERWATER);
+        // Numeric sorts store the raw number, as `= atof` does.
+        let (script, _) = shader("{ sort 10 { map foo } }").unwrap();
+        assert_eq!(script.sort, ShaderSort(10));
+        // `portal` is its own keyword.
+        let (script, _) = shader("{ portal { map foo } }").unwrap();
+        assert_eq!(script.sort, ShaderSort::PORTAL);
+        let (_, warnings) = shader("{ sort\n { map foo } }").unwrap();
+        assert!(parser_warnings_contain(
+            &warnings,
+            "missing sort parameter in shader 'tests/shader'"
+        ));
+    }
+
+    #[test]
+    fn fogparms_fills_the_fog_block() {
+        let (script, warnings) = shader("{ fogParms ( 0.5 0.5 0.5 ) 128\n { map foo } }").unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(
+            script.fog,
+            Some(FogParms {
+                color: [0.5, 0.5, 0.5],
+                depth_for_opaque: 128.0
+            })
+        );
+
+        // A bad colour vector fails the shader; the paren warning is
+        // already collected by ParseVector.
+        let mut script = ShaderScript {
+            name: "tests/shader".into(),
+            ..Default::default()
+        };
+        let mut parser = Parser::new("{ fogParms 0.5 0.5 0.5 128 }");
+        assert_eq!(
+            parser.parse_shader(&mut script),
+            Err(ShaderError::MissingVector)
+        );
+        assert!(parser
+            .warnings
+            .iter()
+            .any(|w| w == "missing parenthesis in shader 'tests/shader'"));
+
+        // A missing depth keeps the colour with a zero depth and does
+        // not skip the rest of the line, just as the C continues.
+        let (script, warnings) = shader("{ fogParms ( 1 1 1 )\n { map foo } }").unwrap();
+        assert_eq!(
+            script.fog,
+            Some(FogParms {
+                color: [1.0, 1.0, 1.0],
+                depth_for_opaque: 0.0
+            })
+        );
+        assert!(parser_warnings_contain(
+            &warnings,
+            "missing parm for 'fogParms' keyword in shader 'tests/shader'"
+        ));
+    }
+
+    #[test]
+    fn skyparms_builds_the_six_faces_and_defaults_the_cloud_height() {
+        let (script, _) = shader("{ skyparms env/cloud 512 - { map foo } }").unwrap();
+        let sky = script.sky.unwrap();
+        let outer = sky.outerbox.unwrap();
+        assert_eq!(outer[0], "env/cloud_rt.tga");
+        assert_eq!(outer[3], "env/cloud_ft.tga");
+        assert_eq!(outer[5], "env/cloud_dn.tga");
+        assert!(sky.innerbox.is_none());
+        assert_eq!(sky.cloud_height, 512.0);
+
+        // A zero cloud height falls back to 512.
+        let (script, _) = shader("{ skyparms env/x 0 - }").unwrap();
+        assert_eq!(script.sky.unwrap().cloud_height, 512.0);
+
+        // "-" for the outer box, a real inner box.
+        let (script, _) = shader("{ skyparms - 256 env/inner }").unwrap();
+        let sky = script.sky.unwrap();
+        assert!(sky.outerbox.is_none());
+        assert_eq!(sky.innerbox.unwrap()[0], "env/inner_rt.tga");
+
+        // A missing inner box warns and leaves the shader unmarked —
+        // the C returns before setting is_sky.
+        let (script, warnings) = shader("{ skyparms env/x 512\n { map foo } }").unwrap();
+        assert!(script.sky.is_none());
+        assert!(parser_warnings_contain(
+            &warnings,
+            "'skyParms' missing parameter in shader 'tests/shader'"
+        ));
+    }
+
+    #[test]
+    fn deform_directives_parse() {
+        let (script, warnings) =
+            shader("{ deformVertexes wave 2 sin 0 1 0 1 { map foo } }").unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(script.deforms.len(), 1);
+        let d = &script.deforms[0];
+        assert_eq!(d.deform, Deform::Wave);
+        assert_eq!(d.spread, 0.5);
+        assert_eq!(
+            d.wave,
+            WaveForm {
+                func: GenFunc::Sin,
+                base: 0.0,
+                amplitude: 1.0,
+                phase: 0.0,
+                frequency: 1.0
+            }
+        );
+
+        // A zero divisor warns and uses the 100 fallback.
+        let (script, warnings) =
+            shader("{ deformVertexes wave 0 sin 0 1 0 1 { map foo } }").unwrap();
+        assert_eq!(script.deforms[0].spread, 100.0);
+        assert!(parser_warnings_contain(
+            &warnings,
+            "illegal div value of 0 in deformVertexes command for shader 'tests/shader'"
+        ));
+
+        let (script, _) = shader("{ deformVertexes bulge 2 3 4 { map foo } }").unwrap();
+        let d = &script.deforms[0];
+        assert_eq!(d.deform, Deform::Bulge);
+        assert_eq!(
+            (d.bulge_width, d.bulge_height, d.bulge_speed),
+            (2.0, 3.0, 4.0)
+        );
+
+        // `normal` reads amplitude first, then frequency — as the C
+        // does, whatever the docs suggest.
+        let (script, _) = shader("{ deformVertexes normal 0.5 0.1 { map foo } }").unwrap();
+        let d = &script.deforms[0];
+        assert_eq!(d.deform, Deform::Normals);
+        assert_eq!(d.wave.amplitude, 0.5);
+        assert_eq!(d.wave.frequency, 0.1);
+
+        let (script, _) =
+            shader("{ deformVertexes move 1 2 3 square 0 0 0 1 { map foo } }").unwrap();
+        let d = &script.deforms[0];
+        assert_eq!(d.deform, Deform::Move);
+        assert_eq!(d.move_vector, [1.0, 2.0, 3.0]);
+        assert_eq!(d.wave.func, GenFunc::Square);
+
+        let (script, _) = shader("{ deformVertexes projectionShadow { map foo } }").unwrap();
+        assert_eq!(script.deforms[0].deform, Deform::ProjectionShadow);
+        let (script, _) = shader("{ deformVertexes autoSprite { map foo } }").unwrap();
+        assert_eq!(script.deforms[0].deform, Deform::Autosprite);
+        let (script, _) = shader("{ deformVertexes autoSprite2 { map foo } }").unwrap();
+        assert_eq!(script.deforms[0].deform, Deform::Autosprite2);
+
+        // text[0-7]; a bare "text" or an out-of-range digit lands on 0,
+        // because token[4] reads past the token.
+        let (script, _) = shader("{ deformVertexes text3 { map foo } }").unwrap();
+        assert_eq!(script.deforms[0].deform, Deform::Text3);
+        let (script, _) = shader("{ deformVertexes text { map foo } }").unwrap();
+        assert_eq!(script.deforms[0].deform, Deform::Text0);
+        let (script, _) = shader("{ deformVertexes text9 { map foo } }").unwrap();
+        assert_eq!(script.deforms[0].deform, Deform::Text0);
+
+        // An unknown subtype keeps the reserved (zeroed) slot and warns.
+        let (script, warnings) = shader("{ deformVertexes wobble { map foo } }").unwrap();
+        assert_eq!(script.deforms[0].deform, Deform::None);
+        assert!(parser_warnings_contain(
+            &warnings,
+            "unknown deformVertexes subtype 'wobble' found in shader 'tests/shader'"
+        ));
+
+        // Only three deforms fit; the fourth warns without storing.
+        let body = format!(
+            "{{ {} {{ map foo }} }}",
+            "deformVertexes autosprite ".repeat(MAX_SHADER_DEFORMS + 1)
+        );
+        let (script, warnings) = shader(&body).unwrap();
+        assert_eq!(script.deforms.len(), MAX_SHADER_DEFORMS);
+        assert!(parser_warnings_contain(
+            &warnings,
+            &format!("MAX_SHADER_DEFORMS in 'tests/shader'")
+        ));
+
+        // A missing subtype warns without consuming a slot.
+        let (script, warnings) = shader("{ deformVertexes\n { map foo } }").unwrap();
+        assert!(script.deforms.is_empty());
+        assert!(parser_warnings_contain(
+            &warnings,
+            "missing deform parm in shader 'tests/shader'"
+        ));
+
+        // Missing wave parameters stop early but keep the slot — and
+        // the wave deform is still set, because ParseWaveForm returns
+        // void in C.
+        let (script, warnings) = shader("{ deformVertexes wave 0\n { map foo } }").unwrap();
+        assert_eq!(script.deforms[0].deform, Deform::Wave);
+        assert_eq!(script.deforms[0].spread, 100.0);
+        assert!(parser_warnings_contain(
+            &warnings,
+            "missing waveform parm in shader 'tests/shader'"
+        ));
+    }
+
+    #[test]
+    fn q3map_sun_computes_the_light_and_direction() {
+        // Light (0,1,0) is already unit, times intensity 2; yaw 90° and
+        // pitch 0° point the direction along +Y.
+        let (script, _) = shader("{ q3map_sun 0 1 0 2 90 0 { map foo } }").unwrap();
+        let sun = script.sun.unwrap();
+        assert_eq!(sun.light, [0.0, 2.0, 0.0]);
+        for (i, expected) in [0.0, 1.0, 0.0].iter().enumerate() {
+            assert!(
+                (sun.direction[i] - expected).abs() < 1e-6,
+                "direction[{i}] = {}",
+                sun.direction[i]
+            );
+        }
+
+        // Non-unit input is normalized before scaling: (0,0,4) -> (0,0,1)
+        // * 3, and pitch 90° points straight up.
+        let (script, _) = shader("{ q3map_sun 0 0 4 3 0 90 { map foo } }").unwrap();
+        let sun = script.sun.unwrap();
+        assert_eq!(sun.light, [0.0, 0.0, 3.0]);
+        assert!(sun.direction[0].abs() < 1e-6 && sun.direction[1].abs() < 1e-6);
+        assert!((sun.direction[2] - 1.0).abs() < 1e-6);
     }
 }
