@@ -4,10 +4,11 @@
 //! This is the first stage of the renderer's model path: the file is
 //! parsed into owned frames, tags and surface metadata, which is what
 //! [`crate::refexport::RefExport::lerp_tag`] and
-//! [`crate::refexport::RefExport::model_bounds`] need. The geometry chunks
-//! (triangles, texture coordinates and compressed vertex normals) are
-//! located and bounds-checked but not decoded yet; that arrives with the
-//! rendering stage.
+//! [`crate::refexport::RefExport::model_bounds`] need. Surface geometry —
+//! triangles, texture coordinates and the compressed vertex positions and
+//! normals — is decoded the way `LerpMeshVertexes` and `RB_SurfaceMesh`
+//! do it, so a backend can build vertex buffers straight from this
+//! module.
 //!
 //! All multi-byte fields are read little-endian, as `LittleLong`/
 //! `LittleFloat` do in the C loader.
@@ -38,6 +39,16 @@ const FRAME_SIZE: usize = 56;
 const TAG_SIZE: usize = 112;
 const SURFACE_SIZE: usize = 108;
 const SHADER_SIZE: usize = 68;
+const TRIANGLE_SIZE: usize = 12;
+const ST_SIZE: usize = 8;
+const XYZ_SIZE: usize = 8;
+
+/// `MD3_XYZ_SCALE`: compressed vertex positions are stored in 1/64ths.
+const MD3_XYZ_SCALE: f32 = 1.0 / 64.0;
+
+/// `FUNCTABLE_SIZE` from `tr_local.h`.
+const FUNCTABLE_SIZE: usize = 1024;
+const FUNCTABLE_MASK: usize = FUNCTABLE_SIZE - 1;
 
 /// Why an MD3 file could not be loaded, standing in for the warnings and
 /// `ERR_DROP` calls in `R_LoadMD3`.
@@ -57,6 +68,9 @@ pub enum ModelError {
     LimitExceeded(&'static str),
     /// Surfaces did not chain to the end of the file.
     BadSurfaceChain,
+    /// A triangle index points past the surface's vertices. Stricter than
+    /// `R_LoadMD3`, which leaves this for the draw path to trip over.
+    BadIndex(&'static str),
 }
 
 /// `md3Frame_t`.
@@ -85,8 +99,10 @@ pub struct Md3Shader {
     pub shader_index: i32,
 }
 
-/// `md3Surface_t` metadata. The geometry chunks behind `ofs_triangles`,
-/// `ofs_st` and `ofs_xyz_normals` are validated but not decoded yet.
+/// `md3Surface_t` plus its geometry, decoded at load: triangles and
+/// texture coordinates are flat, while the compressed vertex positions
+/// and normals stay as the file stored them so frames can be lerped on
+/// demand without keeping a float copy of every frame.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Md3Surface {
     pub name: String,
@@ -95,6 +111,23 @@ pub struct Md3Surface {
     pub num_verts: usize,
     pub num_triangles: usize,
     pub shaders: Vec<Md3Shader>,
+    /// `numTriangles` index triples, each index below `num_verts`.
+    pub triangles: Vec<[u32; 3]>,
+    /// One `[s, t]` pair per vertex.
+    pub tex_coords: Vec<[f32; 2]>,
+    /// The raw `md3XyzNormal_t` chunk: `num_frames * num_verts * 8`
+    /// bytes of three little-endian `i16` positions plus a packed normal.
+    xyz_normals: Vec<u8>,
+}
+
+/// One vertex as `LerpMeshVertexes` and `RB_SurfaceMesh` hand it to the
+/// tessellator: the lerped position, the decoded normal, and the
+/// texcoords the draw path copies alongside it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeshVertex {
+    pub position: Vec3,
+    pub normal: Vec3,
+    pub tex_coords: [f32; 2],
 }
 
 /// A loaded MD3 model: header fields plus the decoded frames, tags and
@@ -234,6 +267,66 @@ impl Md3Model {
     }
 }
 
+impl Md3Surface {
+    /// The raw compressed vertex chunk: `num_frames * num_verts * 8`
+    /// bytes of three little-endian `i16` positions plus a packed normal,
+    /// kept exactly as the C loader keeps them in the hunk.
+    pub fn compressed_vertices(&self) -> &[u8] {
+        &self.xyz_normals
+    }
+
+    /// `LerpMeshVertexes`: the vertices of `frame` pulled towards
+    /// `old_frame` by `backlerp`, paired with the texcoords
+    /// `RB_SurfaceMesh` copies next to them. As in C, equal frames force
+    /// `backlerp` to zero, frames past the end clamp to the last one, and
+    /// the decoded normals are only renormalized when a real lerp
+    /// happened (`VectorArrayNormalize` runs solely in that branch).
+    pub fn lerp_vertices(&self, frame: usize, old_frame: usize, backlerp: f32) -> Vec<MeshVertex> {
+        let stride = self.num_frames * self.num_verts * XYZ_SIZE;
+        if self.num_verts == 0 || self.num_frames == 0 || self.xyz_normals.len() < stride {
+            return Vec::new();
+        }
+
+        let frame = frame.min(self.num_frames - 1);
+        let old_frame = old_frame.min(self.num_frames - 1);
+        let backlerp = if frame == old_frame { 0.0 } else { backlerp };
+        let front = 1.0 - backlerp;
+
+        let mut vertices = Vec::with_capacity(self.num_verts);
+        for vert in 0..self.num_verts {
+            let new_at = (frame * self.num_verts + vert) * XYZ_SIZE;
+            let old_at = (old_frame * self.num_verts + vert) * XYZ_SIZE;
+
+            let mut position = [0.0f32; 3];
+            for axis in 0..3 {
+                let new = read_i16(&self.xyz_normals, new_at + axis * 2) as f32;
+                let old = read_i16(&self.xyz_normals, old_at + axis * 2) as f32;
+                position[axis] = (old * backlerp + new * front) * MD3_XYZ_SCALE;
+            }
+
+            let new_normal = decode_normal(read_i16(&self.xyz_normals, new_at + 6));
+            let normal = if backlerp == 0.0 {
+                new_normal
+            } else {
+                let old_normal = decode_normal(read_i16(&self.xyz_normals, old_at + 6));
+                let mut lerped = [0.0f32; 3];
+                for axis in 0..3 {
+                    lerped[axis] = old_normal[axis] * backlerp + new_normal[axis] * front;
+                }
+                normalize(&mut lerped);
+                lerped
+            };
+
+            vertices.push(MeshVertex {
+                position,
+                normal,
+                tex_coords: self.tex_coords[vert],
+            });
+        }
+        vertices
+    }
+}
+
 fn read_frames(
     data: &[u8],
     ofs: usize,
@@ -317,7 +410,10 @@ fn read_surfaces(
         let num_shaders = read_u32(data, pos + 76) as usize;
         let num_verts = read_u32(data, pos + 80) as usize;
         let num_triangles = read_u32(data, pos + 84) as usize;
+        let ofs_triangles = read_u32(data, pos + 88) as usize;
         let ofs_shaders = read_u32(data, pos + 92) as usize;
+        let ofs_st = read_u32(data, pos + 96) as usize;
+        let ofs_xyz_normals = read_u32(data, pos + 100) as usize;
         let ofs_end = read_u32(data, pos + 104) as usize;
 
         if num_shaders > MD3_MAX_SHADERS {
@@ -360,6 +456,63 @@ fn read_surfaces(
             });
         }
 
+        // The three geometry chunks must sit inside the model's span.
+        let chunk_start =
+            |ofs: usize, bytes: usize, what: &'static str| -> Result<usize, ModelError> {
+                let start = pos.checked_add(ofs).ok_or(ModelError::BadOffset(what))?;
+                let end = start
+                    .checked_add(bytes)
+                    .ok_or(ModelError::BadOffset(what))?;
+                if end > span {
+                    return Err(ModelError::BadOffset(what));
+                }
+                Ok(start)
+            };
+
+        let triangles_start = chunk_start(
+            ofs_triangles,
+            num_triangles
+                .checked_mul(TRIANGLE_SIZE)
+                .ok_or(ModelError::BadOffset("ofsTriangles"))?,
+            "ofsTriangles",
+        )?;
+        let st_start = chunk_start(
+            ofs_st,
+            num_verts
+                .checked_mul(ST_SIZE)
+                .ok_or(ModelError::BadOffset("ofsSt"))?,
+            "ofsSt",
+        )?;
+        let xyz_bytes = num_frames
+            .checked_mul(num_verts)
+            .and_then(|n| n.checked_mul(XYZ_SIZE))
+            .ok_or(ModelError::BadOffset("ofsXyzNormals"))?;
+        let xyz_start = chunk_start(ofs_xyz_normals, xyz_bytes, "ofsXyzNormals")?;
+
+        let mut triangles = Vec::with_capacity(num_triangles);
+        for i in 0..num_triangles {
+            let at = triangles_start + i * TRIANGLE_SIZE;
+            let index = [
+                read_u32(data, at),
+                read_u32(data, at + 4),
+                read_u32(data, at + 8),
+            ];
+            // R_LoadMD3 never checks this: a wild index would read past
+            // the vertex array at draw time instead of failing here.
+            if index.iter().any(|&idx| idx as usize >= num_verts) {
+                return Err(ModelError::BadIndex("triangles"));
+            }
+            triangles.push(index);
+        }
+
+        let mut tex_coords = Vec::with_capacity(num_verts);
+        for i in 0..num_verts {
+            let at = st_start + i * ST_SIZE;
+            tex_coords.push([read_f32(data, at), read_f32(data, at + 4)]);
+        }
+
+        let xyz_normals = data[xyz_start..xyz_start + xyz_bytes].to_vec();
+
         surfaces.push(Md3Surface {
             name: read_cstring(&data[pos + 4..pos + 4 + MD3_NAME_LENGTH]),
             flags: i32::from_le_bytes(data[pos + 68..pos + 72].try_into().unwrap()),
@@ -367,6 +520,9 @@ fn read_surfaces(
             num_verts,
             num_triangles,
             shaders,
+            triangles,
+            tex_coords,
+            xyz_normals,
         });
 
         let next = pos
@@ -392,12 +548,39 @@ fn normalize(v: &mut Vec3) {
     }
 }
 
+/// `tr.sinTable[i] = sin( DEG2RAD( i * 360.0f / (FUNCTABLE_SIZE - 1) ) )`.
+/// The lat and lng indexes are at most `255 * (FUNCTABLE_SIZE/256) =
+/// 1020`, so the unmasked C lookups stay in range; masking makes that
+/// invariant explicit.
+fn sin_table(index: usize) -> f32 {
+    let degrees = (index & FUNCTABLE_MASK) as f32 * 360.0 / (FUNCTABLE_SIZE as f32 - 1.0);
+    degrees.to_radians().sin()
+}
+
+/// The packed-normal decode from `LerpMeshVertexes`: the high byte is
+/// `lat`, the low byte `lng`, giving `x = cos(lat) * sin(lng)`,
+/// `y = sin(lat) * sin(lng)`, `z = cos(lng)` through the engine's table.
+fn decode_normal(packed: i16) -> Vec3 {
+    let bits = packed as u16;
+    let lat = (bits >> 8) as usize * (FUNCTABLE_SIZE / 256);
+    let lng = (bits & 0xff) as usize * (FUNCTABLE_SIZE / 256);
+    [
+        sin_table((lat + FUNCTABLE_SIZE / 4) & FUNCTABLE_MASK) * sin_table(lng),
+        sin_table(lat) * sin_table(lng),
+        sin_table((lng + FUNCTABLE_SIZE / 4) & FUNCTABLE_MASK),
+    ]
+}
+
 fn read_f32(data: &[u8], at: usize) -> f32 {
     f32::from_le_bytes(data[at..at + 4].try_into().unwrap())
 }
 
 fn read_u32(data: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(data[at..at + 4].try_into().unwrap())
+}
+
+fn read_i16(data: &[u8], at: usize) -> i16 {
+    i16::from_le_bytes(data[at..at + 2].try_into().unwrap())
 }
 
 fn read_vec3(data: &[u8], at: usize) -> Vec3 {
@@ -430,6 +613,10 @@ mod tests {
         data[at..at + 4].copy_from_slice(&v.to_le_bytes());
     }
 
+    fn put_i16(data: &mut [u8], at: usize, v: i16) {
+        data[at..at + 2].copy_from_slice(&v.to_le_bytes());
+    }
+
     fn put_name(data: &mut [u8], at: usize, width: usize, name: &str) {
         data[at..at + width].fill(0);
         let bytes = name.as_bytes();
@@ -438,18 +625,28 @@ mod tests {
     }
 
     /// Builds a small but structurally complete MD3: two frames, one tag
-    /// per frame, and one surface with one shader. Frame `f` puts its tag
+    /// per frame, and one surface with one shader, one triangle and three
+    /// vertices whose positions and packed normals differ per frame.
+    /// Frame `f` puts its tag
     /// origin at `(f * 10, 0, 0)` and scales the axis rows by `1 + f`, so
     /// interpolation and normalization are both observable.
     fn build_md3(tag_name: &str) -> Vec<u8> {
         let num_frames = 2;
         let num_tags = 1;
         let num_shaders = 1;
+        let num_verts = 3;
+        let num_triangles = 1;
 
         let ofs_frames = HEADER_SIZE;
         let ofs_tags = ofs_frames + num_frames * FRAME_SIZE;
         let ofs_surfaces = ofs_tags + num_frames * num_tags * TAG_SIZE;
-        let surface_ofs_end = SURFACE_SIZE + num_shaders * SHADER_SIZE;
+        // The surface carries real geometry, in the chunk order qfiles.h
+        // documents: shader, triangles, texcoords, compressed vertices.
+        let ofs_shaders = SURFACE_SIZE;
+        let ofs_triangles = ofs_shaders + num_shaders * SHADER_SIZE;
+        let ofs_st = ofs_triangles + num_triangles * TRIANGLE_SIZE;
+        let ofs_xyz = ofs_st + num_verts * ST_SIZE;
+        let surface_ofs_end = ofs_xyz + num_frames * num_verts * XYZ_SIZE;
         let ofs_eof = ofs_surfaces + surface_ofs_end;
 
         let mut data = vec![0u8; ofs_eof];
@@ -501,18 +698,47 @@ mod tests {
             }
         }
 
-        // one surface with one shader
+        // one surface with one shader and one triangle over three vertices
         let surf = ofs_surfaces;
         put_i32(&mut data, surf, 0x33504449 as i32); // surface ident, IDP3
         put_name(&mut data, surf + 4, 64, "body");
         put_i32(&mut data, surf + 72, num_frames as i32);
         put_i32(&mut data, surf + 76, num_shaders as i32);
-        put_i32(&mut data, surf + 80, 100); // numVerts
-        put_i32(&mut data, surf + 84, 90); // numTriangles
-        put_i32(&mut data, surf + 92, SURFACE_SIZE as i32); // ofsShaders
-        put_i32(&mut data, surf + 104, surface_ofs_end as i32); // ofsEnd
-        put_name(&mut data, surf + SURFACE_SIZE, 64, "models/test/body");
-        put_i32(&mut data, surf + SURFACE_SIZE + 64, 3);
+        put_i32(&mut data, surf + 80, num_verts as i32);
+        put_i32(&mut data, surf + 84, num_triangles as i32);
+        put_i32(&mut data, surf + 88, ofs_triangles as i32);
+        put_i32(&mut data, surf + 92, ofs_shaders as i32);
+        put_i32(&mut data, surf + 96, ofs_st as i32);
+        put_i32(&mut data, surf + 100, ofs_xyz as i32);
+        put_i32(&mut data, surf + 104, surface_ofs_end as i32);
+
+        put_name(&mut data, surf + ofs_shaders, 64, "models/test/body");
+        put_i32(&mut data, surf + ofs_shaders + 64, 3);
+
+        put_i32(&mut data, surf + ofs_triangles, 0);
+        put_i32(&mut data, surf + ofs_triangles + 4, 1);
+        put_i32(&mut data, surf + ofs_triangles + 8, 2);
+
+        for vert in 0..num_verts {
+            let at = surf + ofs_st + vert * ST_SIZE;
+            put_f32(&mut data, at, vert as f32 * 0.25);
+            put_f32(&mut data, at + 4, 1.0 - vert as f32 * 0.25);
+        }
+
+        // Frame `f` stores vertex `v` at x = 64*(v+1)*(f+1), y = x/2,
+        // z = 0; frame 0's packed normals point up (+Z), frame 1's
+        // (lat = lng = 64) point along +Y.
+        for frame in 0..num_frames {
+            for vert in 0..num_verts {
+                let at = surf + ofs_xyz + (frame * num_verts + vert) * XYZ_SIZE;
+                let scale = 64.0 * (frame + 1) as f32;
+                put_i16(&mut data, at, ((vert + 1) as f32 * scale) as i16);
+                put_i16(&mut data, at + 2, ((vert + 1) as f32 * scale * 0.5) as i16);
+                put_i16(&mut data, at + 4, 0);
+                let packed: i16 = if frame == 0 { 0 } else { (64 << 8) | 64 };
+                put_i16(&mut data, at + 6, packed);
+            }
+        }
 
         data
     }
@@ -537,8 +763,8 @@ mod tests {
         assert_eq!(model.surfaces.len(), 1);
         let surface = &model.surfaces[0];
         assert_eq!(surface.name, "body");
-        assert_eq!(surface.num_verts, 100);
-        assert_eq!(surface.num_triangles, 90);
+        assert_eq!(surface.num_verts, 3);
+        assert_eq!(surface.num_triangles, 1);
         assert_eq!(surface.shaders.len(), 1);
         assert_eq!(surface.shaders[0].name, "models/test/body");
         assert_eq!(surface.shaders[0].shader_index, 3);
@@ -670,5 +896,118 @@ mod tests {
                                 // A zero ofsEnd would loop forever in the C walk; it is refused.
         put_i32(&mut data, ofs_surfaces + 104, 0);
         assert_eq!(Md3Model::load(&data), Err(ModelError::BadSurfaceChain));
+    }
+
+    #[test]
+    fn geometry_decodes_triangles_tex_coords_and_positions() {
+        let model = Md3Model::load(&build_md3("tag_head")).unwrap();
+        let surface = &model.surfaces[0];
+
+        assert_eq!(surface.triangles, vec![[0, 1, 2]]);
+        assert_eq!(
+            surface.tex_coords,
+            vec![[0.0, 1.0], [0.25, 0.75], [0.5, 0.5]]
+        );
+        assert_eq!(surface.compressed_vertices().len(), 2 * 3 * XYZ_SIZE);
+
+        let frame0 = surface.lerp_vertices(0, 0, 0.0);
+        assert_eq!(frame0.len(), 3);
+        // The raw shorts are 64*(vert+1)*(frame+1) on x and half that on
+        // y; MD3_XYZ_SCALE brings frame 0 back to 1, 2, 3 on x.
+        assert_eq!(frame0[0].position, [1.0, 0.5, 0.0]);
+        assert_eq!(frame0[2].position, [3.0, 1.5, 0.0]);
+        assert_eq!(frame0[1].tex_coords, [0.25, 0.75]);
+
+        // The packed normal 0 (lat = lng = 0) decodes to +Z.
+        assert!(frame0[0].normal[0].abs() < 1e-4);
+        assert!(frame0[0].normal[1].abs() < 1e-4);
+        assert!((frame0[0].normal[2] - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn lerp_vertices_interpolates_positions_and_normals() {
+        let model = Md3Model::load(&build_md3("tag_head")).unwrap();
+        let surface = &model.surfaces[0];
+
+        let lerped = surface.lerp_vertices(1, 0, 0.5);
+        // The positions are dyadic, so the halfway point is exact.
+        assert_eq!(lerped[0].position, [1.5, 0.75, 0.0]);
+        assert_eq!(lerped[1].position, [3.0, 1.5, 0.0]);
+        assert_eq!(lerped[2].position, [4.5, 2.25, 0.0]);
+
+        // +Z lerped halfway with +Y, then renormalized exactly as
+        // VectorArrayNormalize does in the lerping branch.
+        assert!(lerped[0].normal[0].abs() < 0.01);
+        assert!(
+            (lerped[0].normal[1] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01,
+            "{}",
+            lerped[0].normal[1]
+        );
+        assert!(
+            (lerped[0].normal[2] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01,
+            "{}",
+            lerped[0].normal[2]
+        );
+    }
+
+    #[test]
+    fn matching_frames_force_a_zero_backlerp() {
+        let model = Md3Model::load(&build_md3("tag_head")).unwrap();
+        let surface = &model.surfaces[0];
+
+        // RB_SurfaceMesh zeroes backlerp when oldframe == frame, so a
+        // stale backlerp value cannot move the vertices.
+        let forced = surface.lerp_vertices(1, 1, 0.75);
+        assert_eq!(forced, surface.lerp_vertices(1, 1, 0.0));
+        assert_eq!(forced[0].position, [2.0, 1.0, 0.0]);
+        // Frames past the end clamp to the last one and clamp together.
+        assert_eq!(surface.lerp_vertices(9, 9, 0.5), forced);
+    }
+
+    #[test]
+    fn packed_normals_decode_through_the_engine_sin_table() {
+        // The table is sin(i * 360 / (1023) degrees), so the decode is
+        // only exact up to the table's own rounding; 0.01 covers that.
+        let up = decode_normal(0);
+        assert!(up[0].abs() < 1e-4 && up[1].abs() < 1e-4);
+        assert!((up[2] - 1.0).abs() < 1e-4);
+
+        // A quarter turn of lat with a quarter turn of lng lands on +Y.
+        let side = decode_normal((64 << 8) | 64);
+        assert!((side[1] - 1.0).abs() < 0.01);
+        assert!(side[0].abs() < 0.01 && side[2].abs() < 0.01);
+
+        // Every lat/lng pair decodes to a unit vector.
+        for lat in (0..=255u32).step_by(17) {
+            for lng in (0..=255u32).step_by(17) {
+                let packed = (((lat << 8) | lng) & 0xffff) as i16;
+                let normal = decode_normal(packed);
+                let len = normal.iter().map(|c| c * c).sum::<f32>().sqrt();
+                assert!((len - 1.0).abs() < 0.01, "lat={lat} lng={lng} len={len}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_geometry_offset_is_rejected() {
+        let mut data = build_md3("tag_head");
+        let surf = 444; // 108 header + 2*56 frames + 2*112 tags
+        put_i32(&mut data, surf + 96, 0x00ff_ffffu32 as i32); // ofsSt
+        assert_eq!(Md3Model::load(&data), Err(ModelError::BadOffset("ofsSt")));
+    }
+
+    #[test]
+    fn a_triangle_index_past_the_vertices_is_rejected() {
+        let mut data = build_md3("tag_head");
+        let surf = 444;
+        let ofs_triangles =
+            i32::from_le_bytes(data[surf + 88..surf + 92].try_into().unwrap()) as usize;
+        // The second index points at a fourth vertex that does not exist;
+        // R_LoadMD3 would only find out at draw time.
+        put_i32(&mut data, surf + ofs_triangles + 4, 7);
+        assert_eq!(
+            Md3Model::load(&data),
+            Err(ModelError::BadIndex("triangles"))
+        );
     }
 }
