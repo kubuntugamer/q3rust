@@ -61,6 +61,9 @@ NDIR=$(MOUNT_DIR)/null
 UIDIR=$(MOUNT_DIR)/ui
 Q3UIDIR=$(MOUNT_DIR)/q3_ui
 FTDIR=$(MOUNT_DIR)/ft2
+# System FreeType 2 (ft2 sources are not bundled in this release)
+FT_CFLAGS=$(shell pkg-config --cflags freetype2)
+FT_LIBS=$(shell pkg-config --libs freetype2)
 JPDIR=$(MOUNT_DIR)/jpeg-6
 SPLNDIR=$(MOUNT_DIR)/splines
 
@@ -111,7 +114,7 @@ ifeq ($(PLATFORM),linux)
 
   # bk001205: no mo'  -I/usr/include/glide, no FX
   # bk001205: no mo'  -Dstricmp=strcasecmp, see q_shared.h
-  BASE_CFLAGS =  -pipe -fsigned-char
+  BASE_CFLAGS =  -pipe -fsigned-char -fcommon
   # rcg010216: DLL_ONLY for PPC
   ifeq ($(strip $(DLL_ONLY)),true)
     BASE_CFLAGS += -DDLL_ONLY
@@ -210,7 +213,7 @@ VENDOR=unknown
 endif #alpha test
 
 
-BASE_CFLAGS =  -pipe
+BASE_CFLAGS =  -pipe -fcommon
 
 GL_CFLAGS = -I$(MESADIR)/include -I/usr/X11R6/include
 
@@ -515,20 +518,7 @@ Q3OBJ = \
 	$(B)/client/unix_main.o \
 	$(B)/client/unix_net.o \
 	$(B)/client/unix_shared.o \
-	\
-	$(B)/client/ahoptim.o  \
-	$(B)/client/autohint.o \
-	$(B)/client/ftbase.o   \
-	$(B)/client/ftdebug.o  \
-	$(B)/client/ftglyph.o  \
-	$(B)/client/ftinit.o   \
-	$(B)/client/ftmm.o     \
-	$(B)/client/ftsystem.o \
-	$(B)/client/raster1.o  \
-	$(B)/client/sfnt.o     \
-	$(B)/client/sfobjs.o   \
-	$(B)/client/smooth.o   \
-	$(B)/client/truetype.o
+
 #	\
 #	$(B)/client/q_parse.o \
 #	$(B)/client/math_quaternion.o \
@@ -579,6 +569,7 @@ else
 		$(B)/client/linux_qgl.o \
 		$(B)/client/linux_glimp.o \
 		$(B)/client/linux_joystick.o \
+		$(B)/client/linux_signals.o \
 		$(B)/client/linux_snd.o \
 		$(B)/client/snd_mixa.o \
 		$(B)/client/matha.o \
@@ -588,6 +579,7 @@ else
 		$(B)/client/linux_qgl.o \
 		$(B)/client/linux_glimp_smp.o \
 		$(B)/client/linux_joystick.o \
+		$(B)/client/linux_signals.o \
 		$(B)/client/linux_snd.o \
 		$(B)/client/snd_mixa.o \
 		$(B)/client/matha.o
@@ -603,7 +595,7 @@ endif #FreeBSD
 endif #IRIX
 
 $(B)/$(PLATFORM)quake3 : $(Q3OBJ) $(Q3POBJ)
-	$(CC)  -o $@ $(Q3OBJ) $(Q3POBJ) $(GLLDFLAGS) $(LDFLAGS) 
+	$(CC)  -o $@ $(Q3OBJ) $(Q3POBJ) $(GLLDFLAGS) $(LDFLAGS) $(FT_LIBS) 
 # TTimo: splines code requires C++ linking, but splines have not been officially included in the codebase
 #	$(CXX)  -o $@ $(Q3OBJ) $(Q3POBJ) $(GLLDFLAGS) $(LDFLAGS) 
 
@@ -722,7 +714,7 @@ $(B)/client/tr_backend.o : $(RDIR)/tr_backend.c; $(DO_CC)  $(GL_CFLAGS)
 $(B)/client/tr_cmds.o : $(RDIR)/tr_cmds.c; $(DO_CC)  $(GL_CFLAGS) 
 $(B)/client/tr_curve.o : $(RDIR)/tr_curve.c; $(DO_CC)  $(GL_CFLAGS) 
 $(B)/client/tr_flares.o : $(RDIR)/tr_flares.c; $(DO_CC)  $(GL_CFLAGS) 
-$(B)/client/tr_font.o : $(RDIR)/tr_font.c; $(DO_CC)   $(GL_CFLAGS) 
+$(B)/client/tr_font.o : $(RDIR)/tr_font.c; $(DO_CC)   $(GL_CFLAGS) $(FT_CFLAGS) 
 $(B)/client/tr_image.o : $(RDIR)/tr_image.c; $(DO_CC)   $(GL_CFLAGS) 
 $(B)/client/tr_init.o : $(RDIR)/tr_init.c; $(DO_CC)    $(GL_CFLAGS) 
 $(B)/client/tr_light.o : $(RDIR)/tr_light.c; $(DO_CC)  $(GL_CFLAGS) 
@@ -754,6 +746,7 @@ $(B)/client/irix_input.o : $(UDIR)/irix_input.c; $(DO_CC)
 $(B)/client/linux_common.o : $(UDIR)/linux_common.c; $(DO_CC)
 $(B)/client/linux_glimp.o : $(UDIR)/linux_glimp.c; $(DO_CC)  $(GL_CFLAGS) 
 $(B)/client/linux_glimp_smp.o : $(UDIR)/linux_glimp.c; $(DO_SMP_CC)  $(GL_CFLAGS) 
+$(B)/client/linux_signals.o : $(UDIR)/linux_signals.c; $(DO_CC)
 $(B)/client/linux_joystick.o : $(UDIR)/linux_joystick.c; $(DO_CC)  
 $(B)/client/linux_qgl.o : $(UDIR)/linux_qgl.c; $(DO_CC)  $(GL_CFLAGS) 
 $(B)/client/linux_input.o : $(UDIR)/linux_input.c; $(DO_CC) 
@@ -777,19 +770,8 @@ $(B)/client/unzip.o : $(CMDIR)/unzip.c; $(DO_CC)
 $(B)/client/vm.o : $(CMDIR)/vm.c; $(DO_CC) 
 $(B)/client/vm_interpreted.o : $(CMDIR)/vm_interpreted.c; $(DO_CC) 
 
-$(B)/client/ahoptim.o  : $(FTDIR)/ahoptim.c;   $(DO_CC)
-$(B)/client/autohint.o : $(FTDIR)/autohint.c;  $(DO_CC)
-$(B)/client/ftbase.o   : $(FTDIR)/ftbase.c;    $(DO_CC)
-$(B)/client/ftdebug.o  : $(FTDIR)/ftdebug.c;   $(DO_CC)
-$(B)/client/ftglyph.o  : $(FTDIR)/ftglyph.c;   $(DO_CC)
-$(B)/client/ftinit.o   : $(FTDIR)/ftinit.c;    $(DO_CC)
-$(B)/client/ftmm.o     : $(FTDIR)/ftmm.c;      $(DO_CC)
-$(B)/client/ftsystem.o : $(FTDIR)/ftsystem.c;  $(DO_CC)
-$(B)/client/raster1.o  : $(FTDIR)/raster1.c;   $(DO_CC) -DFT_FLAT_COMPILE
-$(B)/client/sfnt.o     : $(FTDIR)/sfnt.c;      $(DO_CC)
-$(B)/client/sfobjs.o   : $(FTDIR)/sfobjs.c;    $(DO_CC)
-$(B)/client/smooth.o   : $(FTDIR)/smooth.c;    $(DO_CC) -DFT_FLAT_COMPILE
-$(B)/client/truetype.o : $(FTDIR)/truetype.c;  $(DO_CC)
+# FreeType 2 is linked from the system library (pkg-config freetype2);
+# the bundled code/ft2 sources are not part of this release.
 
 # TTimo: took out splines code
 #$(B)/client/q_parse.o : $(SPLNDIR)/q_parse.cpp; $(DO_CXX)
@@ -909,6 +891,7 @@ Q3DOBJ = \
 	$(B)/ded/l_struct.o \
 	\
 	$(B)/ded/linux_common.o \
+	$(B)/ded/linux_signals.o \
 	$(B)/ded/unix_main.o \
 	$(B)/ded/unix_net.o \
 	$(B)/ded/unix_shared.o \
@@ -985,6 +968,7 @@ $(B)/ded/l_script.o : $(BLIBDIR)/l_script.c; $(DO_BOT_CC)
 $(B)/ded/l_struct.o : $(BLIBDIR)/l_struct.c; $(DO_BOT_CC) 
 
 $(B)/ded/linux_common.o : $(UDIR)/linux_common.c; $(DO_CC)
+$(B)/ded/linux_signals.o : $(UDIR)/linux_signals.c; $(DO_DED_CC)
 $(B)/ded/unix_main.o : $(UDIR)/unix_main.c; $(DO_DED_CC) 
 $(B)/ded/unix_net.o : $(UDIR)/unix_net.c; $(DO_DED_CC) 
 $(B)/ded/unix_shared.o : $(UDIR)/unix_shared.c; $(DO_DED_CC) 
@@ -1410,7 +1394,7 @@ $(B)/baseq3/ui/ui_spskill.o : $(Q3UIDIR)/ui_spskill.c; $(DO_SHLIB_CC)
 $(B)/baseq3/ui/ui_startserver.o : $(Q3UIDIR)/ui_startserver.c; $(DO_SHLIB_CC) 
 $(B)/baseq3/ui/ui_team.o : $(Q3UIDIR)/ui_team.c; $(DO_SHLIB_CC) 
 $(B)/baseq3/ui/ui_teamorders.o : $(Q3UIDIR)/ui_teamorders.c; $(DO_SHLIB_CC) 
-$(B)/baseq3/ui/ui_syscalls.o : $(Q3UIDIR)/ui_syscalls.c; $(DO_SHLIB_CC) 
+$(B)/baseq3/ui/ui_syscalls.o : $(UIDIR)/ui_syscalls.c; $(DO_SHLIB_CC) 
 $(B)/baseq3/ui/ui_video.o : $(Q3UIDIR)/ui_video.c; $(DO_SHLIB_CC) 
 
 # bk001205 - these wre the only SHLIB compiles in 1.17

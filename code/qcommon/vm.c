@@ -541,7 +541,7 @@ vm_t *VM_Create( const char *module, int (*systemCalls)(int *),
 	// copy or compile the instructions
 	vm->codeLength = header->codeLength;
 
-	if ( interpret >= VMI_COMPILED ) {
+	if ( interpret >= VMI_COMPILED && id386 ) {
 		vm->compiled = qtrue;
 		VM_Compile( vm, header );
 	} else {
@@ -698,7 +698,7 @@ int	QDECL VM_Call( vm_t *vm, int callnum, ... ) {
                             args[4],  args[5],  args[6], args[7],
                             args[8],  args[9], args[10], args[11],
                             args[12], args[13], args[14], args[15]);
-	} else if ( vm->compiled ) {
+	} else if ( vm->compiled && id386 ) {
 		r = VM_CallCompiled( vm, &callnum );
 	} else {
 		r = VM_CallInterpreted( vm, &callnum );
