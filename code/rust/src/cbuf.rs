@@ -65,6 +65,48 @@ impl Cbuf {
         true
     }
 
+    /// Removes and returns the next command line, or `None` when the buffer
+    /// is empty. A `;` inside quotes does not end the line, and a line longer
+    /// than `MAX_CMD_LINE - 1` bytes is clipped, leaving the rest buffered.
+    pub fn next_line(&mut self) -> Option<String> {
+        if self.text.is_empty() {
+            return None;
+        }
+
+        // Find the end of the line: `;` outside quotes, or a newline.
+        let mut quotes = 0usize;
+        let mut i = 0usize;
+        while i < self.text.len() {
+            let c = self.text[i];
+            if c == b'"' {
+                quotes += 1;
+            }
+            if quotes & 1 == 0 && c == b';' {
+                break;
+            }
+            if c == b'\n' || c == b'\r' {
+                break;
+            }
+            i += 1;
+        }
+
+        if i >= MAX_CMD_LINE - 1 {
+            i = MAX_CMD_LINE - 1;
+        }
+
+        let line = String::from_utf8_lossy(&self.text[..i]).into_owned();
+
+        // Remove the consumed text, including the separator. If the line
+        // ran to the end of the buffer, clear it.
+        if i == self.text.len() {
+            self.text.clear();
+        } else {
+            self.text.drain(..i + 1);
+        }
+
+        Some(line)
+    }
+
     /// Runs buffered commands, calling `exec` with each command line.
     /// Stops early when `wait` is set, leaving the rest for the next call.
     pub fn execute<F: FnMut(&str)>(&mut self, mut exec: F) {
@@ -73,39 +115,10 @@ impl Cbuf {
                 self.wait -= 1;
                 break;
             }
-
-            // Find the end of the line: `;` outside quotes, or a newline.
-            let mut quotes = 0usize;
-            let mut i = 0usize;
-            while i < self.text.len() {
-                let c = self.text[i];
-                if c == b'"' {
-                    quotes += 1;
-                }
-                if quotes & 1 == 0 && c == b';' {
-                    break;
-                }
-                if c == b'\n' || c == b'\r' {
-                    break;
-                }
-                i += 1;
+            match self.next_line() {
+                Some(line) => exec(&line),
+                None => break,
             }
-
-            if i >= MAX_CMD_LINE - 1 {
-                i = MAX_CMD_LINE - 1;
-            }
-
-            let line = String::from_utf8_lossy(&self.text[..i]).into_owned();
-
-            // Remove the consumed text, including the separator. If the line
-            // ran to the end of the buffer, clear it.
-            if i == self.text.len() {
-                self.text.clear();
-            } else {
-                self.text.drain(..i + 1);
-            }
-
-            exec(&line);
         }
     }
 }
