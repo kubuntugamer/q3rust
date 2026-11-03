@@ -23,6 +23,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #ifndef _QCOMMON_H_
 #define _QCOMMON_H_
 
+#include <stdint.h>
 #include "../qcommon/cm_public.h"
 
 //#define	PRE_RELEASE_DEMO
@@ -310,7 +311,7 @@ typedef enum {
 } sharedTraps_t;
 
 void	VM_Init( void );
-vm_t	*VM_Create( const char *module, int (*systemCalls)(int *), 
+vm_t	*VM_Create( const char *module, int (*systemCalls)(intptr_t *), 
 				   vmInterpret_t interpret );
 // module should be bare: "cgame", not "cgame.dll" or "vm/cgame.qvm"
 
@@ -322,8 +323,10 @@ int		QDECL VM_Call( vm_t *vm, int callNum, ... );
 
 void	VM_Debug( int level );
 
-void	*VM_ArgPtr( int intValue );
-void	*VM_ExplicitArgPtr( vm_t *vm, int intValue );
+// syscall arguments are pointer-sized so that dynamically loaded modules can
+// hand the engine real 64-bit pointers
+void	*VM_ArgPtr( intptr_t intValue );
+void	*VM_ExplicitArgPtr( vm_t *vm, intptr_t intValue );
 
 /*
 ==============================================================

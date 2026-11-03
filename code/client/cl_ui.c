@@ -757,9 +757,11 @@ static int FloatAsInt( float f ) {
 	return temp;
 }
 
-void *VM_ArgPtr( int intValue );
+void *VM_ArgPtr( intptr_t intValue );
 #define	VMA(x) VM_ArgPtr(args[x])
-#define	VMF(x)	((float *)args)[x]
+// syscall arguments are pointer sized, so a float handed over as its bit
+// pattern lives in the low word of one slot rather than a packed float array
+#define	VMF(x)	(*(float *)&args[x])
 
 /*
 ====================
@@ -768,7 +770,7 @@ CL_UISystemCalls
 The ui module is making a system call
 ====================
 */
-int CL_UISystemCalls( int *args ) {
+int CL_UISystemCalls( intptr_t *args ) {
 	switch( args[0] ) {
 	case UI_ERROR:
 		Com_Error( ERR_DROP, "%s", VMA(1) );

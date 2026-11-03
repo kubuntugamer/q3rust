@@ -363,7 +363,7 @@ int	VM_CallInterpreted( vm_t *vm, int *args ) {
 	*(int *)&image[ programStack ] = -1;	// will terminate the loop on return
 
 	vm->callLevel = 0;
-	
+
 	VM_Debug(0);
 
 //	vm_debugLevel=2;
@@ -500,6 +500,8 @@ nextInstruction2:
 			opStack--;
 			if ( programCounter < 0 ) {
 				// system call
+				intptr_t	parms[16];
+				int			i;
 				int		r;
 				int		temp;
 #ifdef DEBUG_VM
@@ -517,8 +519,13 @@ nextInstruction2:
 #endif
 				*(int *)&image[ programStack + 4 ] = -1 - programCounter;
 
-//VM_LogSyscalls( (int *)&image[ programStack + 4 ] );
-				r = vm->systemCall( (int *)&image[ programStack + 4 ] );
+				// the bytecode stack holds 32-bit cells; widen them for the
+				// syscall table, which takes pointer-sized arguments
+				for ( i = 0; i < (int)( sizeof( parms ) / sizeof( parms[0] ) ); i++ ) {
+					parms[i] = ((int *)&image[ programStack + 4 ])[i];
+				}
+
+				r = vm->systemCall( parms );
 
 #ifdef DEBUG_VM
 				// this is just our stack frame pointer, only needed

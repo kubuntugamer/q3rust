@@ -21,6 +21,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 */
 #include "../game/q_shared.h"
 #include "qcommon.h"
+#include <stdint.h>
 
 typedef enum {
 	OP_UNDEF, 
@@ -127,7 +128,7 @@ struct vm_s {
     // DO NOT MOVE OR CHANGE THESE WITHOUT CHANGING THE VM_OFFSET_* DEFINES
     // USED BY THE ASM CODE
     int			programStack;		// the vm may be recursively entered
-    int			(*systemCall)( int *parms );
+    int			(*systemCall)( intptr_t *parms );
 
 	//------------------------------------
    
