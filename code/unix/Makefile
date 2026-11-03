@@ -515,7 +515,6 @@ Q3OBJ = \
 	$(B)/client/unix_net.o \
 	$(B)/client/unix_shared.o \
 	\
-	$(B)/client/ahoptim.o  \
 	$(B)/client/autohint.o \
 	$(B)/client/ftbase.o   \
 	$(B)/client/ftdebug.o  \
@@ -764,7 +763,6 @@ $(B)/client/unzip.o : $(CMDIR)/unzip.c; $(DO_CC)
 $(B)/client/vm.o : $(CMDIR)/vm.c; $(DO_CC) 
 $(B)/client/vm_interpreted.o : $(CMDIR)/vm_interpreted.c; $(DO_CC) 
 
-$(B)/client/ahoptim.o  : $(FTDIR)/ahoptim.c;   $(DO_CC)
 $(B)/client/autohint.o : $(FTDIR)/autohint.c;  $(DO_CC)
 $(B)/client/ftbase.o   : $(FTDIR)/ftbase.c;    $(DO_CC)
 $(B)/client/ftdebug.o  : $(FTDIR)/ftdebug.c;   $(DO_CC)
@@ -1595,7 +1593,6 @@ Q3SOBJ = \
 	$(B)/q3static/ahoptim.o  \
 	$(B)/q3static/autohint.o \
 	$(B)/q3static/ftbase.o   \
-	$(B)/q3static/ftdebug.o  \
 	$(B)/q3static/ftglyph.o  \
 	$(B)/q3static/ftinit.o   \
 	$(B)/q3static/ftmm.o     \
