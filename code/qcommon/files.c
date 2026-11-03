@@ -2757,7 +2757,9 @@ static void FS_Startup( const char *gameName ) {
 	Com_Printf( "----- FS_Startup -----\n" );
 
 	fs_debug = Cvar_Get( "fs_debug", "0", 0 );
-	fs_useUring = Cvar_Get( "fs_useUring", "0", CVAR_ARCHIVE );
+	// 1 = read through io_uring when the kernel provides it, falling back to
+	// stdio per read if the ring cannot be set up. 0 forces stdio.
+	fs_useUring = Cvar_Get( "fs_useUring", "1", CVAR_ARCHIVE );
 	fs_copyfiles = Cvar_Get( "fs_copyfiles", "0", CVAR_INIT );
 	fs_cdpath = Cvar_Get ("fs_cdpath", Sys_DefaultCDPath(), CVAR_INIT );
 	fs_basepath = Cvar_Get ("fs_basepath", Sys_DefaultInstallPath(), CVAR_INIT );

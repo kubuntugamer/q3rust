@@ -444,24 +444,29 @@ unsigned int Sys_ProcessorCount()
 
 /*
 =============================================================================
-io_uring file reads (opt-in via fs_useUring, default 0)
+io_uring file reads (fs_useUring, default on)
 
-Ported from kubuntugamer/vkq3ng code/unix/linux_uring.c, stage 1 only:
-synchronous pread-style reads through a raw io_uring ring with no liburing
-dependency. Any failure returns 0 so FS_Read falls back to fread.
-No performance claim is made; this path is unbenchmarked.
+pread-style reads through a raw io_uring ring with no liburing dependency.
+A read is split into 64 KiB operations that are all queued at once and
+reaped together, so a large pak/bsp read costs one submit + one wait
+instead of one enter per chunk. Any shortfall or error returns 0 and FS_Read
+falls back to fread, so a kernel without io_uring (or a sandbox that blocks
+io_uring_setup) is not fatal.
 =============================================================================
 */
+#if defined(__linux__)
 #include <linux/io_uring.h>
 #include <sys/syscall.h>
 #include <stdint.h>
+#endif
 
-#ifdef SYS_io_uring_setup
+#if defined(__linux__) && defined(SYS_io_uring_setup)
 
 #define URING_QD 32
 
 typedef struct {
 	int ring_fd;
+	unsigned *sq_head;
 	unsigned *sq_tail;
 	unsigned *sq_mask;
 	unsigned *sq_array;
@@ -527,6 +532,7 @@ static int Sys_UringInit(void) {
 		return 0;
 	}
 
+	uring.sq_head = (unsigned *)((char *)sq_ptr + params.sq_off.head);
 	uring.sq_tail = (unsigned *)((char *)sq_ptr + params.sq_off.tail);
 	uring.sq_mask = (unsigned *)((char *)sq_ptr + params.sq_off.ring_mask);
 	uring.sq_array = (unsigned *)((char *)sq_ptr + params.sq_off.array);
@@ -535,34 +541,125 @@ static int Sys_UringInit(void) {
 	uring.cq_mask = (unsigned *)((char *)cq_ptr + params.cq_off.ring_mask);
 	uring.cqes = (struct io_uring_cqe *)((char *)cq_ptr + params.cq_off.cqes);
 	uring.ready = 1;
+	Com_DPrintf( "io_uring: ring ready (queue depth %d, %d entries), file reads use it\n",
+		URING_QD, params.sq_entries );
 	return 1;
 }
 
-/* One ring round-trip: read len bytes at off into buf. Returns bytes or -1. */
-static long Sys_UringPReadOnce(int fd, void *buf, unsigned len, unsigned long long off) {
-	unsigned tail = uring_load_acquire(uring.sq_tail);
-	unsigned index = tail & *uring.sq_mask;
-	struct io_uring_sqe *sqe = &uring.sqes[index];
-	unsigned head;
-	long res;
+#define URING_CHUNK	65536		/* bytes per queued read */
 
+/* Per-batch bookkeeping, indexed by SQE user_data. */
+typedef struct {
+	unsigned	off;		/* byte offset within the caller's buffer */
+	unsigned	len;
+	long		res;
+	int			done;
+} uring_op_t;
+
+static uring_op_t uring_ops[URING_QD];
+
+/* Queue one read at an absolute file offset. Returns 0 when the SQ is full. */
+static int Sys_UringQueue(int fd, void *buf, unsigned len, unsigned long long off, unsigned user_data) {
+	unsigned head = uring_load_acquire(uring.sq_head);
+	unsigned tail = uring_load_acquire(uring.sq_tail);
+	struct io_uring_sqe *sqe;
+	unsigned index;
+
+	if (tail - head >= (unsigned)URING_QD) {
+		return 0;
+	}
+
+	index = tail & *uring.sq_mask;
+	sqe = &uring.sqes[index];
 	memset(sqe, 0, sizeof(*sqe));
 	sqe->opcode = IORING_OP_READ;
 	sqe->fd = fd;
 	sqe->off = off;
 	sqe->addr = (unsigned long long)(uintptr_t)buf;
 	sqe->len = len;
+	sqe->user_data = user_data;
 	uring.sq_array[index] = index;
 	uring_store_release(uring.sq_tail, tail + 1);
+	return 1;
+}
 
-	if (syscall(SYS_io_uring_enter, uring.ring_fd, 1, 1, IORING_ENTER_GETEVENTS, NULL, 0) < 0) {
-		return -1;
+/*
+Read exactly len bytes at an absolute offset. The range is split into
+URING_CHUNK pieces, submitted as one batch and reaped as one batch.
+Completions may arrive out of order, so each one is matched to its request
+through user_data instead of assumed to be sequential.
+Returns len on success, -1 on any error or short read.
+*/
+static long Sys_UringPReadRange(int fd, void *buf, unsigned len, unsigned long long off) {
+	char *p = (char *)buf;
+	unsigned issued = 0;	/* bytes covered by queued/submitted ops */
+	unsigned reaped = 0;	/* bytes verified */
+
+	while (reaped < len) {
+		unsigned batch = 0;
+		unsigned left;
+		unsigned i;
+
+		while (batch < URING_QD && issued < len) {
+			unsigned chunk = len - issued;
+
+			if (chunk > URING_CHUNK) {
+				chunk = URING_CHUNK;
+			}
+			if (!Sys_UringQueue(fd, p + issued, chunk, off + issued, batch)) {
+				break;
+			}
+			uring_ops[batch].off = issued;
+			uring_ops[batch].len = chunk;
+			uring_ops[batch].res = 0;
+			uring_ops[batch].done = 0;
+			issued += chunk;
+			batch++;
+		}
+
+		if (batch == 0) {
+			return -1;
+		}
+
+		/* Submit the batch and wait for all of it to complete. */
+		if (syscall(SYS_io_uring_enter, uring.ring_fd, batch, batch, IORING_ENTER_GETEVENTS, NULL, 0) < 0) {
+			return -1;
+		}
+
+		for (left = batch; left > 0; ) {
+			unsigned head = uring_load_acquire(uring.cq_head);
+
+			if (head == uring_load_acquire(uring.cq_tail)) {
+				/* Completion not published yet; wait for one more. */
+				if (syscall(SYS_io_uring_enter, uring.ring_fd, 0, 1, IORING_ENTER_GETEVENTS, NULL, 0) < 0) {
+					return -1;
+				}
+				continue;
+			}
+
+			{
+				struct io_uring_cqe *cqe = &uring.cqes[head & *uring.cq_mask];
+				unsigned idx = (unsigned)cqe->user_data;
+
+				if (idx < batch) {
+					uring_ops[idx].res = cqe->res;
+					uring_ops[idx].done = 1;
+				}
+			}
+			uring_store_release(uring.cq_head, head + 1);
+			left--;
+		}
+
+		for (i = 0; i < batch; i++) {
+			if (!uring_ops[i].done || uring_ops[i].res != (long)uring_ops[i].len) {
+				return -1;
+			}
+		}
+
+		reaped = issued;
 	}
 
-	head = uring_load_acquire(uring.cq_head);
-	res = uring.cqes[head & *uring.cq_mask].res;
-	uring_store_release(uring.cq_head, head + 1);
-	return res;
+	return (long)len;
 }
 
 /*
@@ -572,9 +669,8 @@ or error, with the position restored so the caller can fread instead.
 */
 int Sys_UringHandleRead(void *vf, void *buf, int len) {
 	FILE *f = (FILE *)vf;
-	char *p = (char *)buf;
 	long off;
-	int fd, total = 0;
+	int fd;
 
 	if (len <= 0) {
 		return 1;
@@ -587,15 +683,11 @@ int Sys_UringHandleRead(void *vf, void *buf, int len) {
 	if (fd < 0 || off < 0) {
 		return 0;
 	}
-	while (total < len) {
-		long r = Sys_UringPReadOnce(fd, p + total, (unsigned)(len - total), (unsigned long long)(off + total));
-		if (r <= 0) {
-			fseek(f, off, SEEK_SET);
-			return 0;
-		}
-		total += (int)r;
+	if (Sys_UringPReadRange(fd, buf, (unsigned)len, (unsigned long long)off) != (long)len) {
+		fseek(f, off, SEEK_SET);
+		return 0;
 	}
-	return fseek(f, off + total, SEEK_SET) == 0;
+	return fseek(f, off + len, SEEK_SET) == 0;
 }
 
 #else
