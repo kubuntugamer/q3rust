@@ -760,11 +760,9 @@ endif
 endif
 
 $(B)/client/unzip.o : $(CMDIR)/unzip.c; $(DO_CC) 
-$(B)/client/vm.o : $(CMDIR)/vm.c; $(DO_CC) 
 $(B)/client/vm_interpreted.o : $(CMDIR)/vm_interpreted.c; $(DO_CC) 
 
 $(B)/client/autohint.o : $(FTDIR)/autohint.c;  $(DO_CC)
-$(B)/client/ftbase.o   : $(FTDIR)/ftbase.c;    $(DO_CC)
 $(B)/client/ftdebug.o  : $(FTDIR)/ftdebug.c;   $(DO_CC)
 $(B)/client/ftglyph.o  : $(FTDIR)/ftglyph.c;   $(DO_CC)
 $(B)/client/ftinit.o   : $(FTDIR)/ftinit.c;    $(DO_CC)
