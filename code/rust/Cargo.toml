@@ -6,3 +6,9 @@ license = "GPL-2.0-or-later"
 description = "Rust port of the Quake III Arena engine core (Phase 1 scaffold)"
 
 [dependencies]
+
+[features]
+default = []
+# The C ABI surface for linking into the engine. Off by default so test
+# binaries do not need the engine's Com_*/Cvar_*/FS_* symbols.
+engine-ffi = []
