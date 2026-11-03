@@ -36,6 +36,12 @@ BDIR=$(MOUNT_DIR)/../run
 # BUILD_NAME=$(BUILD_NAME)
 BUILD_NAME=quake3.x86
 
+# SDL2 provides the audio backend (code/unix/sdl_snd.c). pkg-config is used
+# when available so non-default SDL install prefixes work; -lSDL2 is the
+# fallback.
+SDL2_CFLAGS := $(shell pkg-config --cflags sdl2 2>/dev/null)
+SDL2_LIBS := $(shell pkg-config --libs sdl2 2>/dev/null || echo -lSDL2)
+
 
 
 #############################################################################
@@ -162,7 +168,7 @@ DEBUG_CFLAGS += -O
 
   THREAD_LDFLAGS=-lpthread
   LDFLAGS=-ldl -lm
-  GLLDFLAGS=-L/usr/X11R6/lib -lX11 -lXext -lXxf86dga -lXxf86vm
+  GLLDFLAGS=-L/usr/X11R6/lib -lX11 -lXext -lXxf86dga -lXxf86vm -lXi
 
   ifeq ($(ARCH),axp)
     TARGETS=\
@@ -174,7 +180,6 @@ DEBUG_CFLAGS += -O
 	  $(B)/$(PLATFORM)q3ded \
 	  $(B)/baseq3/cgame$(ARCH).$(SHLIBEXT) \
 	  $(B)/baseq3/qagame$(ARCH).$(SHLIBEXT) \
-	  $(B)/baseq3/ui$(ARCH).$(SHLIBEXT)     \
 	  $(B)/missionpack/cgame$(ARCH).$(SHLIBEXT) \
 	  $(B)/missionpack/qagame$(ARCH).$(SHLIBEXT) \
 	  $(B)/missionpack/ui$(ARCH).$(SHLIBEXT) \
@@ -184,6 +189,13 @@ DEBUG_CFLAGS += -O
 #	  $(B)/missionpack/vm/qagame.qvm \
 #	  $(B)/missionpack/vm/cgame.qvm \
 #	  $(B)/missionpack/vm/ui.qvm
+
+# The baseq3 UI is not built from this tree: code/q3_ui/ui_syscalls.c was
+# never part of the release, and the ranking menus (ui_login.c, ui_signup.c,
+# ui_rankings.c, ui_rankstatus.c, ui_specifyleague.c) call trap_CL_UI_Rank*
+# entry points that neither ui_public.h nor cl_ui.c define. The shipped
+# uix86_64.so / ui.qvm is used instead. Re-add
+# $(B)/baseq3/ui$(ARCH).$(SHLIBEXT) here once those sources exist.
   endif
 
 ## $(B)/$(PLATFORM)q3static   \
@@ -239,7 +251,7 @@ THREAD_LDFLAGS=-lpthread
 LDFLAGS=-lm
 #GLLDFLAGS=-L/usr/X11R6/lib -L$(MESADIR)/lib -lGL -lX11 -lXext -lXxf86dga -lXxf86vm
 #GLLDFLAGS=-L/usr/X11/lib -lGL -lX11 -lXext -lm
-GLLDFLAGS=-L/usr/X11R6/lib -lGL -lX11 -lXext -lXxf86dga -lXxf86vm
+GLLDFLAGS=-L/usr/X11R6/lib -lGL -lX11 -lXext -lXxf86dga -lXxf86vm -lXi
 
 ifeq ($(ARCH),axp)
 TARGETS=\
@@ -249,7 +261,6 @@ TARGETS=\
 	$(B)/$(PLATFORM)quake3 \
 	$(B)/baseq3/cgame$(ARCH).$(SHLIBEXT) \
 	$(B)/baseq3/qagame$(ARCH).$(SHLIBEXT) \
-	$(B)/baseq3/ui$(ARCH).$(SHLIBEXT)     \
 	$(B)/missionpack/cgame$(ARCH).$(SHLIBEXT) \
 	$(B)/missionpack/qagame$(ARCH).$(SHLIBEXT) \
 	$(B)/missionpack/ui$(ARCH).$(SHLIBEXT)
@@ -328,6 +339,8 @@ DO_BOT_CC=$(CC) $(CFLAGS) -DBOTLIB  -o $@ -c $<   # $(SHLIBCFLAGS) # bk001212
 DO_DEBUG_CC=$(CC) $(DEBUG_CFLAGS) -o $@ -c $<
 DO_SHLIB_CC=$(CC) $(CFLAGS) $(SHLIBCFLAGS) -o $@ -c $<
 DO_SHLIB_DEBUG_CC=$(CC) $(DEBUG_CFLAGS) $(SHLIBCFLAGS) -o $@ -c $<
+DO_SDL_CC=$(CC) $(CFLAGS) $(SDL2_CFLAGS) -o $@ -c $<
+DO_SDL_STATIC_CC=$(CC) $(CFLAGS) $(SDL2_CFLAGS) -DQ3_STATIC -o $@ -c $<
 DO_AS=$(CC) $(CFLAGS) -DELF -x assembler-with-cpp -o $@ -c $<
 DO_NASM=nasm -f elf -o $@  $<
 DO_DED_CC=$(CC) -DDEDICATED -DC_ONLY $(CFLAGS) -o $@ -c $<
@@ -513,20 +526,10 @@ Q3OBJ = \
 	\
 	$(B)/client/unix_main.o \
 	$(B)/client/unix_net.o \
-	$(B)/client/unix_shared.o \
-	\
-	$(B)/client/autohint.o \
-	$(B)/client/ftbase.o   \
-	$(B)/client/ftdebug.o  \
-	$(B)/client/ftglyph.o  \
-	$(B)/client/ftinit.o   \
-	$(B)/client/ftmm.o     \
-	$(B)/client/ftsystem.o \
-	$(B)/client/raster1.o  \
-	$(B)/client/sfnt.o     \
-	$(B)/client/sfobjs.o   \
-	$(B)/client/smooth.o   \
-	$(B)/client/truetype.o
+	$(B)/client/unix_shared.o
+# The bundled FreeType 1 sources (code/ft2) are not part of this tree and
+# nothing in the client references them, so they are not built. Keep this
+# list empty rather than pointing at files that do not exist.
 #	\
 #	$(B)/client/q_parse.o \
 #	$(B)/client/math_quaternion.o \
@@ -553,7 +556,8 @@ ifeq ($(PLATFORM),freebsd)
 		$(B)/client/linux_common.o \
 		$(B)/client/linux_qgl.o \
 		$(B)/client/linux_glimp.o \
-		$(B)/client/linux_snd.o \
+		$(B)/client/linux_gpu.o \
+		$(B)/client/sdl_snd.o \
 		$(B)/client/snd_mixa.o \
 		$(B)/client/matha.o   \
 		$(B)/client/ftol.o \
@@ -574,7 +578,9 @@ else
 		$(B)/client/linux_qgl.o \
 		$(B)/client/linux_glimp.o \
 		$(B)/client/linux_joystick.o \
-		$(B)/client/linux_snd.o \
+		$(B)/client/linux_signals.o \
+		$(B)/client/linux_gpu.o \
+		$(B)/client/sdl_snd.o \
 		$(B)/client/snd_mixa.o \
 		$(B)/client/matha.o \
 
@@ -583,7 +589,9 @@ else
 		$(B)/client/linux_qgl.o \
 		$(B)/client/linux_glimp_smp.o \
 		$(B)/client/linux_joystick.o \
-		$(B)/client/linux_snd.o \
+		$(B)/client/linux_signals.o \
+		$(B)/client/linux_gpu.o \
+		$(B)/client/sdl_snd.o \
 		$(B)/client/snd_mixa.o \
 		$(B)/client/matha.o
 
@@ -594,12 +602,12 @@ endif #FreeBSD
 endif #IRIX
 
 $(B)/$(PLATFORM)quake3 : $(Q3OBJ) $(Q3POBJ)
-	$(CC)  -o $@ $(Q3OBJ) $(Q3POBJ) $(GLLDFLAGS) $(LDFLAGS) 
+	$(CC)  -o $@ $(Q3OBJ) $(Q3POBJ) $(GLLDFLAGS) $(SDL2_LIBS) $(LDFLAGS) 
 # TTimo: splines code requires C++ linking, but splines have not been officially included in the codebase
 #	$(CXX)  -o $@ $(Q3OBJ) $(Q3POBJ) $(GLLDFLAGS) $(LDFLAGS) 
 
 $(B)/$(PLATFORM)quake3-smp : $(Q3OBJ) $(Q3POBJ_SMP)
-	$(CC)  -o $@ $(Q3OBJ) $(Q3POBJ_SMP) $(GLLDFLAGS) \
+	$(CC)  -o $@ $(Q3OBJ) $(Q3POBJ_SMP) $(GLLDFLAGS) $(SDL2_LIBS) \
 		$(THREAD_LDFLAGS) $(LDFLAGS) 
 
 $(B)/client/cl_cgame.o : $(CDIR)/cl_cgame.c; $(DO_CC)   
@@ -746,9 +754,11 @@ $(B)/client/linux_common.o : $(UDIR)/linux_common.c; $(DO_CC)
 $(B)/client/linux_glimp.o : $(UDIR)/linux_glimp.c; $(DO_CC)  $(GL_CFLAGS) 
 $(B)/client/linux_glimp_smp.o : $(UDIR)/linux_glimp.c; $(DO_SMP_CC)  $(GL_CFLAGS) 
 $(B)/client/linux_joystick.o : $(UDIR)/linux_joystick.c; $(DO_CC)  
+$(B)/client/linux_signals.o : $(UDIR)/linux_signals.c; $(DO_CC)
 $(B)/client/linux_qgl.o : $(UDIR)/linux_qgl.c; $(DO_CC)  $(GL_CFLAGS) 
 $(B)/client/linux_input.o : $(UDIR)/linux_input.c; $(DO_CC) 
-$(B)/client/linux_snd.o : $(UDIR)/linux_snd.c; $(DO_CC) 
+$(B)/client/linux_gpu.o : $(UDIR)/linux_gpu.c; $(DO_CC) 
+$(B)/client/sdl_snd.o : $(UDIR)/sdl_snd.c; $(DO_SDL_CC) 
 $(B)/client/snd_mixa.o : $(UDIR)/snd_mixa.s; $(DO_AS) 
 $(B)/client/matha.o : $(UDIR)/matha.s; $(DO_AS) 
 
@@ -760,19 +770,8 @@ endif
 endif
 
 $(B)/client/unzip.o : $(CMDIR)/unzip.c; $(DO_CC) 
+$(B)/client/vm.o : $(CMDIR)/vm.c; $(DO_CC) 
 $(B)/client/vm_interpreted.o : $(CMDIR)/vm_interpreted.c; $(DO_CC) 
-
-$(B)/client/autohint.o : $(FTDIR)/autohint.c;  $(DO_CC)
-$(B)/client/ftdebug.o  : $(FTDIR)/ftdebug.c;   $(DO_CC)
-$(B)/client/ftglyph.o  : $(FTDIR)/ftglyph.c;   $(DO_CC)
-$(B)/client/ftinit.o   : $(FTDIR)/ftinit.c;    $(DO_CC)
-$(B)/client/ftmm.o     : $(FTDIR)/ftmm.c;      $(DO_CC)
-$(B)/client/ftsystem.o : $(FTDIR)/ftsystem.c;  $(DO_CC)
-$(B)/client/raster1.o  : $(FTDIR)/raster1.c;   $(DO_CC) -DFT_FLAT_COMPILE
-$(B)/client/sfnt.o     : $(FTDIR)/sfnt.c;      $(DO_CC)
-$(B)/client/sfobjs.o   : $(FTDIR)/sfobjs.c;    $(DO_CC)
-$(B)/client/smooth.o   : $(FTDIR)/smooth.c;    $(DO_CC) -DFT_FLAT_COMPILE
-$(B)/client/truetype.o : $(FTDIR)/truetype.c;  $(DO_CC)
 
 # TTimo: took out splines code
 #$(B)/client/q_parse.o : $(SPLNDIR)/q_parse.cpp; $(DO_CXX)
@@ -892,6 +891,7 @@ Q3DOBJ = \
 	$(B)/ded/l_struct.o \
 	\
 	$(B)/ded/linux_common.o \
+	$(B)/ded/linux_signals.o \
 	$(B)/ded/unix_main.o \
 	$(B)/ded/unix_net.o \
 	$(B)/ded/unix_shared.o \
@@ -965,6 +965,7 @@ $(B)/ded/l_script.o : $(BLIBDIR)/l_script.c; $(DO_BOT_CC)
 $(B)/ded/l_struct.o : $(BLIBDIR)/l_struct.c; $(DO_BOT_CC) 
 
 $(B)/ded/linux_common.o : $(UDIR)/linux_common.c; $(DO_CC)
+$(B)/ded/linux_signals.o : $(UDIR)/linux_signals.c; $(DO_DED_CC)
 $(B)/ded/unix_main.o : $(UDIR)/unix_main.c; $(DO_DED_CC) 
 $(B)/ded/unix_net.o : $(UDIR)/unix_net.c; $(DO_DED_CC) 
 $(B)/ded/unix_shared.o : $(UDIR)/unix_shared.c; $(DO_DED_CC) 
@@ -1588,23 +1589,11 @@ Q3SOBJ = \
 	$(B)/q3static/unix_net.o \
 	$(B)/q3static/unix_shared.o \
 	\
-	$(B)/q3static/ahoptim.o  \
-	$(B)/q3static/autohint.o \
-	$(B)/q3static/ftbase.o   \
-	$(B)/q3static/ftglyph.o  \
-	$(B)/q3static/ftinit.o   \
-	$(B)/q3static/ftmm.o     \
-	$(B)/q3static/ftsystem.o \
-	$(B)/q3static/raster1.o  \
-	$(B)/q3static/sfnt.o     \
-	$(B)/q3static/sfobjs.o   \
-	$(B)/q3static/smooth.o   \
-	$(B)/q3static/truetype.o \
-	\
 	$(B)/q3static/linux_qgl.o \
 	$(B)/q3static/linux_glimp.o \
 	$(B)/q3static/linux_joystick.o \
-	$(B)/q3static/linux_snd.o \
+	$(B)/q3static/linux_gpu.o \
+	$(B)/q3static/sdl_snd.o \
 	$(B)/q3static/snd_mixa.o \
 	$(B)/q3static/matha.o
 
@@ -1753,7 +1742,8 @@ $(B)/q3static/linux_glimp.o : $(UDIR)/linux_glimp.c; $(DO_CC) -DQ3_STATIC
 $(B)/q3static/linux_joystick.o : $(UDIR)/linux_joystick.c; $(DO_CC) -DQ3_STATIC  
 $(B)/q3static/linux_qgl.o : $(UDIR)/linux_qgl.c; $(DO_CC) -DQ3_STATIC 
 $(B)/q3static/linux_input.o : $(UDIR)/linux_input.c; $(DO_CC) -DQ3_STATIC 
-$(B)/q3static/linux_snd.o : $(UDIR)/linux_snd.c; $(DO_CC) -DQ3_STATIC 
+$(B)/q3static/linux_gpu.o : $(UDIR)/linux_gpu.c; $(DO_CC) -DQ3_STATIC 
+$(B)/q3static/sdl_snd.o : $(UDIR)/sdl_snd.c; $(DO_SDL_STATIC_CC) 
 $(B)/q3static/snd_mixa.o : $(UDIR)/snd_mixa.s; $(DO_AS) 
 $(B)/q3static/matha.o : $(UDIR)/matha.s; $(DO_AS) 
 $(B)/q3static/unzip.o : $(CMDIR)/unzip.c; $(DO_CC) -DQ3_STATIC 
@@ -1766,20 +1756,6 @@ ifeq ($(DLL_ONLY),false)
 $(B)/q3static/vm_ppc.o : $(CMDIR)/vm_ppc.c; $(DO_CC) -DQ3_STATIC
 endif
 endif
-
-$(B)/q3static/ahoptim.o  : $(FTDIR)/ahoptim.c;   $(DO_CC) -DQ3_STATIC
-$(B)/q3static/autohint.o : $(FTDIR)/autohint.c;  $(DO_CC) -DQ3_STATIC
-$(B)/q3static/ftbase.o   : $(FTDIR)/ftbase.c;    $(DO_CC) -DQ3_STATIC
-$(B)/q3static/ftdebug.o  : $(FTDIR)/ftdebug.c;   $(DO_CC) -DQ3_STATIC
-$(B)/q3static/ftglyph.o  : $(FTDIR)/ftglyph.c;   $(DO_CC) -DQ3_STATIC
-$(B)/q3static/ftinit.o   : $(FTDIR)/ftinit.c;    $(DO_CC) -DQ3_STATIC
-$(B)/q3static/ftmm.o     : $(FTDIR)/ftmm.c;      $(DO_CC) -DQ3_STATIC
-$(B)/q3static/ftsystem.o : $(FTDIR)/ftsystem.c;  $(DO_CC) -DQ3_STATIC
-$(B)/q3static/raster1.o  : $(FTDIR)/raster1.c;   $(DO_CC) -DQ3_STATIC -DFT_FLAT_COMPILE
-$(B)/q3static/sfnt.o     : $(FTDIR)/sfnt.c;      $(DO_CC) -DQ3_STATIC
-$(B)/q3static/sfobjs.o   : $(FTDIR)/sfobjs.c;    $(DO_CC) -DQ3_STATIC
-$(B)/q3static/smooth.o   : $(FTDIR)/smooth.c;    $(DO_CC) -DQ3_STATIC -DFT_FLAT_COMPILE
-$(B)/q3static/truetype.o : $(FTDIR)/truetype.c;  $(DO_CC) -DQ3_STATIC
 
 ## add BASEQ3 CGAME
 Q3SOBJ += \
@@ -1989,7 +1965,7 @@ $(B)/q3static/bg_slidemove.o : $(GDIR)/bg_slidemove.c; $(DO_CC) -DQ3_STATIC
 
 
 $(B)/$(PLATFORM)q3static : $(Q3SOBJ) 
-	$(CC) $(CFLAGS) -o $@ $(Q3SOBJ)  $(GLLDFLAGS) $(LDFLAGS) 
+	$(CC) $(CFLAGS) -o $@ $(Q3SOBJ)  $(GLLDFLAGS) $(SDL2_LIBS) $(LDFLAGS) 
 
 
 #############################################################################
