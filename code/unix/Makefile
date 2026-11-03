@@ -356,7 +356,7 @@ makedirs:
 	@if [ ! -d $(B)/client ];then mkdir $(B)/client;fi
 	@if [ ! -d $(B)/ded ];then mkdir $(B)/ded;fi
 	@if [ ! -d $(B)/ref ];then mkdir $(B)/ref;fi
-	@if [ ! -d $(B)/ft2 ];then mkdir $(B)/ft2;fi
+
 	@if [ ! -d $(B)/baseq3 ];then mkdir $(B)/baseq3;fi
 	@if [ ! -d $(B)/baseq3/cgame ];then mkdir $(B)/baseq3/cgame;fi
 	@if [ ! -d $(B)/baseq3/game ];then mkdir $(B)/baseq3/game;fi
