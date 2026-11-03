@@ -24,6 +24,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "../game/q_shared.h"
 #include "qcommon.h"
 #include <setjmp.h>
+#include <stdint.h>
 #ifdef __linux__
 #include <netinet/in.h>
 #else
@@ -1526,8 +1527,9 @@ void Com_InitHunkMemory( void ) {
 	if ( !s_hunkData ) {
 		Com_Error( ERR_FATAL, "Hunk data failed to allocate %i megs", s_hunkTotal / (1024*1024) );
 	}
-	// cacheline align
-	s_hunkData = (byte *) ( ( (int)s_hunkData + 31 ) & ~31 );
+	// cacheline align; the pointer must be widened, not truncated to int,
+	// or the hunk base loses its high bits on 64-bit builds
+	s_hunkData = (byte *) ( ( (uintptr_t)s_hunkData + 31 ) & ~(uintptr_t)31 );
 	Hunk_Clear();
 
 	Cmd_AddCommand( "meminfo", Com_Meminfo_f );

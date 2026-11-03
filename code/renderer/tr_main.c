@@ -1003,7 +1003,14 @@ qsort replacement
 
 =================
 */
-#define	SWAP_DRAW_SURF(a,b) temp=((int *)a)[0];((int *)a)[0]=((int *)b)[0];((int *)b)[0]=temp; temp=((int *)a)[1];((int *)a)[1]=((int *)b)[1];((int *)b)[1]=temp;
+// swap whole drawSurf_t values: a pointer member makes the record wider than
+// the two ints the original macro copied
+#define	SWAP_DRAW_SURF(a,b) \
+	do { \
+		drawSurf_t surfTemp = *(drawSurf_t *)(a); \
+		*(drawSurf_t *)(a) = *(drawSurf_t *)(b); \
+		*(drawSurf_t *)(b) = surfTemp; \
+	} while ( 0 )
 
 /* this parameter defines the cutoff between using quick sort and
    insertion sort for arrays; arrays with lengths shorter or equal to the
@@ -1013,7 +1020,6 @@ qsort replacement
 
 static void shortsort( drawSurf_t *lo, drawSurf_t *hi ) {
     drawSurf_t	*p, *max;
-	int			temp;
 
     while (hi > lo) {
         max = lo;
@@ -1042,13 +1048,8 @@ void qsortFast (
     char *mid;                  /* points to middle of subarray */
     char *loguy, *higuy;        /* traveling pointers for partition step */
     unsigned size;              /* size of the sub-array */
-    char *lostk[30], *histk[30];
-    int stkptr;                 /* stack for saving sub-array to be processed */
-	int	temp;
+    char *lostk[30], *histk[30];    int stkptr;				/* stack for saving sub-array to be processed */
 
-	if ( sizeof(drawSurf_t) != 8 ) {
-		ri.Error( ERR_DROP, "change SWAP_DRAW_SURF macro" );
-	}
 
     /* Note: the number of stack entries required is no more than
        1 + log2(size), so 30 is sufficient for any array */

@@ -2514,7 +2514,9 @@ static void FS_AddGameDirectory( const char *path, const char *dir ) {
 		sorted[i] = pakfiles[i];
 	}
 
-	qsort( sorted, numfiles, 4, paksort );
+	// element size is a pointer, not 4 bytes: hardcoding 4 corrupts the
+	// array on 64-bit builds where char * is 8 bytes wide
+	qsort( sorted, numfiles, sizeof( sorted[0] ), paksort );
 
 	for ( i = 0 ; i < numfiles ; i++ ) {
 		pakfile = FS_BuildOSPath( path, dir, sorted[i] );
