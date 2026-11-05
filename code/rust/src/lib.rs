@@ -1,19 +1,39 @@
-//! Rust port of the Quake III Arena engine core.
+//! Rust port of the Quake III Arena engine.
 //!
-//! Phase 1 scaffold: this crate builds beside the C code and does not
-//! replace any of it yet. Modules are added one at a time in later phases.
+//! The client is Rust end to end: SDL for the window, input and audio device,
+//! Vulkan for drawing, and this crate for the engine itself. Modules ported
+//! from the C tree keep the C names (`Con_Printf`, `Com_Parse` and so on) and
+//! say which file they came from.
 
+pub mod assets;
+pub mod audio;
+pub mod bg_misc;
+pub mod bg_pmove;
+pub mod bsp;
 pub mod cbuf;
+pub mod client;
 pub mod cmd;
+pub mod collision;
+pub mod console;
 pub mod cvar;
+pub mod font;
 pub mod fs;
+pub mod game;
+pub mod game_imports;
 pub mod hunk;
+pub mod mmap;
 pub mod model;
 pub mod pak;
+pub mod pmove;
+pub mod prediction;
 pub mod ref_types;
 pub mod refexport;
 pub mod refimport;
 pub mod shader;
+pub mod shared_entity;
+pub mod texture;
+pub mod vk;
+pub mod vm;
 pub mod zone;
 
 /// Maximum length of a path, matching `MAX_OSPATH` in the C code.

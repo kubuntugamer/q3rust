@@ -9,12 +9,15 @@
 //! - the end-of-central-directory record is found by scanning backwards,
 //!   which tolerates trailing comments and data prepended to the archive;
 //! - entry names are stored lowercased and lookups ignore ASCII case;
-//! - stored (uncompressed) entries can be read; deflated entries are listed
-//!   with their method but reading them returns [`PakError::Unsupported`],
-//!   because the inflate code has not been ported.
+//! - stored entries are handed back as a borrow on the archive, and deflated
+//!   ones are inflated into a fresh buffer (a stock `baseq3` pak is almost
+//!   entirely deflated, so both paths matter).
 //!
 //! Not supported: ZIP64, multi-disk archives and encrypted entries. The C
 //! reader accepts the first two; they are rejected here with a clear error.
+
+use std::borrow::Cow;
+use std::io::Read;
 
 const EOCD_SIG: u32 = 0x0605_4b50;
 const CENTRAL_SIG: u32 = 0x0201_4b50;
@@ -244,16 +247,36 @@ impl<'a> Pak<'a> {
             .find(|e| e.name.eq_ignore_ascii_case(name))
     }
 
-    /// Reads the bytes of a stored entry. Deflated entries are refused
-    /// because the inflate code is not ported yet.
-    pub fn read(&self, entry: &Entry) -> Result<&'a [u8], PakError> {
-        if entry.method != METHOD_STORED {
-            return Err(PakError::Unsupported("compressed entry"));
+    /// Reads an entry. A stored entry borrows straight out of the archive; a
+    /// deflated one is inflated into a fresh buffer, which is what every file
+    /// in a stock `baseq3` pak needs (`unzip -v` calls them `Defl:X`).
+    pub fn read(&self, entry: &Entry) -> Result<Cow<'a, [u8]>, PakError> {
+        match entry.method {
+            METHOD_STORED => {
+                if entry.compressed_size != entry.uncompressed_size {
+                    return Err(PakError::BadEntry);
+                }
+                self.stored(entry).map(Cow::Borrowed)
+            }
+            METHOD_DEFLATE => {
+                let compressed = self.stored(entry)?;
+                let mut bytes = Vec::with_capacity(entry.uncompressed_size as usize);
+                let mut decoder = flate2::read::DeflateDecoder::new(compressed);
+                decoder
+                    .read_to_end(&mut bytes)
+                    .map_err(|_| PakError::BadEntry)?;
+                if bytes.len() != entry.uncompressed_size as usize {
+                    return Err(PakError::Truncated);
+                }
+                Ok(Cow::Owned(bytes))
+            }
+            _ => Err(PakError::Unsupported("compression method")),
         }
-        if entry.compressed_size != entry.uncompressed_size {
-            return Err(PakError::BadEntry);
-        }
+    }
 
+    /// The entry's bytes as stored in the archive: the payload after the local
+    /// header and its name and extra fields.
+    fn stored(&self, entry: &Entry) -> Result<&'a [u8], PakError> {
         let local = self
             .prefix_len
             .checked_add(entry.local_offset as usize)
@@ -280,7 +303,7 @@ impl<'a> Pak<'a> {
     }
 
     /// Finds and reads an entry in one step.
-    pub fn read_file(&self, name: &str) -> Result<&'a [u8], PakError> {
+    pub fn read_file(&self, name: &str) -> Result<Cow<'a, [u8]>, PakError> {
         let entry = self.find(name).ok_or(PakError::NotFound)?;
         self.read(entry)
     }
@@ -329,8 +352,9 @@ pub(crate) mod tests {
     }
 
     /// Builds a classic single-disk zip with the given entries. `method` is
-    /// written to the headers but the payload is always the raw bytes, which
-    /// is only meaningful for stored entries.
+    /// written to the headers but the payload is copied verbatim, so the
+    /// result only describes stored entries; `deflated_zip` fixes up the
+    /// sizes for a real deflate entry.
     pub(crate) fn build_zip(prefix: &[u8], files: &[(&str, &[u8], u16)]) -> Vec<u8> {
         let mut out = prefix.to_vec();
         let mut central = Vec::new();
@@ -431,9 +455,17 @@ pub(crate) mod tests {
         );
         let pak = Pak::open(&zip).unwrap();
 
-        assert_eq!(pak.read_file("FIRST.TXT").unwrap(), b"hello");
-        assert_eq!(pak.read_file("second.txt").unwrap(), b"world");
-        assert_eq!(pak.read(pak.find("first.txt").unwrap()).unwrap(), b"hello");
+        assert_eq!(pak.read_file("FIRST.TXT").unwrap().as_ref(), b"hello");
+        assert_eq!(pak.read_file("second.txt").unwrap().as_ref(), b"world");
+        assert_eq!(
+            pak.read(pak.find("first.txt").unwrap()).unwrap().as_ref(),
+            b"hello"
+        );
+        // Stored entries borrow from the archive instead of being copied.
+        assert!(matches!(
+            pak.read(pak.find("first.txt").unwrap()).unwrap(),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]
@@ -443,19 +475,76 @@ pub(crate) mod tests {
         let pak = Pak::open(&zip).unwrap();
 
         assert_eq!(pak.prefix_len(), prefix.len());
-        assert_eq!(pak.read_file("file.txt").unwrap(), b"payload");
+        assert_eq!(pak.read_file("file.txt").unwrap().as_ref(), b"payload");
+    }
+
+    /// Builds a zip whose single entry is raw-deflated, the way Q3's paks are.
+    pub(crate) fn deflated_zip(name: &str, payload: &[u8]) -> Vec<u8> {
+        use flate2::write::DeflateEncoder;
+        use std::io::Write;
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut zip = build_zip(b"", &[(name, &compressed, METHOD_DEFLATE)]);
+        // `build_zip` writes the payload length into both size fields; a
+        // deflated entry records the smaller stored size and the real one.
+        let eocd = find_eocd(&zip).unwrap();
+        let central = u32_from(&zip[eocd + 16..eocd + 20]) as usize;
+        for (field, value) in [(20u32, compressed.len() as u32), (24, payload.len() as u32)] {
+            let at = central + field as usize;
+            zip[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let local = u32_from(&zip[central + 42..central + 46]) as usize;
+        for (field, value) in [(18u32, compressed.len() as u32), (22, payload.len() as u32)] {
+            let at = local + field as usize;
+            zip[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        zip
     }
 
     #[test]
-    fn deflated_entries_are_listed_but_not_read() {
-        let zip = build_zip(b"", &[("compressed.txt", b"raw", METHOD_DEFLATE)]);
+    fn deflated_entries_are_inflated() {
+        let payload = b"deflated pak data, which a stock baseq3 uses everywhere".repeat(8);
+        let zip = deflated_zip("compressed.txt", &payload);
         let pak = Pak::open(&zip).unwrap();
         let entry = pak.find("compressed.txt").unwrap();
 
         assert_eq!(entry.method(), METHOD_DEFLATE);
+        assert!(
+            entry.compressed_size() < entry.uncompressed_size(),
+            "the fixture should actually compress"
+        );
+
+        let bytes = pak.read(entry).unwrap();
+        assert!(matches!(bytes, Cow::Owned(_)), "inflated data cannot borrow");
+        assert_eq!(bytes.as_ref(), payload.as_slice());
+        assert_eq!(pak.read_file("COMPRESSED.TXT").unwrap().as_ref(), payload.as_slice());
+    }
+
+    #[test]
+    fn corrupt_deflate_data_is_reported() {
+        let mut zip = deflated_zip("compressed.txt", b"some payload to compress");
+        // Local headers precede the central directory, so the payload starts
+        // right after this entry's 30-byte header and its name.
+        let data = LOCAL_LEN + "compressed.txt".len();
+        zip[data..data + 4].fill(0xff);
+
+        let pak = Pak::open(&zip).unwrap();
         assert_eq!(
-            pak.read(entry),
-            Err(PakError::Unsupported("compressed entry"))
+            pak.read_file("compressed.txt"),
+            Err(PakError::BadEntry)
+        );
+    }
+
+    #[test]
+    fn unknown_compression_is_refused() {
+        let zip = build_zip(b"", &[("odd.txt", b"raw", 12)]);
+        let pak = Pak::open(&zip).unwrap();
+        assert_eq!(
+            pak.read(pak.find("odd.txt").unwrap()),
+            Err(PakError::Unsupported("compression method"))
         );
     }
 

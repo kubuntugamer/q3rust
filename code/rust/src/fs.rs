@@ -182,7 +182,9 @@ impl<'a> FileSystem<'a> {
             None => Err(FsError::NotFound),
             Some(Source::Dir(dir)) => dir.read(name).ok_or(FsError::NotFound),
             Some(Source::Pack { pak, entry }) => {
-                pak.read(entry).map(<[u8]>::to_vec).map_err(FsError::Pak)
+                pak.read(entry)
+                    .map(|bytes| bytes.into_owned())
+                    .map_err(FsError::Pak)
             }
         }
     }
@@ -268,8 +270,8 @@ pub fn hash_file_name(fname: &str, hash_size: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pak::tests::build_zip;
-    use crate::pak::{METHOD_DEFLATE, METHOD_STORED};
+    use crate::pak::tests::{build_zip, deflated_zip};
+    use crate::pak::METHOD_STORED;
     use std::collections::HashMap;
 
     /// In-memory directory, so the tests never touch the OS.
@@ -425,16 +427,14 @@ mod tests {
     }
 
     #[test]
-    fn deflated_pack_entries_report_the_pak_error() {
-        let zip = build_zip(b"", &[("packed.cfg", b"x", METHOD_DEFLATE)]);
+    fn deflated_pack_entries_are_inflated() {
+        let payload = b"a deflated config, the way baseq3 stores its files".repeat(4);
+        let zip = deflated_zip("packed.cfg", &payload);
         let pak = Pak::open(&zip).unwrap();
         let mut fs = FileSystem::new();
         fs.push_pack(&pak);
 
-        assert_eq!(
-            fs.read("packed.cfg"),
-            Err(FsError::Pak(PakError::Unsupported("compressed entry")))
-        );
+        assert_eq!(fs.read("packed.cfg"), Ok(payload.to_vec()));
     }
 
     #[test]
