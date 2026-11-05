@@ -22,6 +22,8 @@ pub struct Assets {
     /// Paks that could not be opened, kept for the console.
     errors: Vec<String>,
     bytes: u64,
+    /// The directory the paks came from, for the console.
+    directory: PathBuf,
 }
 
 impl Assets {
@@ -53,6 +55,7 @@ impl Assets {
             names: Vec::new(),
             errors: Vec::new(),
             bytes: 0,
+            directory: directory.to_path_buf(),
         };
 
         for path in paths {
@@ -105,9 +108,83 @@ impl Assets {
         home.join(".q3a").join("baseq3")
     }
 
-    /// Mounts [`Assets::default_directory`].
+    /// Every place a stock install may live, most specific first: an explicit
+    /// override, the classic home directory, the XDG data directory, the
+    /// distribution install roots where `game-data-packager` output lands, and
+    /// the Steam library a player may already own the game in. Nothing here is
+    /// written to, and no asset is ever copied into the tree.
+    pub fn candidates() -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        if let Some(directory) = std::env::var_os("Q3_BASEQ3") {
+            found.push(PathBuf::from(directory));
+        }
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        found.push(home.join(".q3a").join("baseq3"));
+
+        let xdg = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local").join("share"));
+        found.push(xdg.join("quake3").join("baseq3"));
+
+        for root in [
+            "/usr/share/games/quake3",
+            "/usr/share/quake3",
+            "/usr/local/share/games/quake3",
+        ] {
+            found.push(Path::new(root).join("baseq3"));
+        }
+
+        for library in [
+            home.join(".steam")
+                .join("steam")
+                .join("steamapps")
+                .join("common"),
+            home.join(".local")
+                .join("share")
+                .join("Steam")
+                .join("steamapps")
+                .join("common"),
+        ] {
+            found.push(library.join("Quake 3 Arena").join("baseq3"));
+        }
+        found
+    }
+
+    /// The first candidate that actually holds a pak. A directory that exists
+    /// but has none (an empty `~/.q3a`, say) is skipped rather than reported.
+    pub fn discover_in(candidates: &[PathBuf]) -> Result<PathBuf, String> {
+        for directory in candidates {
+            if has_pak(directory) {
+                return Ok(directory.clone());
+            }
+        }
+        let tried: Vec<String> = candidates
+            .iter()
+            .map(|directory| directory.display().to_string())
+            .collect();
+        Err(format!(
+            "no baseq3 holding a pak was found; looked in {}",
+            tried.join(", ")
+        ))
+    }
+
+    /// Mounts the install the player already has. `$Q3_BASEQ3` is an explicit
+    /// choice, so when it is set it is used as-is and a failure is reported
+    /// instead of silently falling back to another copy. Otherwise the first
+    /// of [`Assets::candidates`] that holds a pak is mounted.
     pub fn mount_default() -> Result<Self, String> {
-        Assets::mount(&Assets::default_directory())
+        if let Some(directory) = std::env::var_os("Q3_BASEQ3") {
+            return Assets::mount(Path::new(&directory));
+        }
+        let directory = Assets::discover_in(&Assets::candidates())?;
+        Assets::mount(&directory)
+    }
+
+    /// The directory the mounted paks came from.
+    pub fn source_directory(&self) -> &Path {
+        &self.directory
     }
 
     /// Every mounted file whose path starts with `prefix` and ends with
@@ -170,6 +247,22 @@ impl Assets {
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
+}
+
+/// Whether `directory` holds at least one pak. Discovery uses this rather
+/// than mounting, so a broken install is not opened twice.
+fn has_pak(directory: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path.is_file()
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("pk3"))
+    })
 }
 
 /// Strips leading separators and turns backslashes into slashes.
@@ -263,6 +356,46 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert!(Assets::mount(Path::new("/nonexistent/q3rust/baseq3")).is_err());
+    }
+
+    #[test]
+    fn discovery_skips_directories_without_paks() {
+        let empty = temp_dir("discover-empty");
+        let full = temp_dir("discover-full");
+        std::fs::write(
+            full.join("pak0.pk3"),
+            build_zip(b"", &[("a.txt", b"ok", 0)]),
+        )
+        .unwrap();
+
+        let candidates = vec![empty.clone(), full.clone()];
+        assert_eq!(Assets::discover_in(&candidates).unwrap(), full);
+
+        std::fs::remove_dir_all(&empty).unwrap();
+        std::fs::remove_dir_all(&full).unwrap();
+    }
+
+    #[test]
+    fn discovery_reports_every_place_it_looked() {
+        let missing = std::env::temp_dir().join("q3rust-assets-nowhere");
+        let err = Assets::discover_in(&[missing.clone()]).unwrap_err();
+        assert!(err.contains("no baseq3 holding a pak"), "{err}");
+        assert!(err.contains(&missing.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn the_mounted_directory_is_recorded() {
+        let dir = temp_dir("source");
+        std::fs::write(
+            dir.join("pak0.pk3"),
+            build_zip(b"", &[("a.txt", b"ok", 0)]),
+        )
+        .unwrap();
+
+        let assets = Assets::mount(&dir).unwrap();
+        assert_eq!(assets.source_directory(), dir.as_path());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

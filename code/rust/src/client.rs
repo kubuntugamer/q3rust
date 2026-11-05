@@ -591,7 +591,7 @@ impl Client {
                 "game data: {} paks, {:.1} MB, from {}",
                 assets.len(),
                 assets.bytes() as f64 / (1024.0 * 1024.0),
-                Assets::default_directory().display()
+                assets.source_directory().display()
             ),
             None => "game data: none mounted".to_string(),
         };
