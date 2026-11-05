@@ -15,3 +15,7 @@ code/unix/debugi386/
 # and never extract the QVMs or media out of one into the tree.
 *.pk3
 *.qvm
+
+# Packages built by game-data-packager are build outputs too, and they are
+# large: keep a stray one out of the tree.
+*.deb
