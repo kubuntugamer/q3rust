@@ -118,6 +118,12 @@ pub struct Pak<'a> {
 }
 
 impl<'a> Pak<'a> {
+    /// Every entry name in the archive, as stored (lowercased by
+    /// `FS_LoadZipFile`).
+    pub fn entry_names(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|entry| entry.name.as_str())
+    }
+
     /// Parses the central directory of a zip/pk3 held in `data`.
     pub fn open(data: &'a [u8]) -> Result<Self, PakError> {
         let eocd = find_eocd(data).ok_or(PakError::NotAZip)?;

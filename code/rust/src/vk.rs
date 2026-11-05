@@ -55,6 +55,9 @@ pub struct Vulkan {
     depth_memory: vk::DeviceMemory,
     depth_view: vk::ImageView,
     world_pipeline: vk::Pipeline,
+    /// The skybox: the world shaders again, but it neither tests nor writes
+    /// depth, so the map always draws over it.
+    sky_pipeline: vk::Pipeline,
     world_buffer: vk::Buffer,
     world_memory: vk::DeviceMemory,
     world_mapped: *mut u8,
@@ -190,6 +193,7 @@ impl Vulkan {
                 depth_memory: vk::DeviceMemory::null(),
                 depth_view: vk::ImageView::null(),
                 world_pipeline: vk::Pipeline::null(),
+                sky_pipeline: vk::Pipeline::null(),
                 world_buffer: vk::Buffer::null(),
                 world_memory: vk::DeviceMemory::null(),
                 world_mapped: std::ptr::null_mut(),
@@ -797,9 +801,28 @@ impl Vulkan {
     /// The world pipeline: 3D vertexes, one texture, depth tested and written,
     /// and no blending. It is rebuilt with the render pass on resize.
     fn create_world_pipeline(&mut self) -> Result<(), String> {
-        if self.world_pipeline != vk::Pipeline::null() {
+        self.create_world_pipeline_with(false)
+    }
+
+    /// The skybox pipeline: the same vertexes and shaders, with depth testing
+    /// and depth writing off.
+    fn create_sky_pipeline(&mut self) -> Result<(), String> {
+        self.create_world_pipeline_with(true)
+    }
+
+    fn create_world_pipeline_with(&mut self, sky: bool) -> Result<(), String> {
+        let existing = if sky {
+            self.sky_pipeline
+        } else {
+            self.world_pipeline
+        };
+        if existing != vk::Pipeline::null() {
             unsafe {
-                self.device.destroy_pipeline(self.world_pipeline, None);
+                self.device.destroy_pipeline(existing, None);
+            }
+            if sky {
+                self.sky_pipeline = vk::Pipeline::null();
+            } else {
                 self.world_pipeline = vk::Pipeline::null();
             }
         }
@@ -875,8 +898,8 @@ impl Vulkan {
             let multisample = vk::PipelineMultisampleStateCreateInfo::default()
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1);
             let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-                .depth_test_enable(true)
-                .depth_write_enable(true)
+                .depth_test_enable(!sky)
+                .depth_write_enable(!sky)
                 .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
                 .depth_bounds_test_enable(false)
                 .stencil_test_enable(false);
@@ -914,7 +937,11 @@ impl Vulkan {
 
             self.device.destroy_shader_module(vertex_module, None);
             self.device.destroy_shader_module(fragment_module, None);
-            self.world_pipeline = created[0];
+            if sky {
+                self.sky_pipeline = created[0];
+            } else {
+                self.world_pipeline = created[0];
+            }
             Ok(())
         }
     }
@@ -982,6 +1009,29 @@ impl Vulkan {
         vertices: &[Vertex3D],
         mvp: &[f32; 16],
     ) -> Result<(), String> {
+        self.draw_world_with(self.world_pipeline, texture, vertices, mvp)
+    }
+
+    /// Adds one sky face to the frame, through the pipeline that leaves depth
+    /// alone.
+    pub fn draw_sky(
+        &mut self,
+        texture: &Texture,
+        vertices: &[Vertex3D],
+        mvp: &[f32; 16],
+    ) -> Result<(), String> {
+        self.draw_world_with(self.sky_pipeline, texture, vertices, mvp)
+    }
+
+    /// Adds one world batch to the frame. `mvp` is the 16-float view-projection
+    /// matrix; the depth buffer settles what overlaps what.
+    fn draw_world_with(
+        &mut self,
+        pipeline: vk::Pipeline,
+        texture: &Texture,
+        vertices: &[Vertex3D],
+        mvp: &[f32; 16],
+    ) -> Result<(), String> {
         if vertices.is_empty() {
             return Ok(());
         }
@@ -1016,11 +1066,8 @@ impl Vulkan {
             constants[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
         }
         unsafe {
-            self.device.cmd_bind_pipeline(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.world_pipeline,
-            );
+            self.device
+                .cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
             self.device
                 .cmd_bind_vertex_buffers(command_buffer, 0, &[self.world_buffer], &[offset]);
             self.device.cmd_bind_descriptor_sets(
@@ -1626,6 +1673,7 @@ impl Vulkan {
             self.pipeline = created[0];
             self.additive_pipeline = created[1];
             self.create_world_pipeline()?;
+            self.create_sky_pipeline()?;
             Ok(())
         }
     }
@@ -1845,6 +1893,9 @@ impl Drop for Vulkan {
             }
             if self.world_pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(self.world_pipeline, None);
+            }
+            if self.sky_pipeline != vk::Pipeline::null() {
+                self.device.destroy_pipeline(self.sky_pipeline, None);
             }
             if !self.world_mapped.is_null() {
                 self.device.unmap_memory(self.world_memory);

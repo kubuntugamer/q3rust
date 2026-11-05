@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 use crate::assets::Assets;
 use crate::bsp::{Bsp, BspFace, DrawVert, LIGHTMAP_SIZE, SURFACE_PATCH};
+use crate::shader::{Parser, ShaderScript, ShaderTextIndex};
 use crate::texture;
 use crate::vk::{Texture, Vertex3D, Vulkan};
 
@@ -23,6 +24,8 @@ use crate::vk::{Texture, Vertex3D, Vulkan};
 pub const DEFAULT_VIEW_HEIGHT: f32 = 26.0;
 /// `SURF_NODRAW`: a shader the map never draws.
 const SURF_NODRAW: u32 = 0x80;
+/// `SURF_SKY`: the surface the skybox is drawn in place of.
+const SURF_SKY: u32 = 0x4;
 /// `r_znear`.
 const NEAR_PLANE: f32 = 4.0;
 /// Far plane, far enough for the largest stock map.
@@ -43,6 +46,8 @@ pub struct World {
     /// Triangle-list vertexes; every batch indexes a range of this.
     pub vertices: Vec<Vertex3D>,
     pub batches: Vec<Batch>,
+    /// The map's skybox, when its sky shader names one.
+    pub sky: Option<Sky>,
     textures: Vec<(String, Texture)>,
     /// Surfaces in the file.
     pub faces: usize,
@@ -63,6 +68,13 @@ impl World {
         let verts = bsp.draw_verts().map_err(|e| e.to_string())?;
         let indexes = bsp.draw_indexes().map_err(|e| e.to_string())?;
         let lightmaps = bsp.lightmaps();
+
+        // The sky is whatever shader the map flags as sky: its script names
+        // the six faces, so the name has to survive the face loop.
+        let sky_name = faces.iter().find_map(|face| {
+            let shader = textures.get(face.shader)?;
+            (shader.surface_flags & SURF_SKY != 0).then(|| shader.name.clone())
+        });
 
         let mut by_shader: HashMap<usize, Vec<Vertex3D>> = HashMap::new();
         let mut drawn = 0usize;
@@ -143,6 +155,7 @@ impl World {
         let mut world = World {
             vertices: Vec::new(),
             batches: Vec::new(),
+            sky: None,
             textures: Vec::new(),
             faces: faces.len(),
             drawn,
@@ -194,6 +207,10 @@ impl World {
             });
         }
 
+        world.sky = sky_name
+            .as_deref()
+            .and_then(|name| Sky::load(vk, assets, name).ok().flatten());
+
         Ok(world)
     }
 
@@ -211,7 +228,174 @@ impl World {
         for (_, texture) in self.textures {
             vk.destroy_texture(texture);
         }
+        if let Some(sky) = self.sky {
+            sky.shutdown(vk);
+        }
     }
+}
+
+/// How far the skybox sits from the camera. It has to stay inside
+/// [`FAR_PLANE`], or the sky would be clipped away.
+const SKY_RADIUS: f32 = 2048.0;
+
+/// One face of the skybox: its normal and the two texture axes across it.
+#[derive(Clone, Copy, Debug)]
+struct SkyFace {
+    normal: [f32; 3],
+    s: [f32; 3],
+    t: [f32; 3],
+}
+
+impl SkyFace {
+    fn corner(&self, origin: [f32; 3], s: f32, t: f32) -> [f32; 3] {
+        [
+            origin[0] + (self.normal[0] + s * self.s[0] + t * self.t[0]) * SKY_RADIUS,
+            origin[1] + (self.normal[1] + s * self.s[1] + t * self.t[1]) * SKY_RADIUS,
+            origin[2] + (self.normal[2] + s * self.s[2] + t * self.t[2]) * SKY_RADIUS,
+        ]
+    }
+
+    /// The two triangles of this face, rebuilt around `origin` so the box
+    /// always surrounds the camera.
+    fn vertices(&self, origin: [f32; 3]) -> [Vertex3D; 6] {
+        let vertex = |s: f32, t: f32| Vertex3D {
+            pos: self.corner(origin, s, t),
+            uv: [s * 0.5 + 0.5, t * 0.5 + 0.5],
+            color: [255, 255, 255, 255],
+        };
+        let (a, b, c, d) = (
+            vertex(-1.0, -1.0),
+            vertex(1.0, -1.0),
+            vertex(1.0, 1.0),
+            vertex(-1.0, 1.0),
+        );
+        [a, b, c, a, c, d]
+    }
+}
+
+/// The six faces in `skyParms` order — `rt, bk, lf, ft, up, dn` — with the
+/// texture axes Q3's sky vectors give them (forward +X, left +Y, up +Z).
+const SKY_FACES: [SkyFace; 6] = [
+    SkyFace {
+        normal: [1.0, 0.0, 0.0],
+        s: [0.0, -1.0, 0.0],
+        t: [0.0, 0.0, -1.0],
+    },
+    SkyFace {
+        normal: [0.0, 1.0, 0.0],
+        s: [1.0, 0.0, 0.0],
+        t: [0.0, 0.0, -1.0],
+    },
+    SkyFace {
+        normal: [-1.0, 0.0, 0.0],
+        s: [0.0, 1.0, 0.0],
+        t: [0.0, 0.0, -1.0],
+    },
+    SkyFace {
+        normal: [0.0, -1.0, 0.0],
+        s: [-1.0, 0.0, 0.0],
+        t: [0.0, 0.0, -1.0],
+    },
+    SkyFace {
+        normal: [0.0, 0.0, 1.0],
+        s: [1.0, 0.0, 0.0],
+        t: [0.0, 1.0, 0.0],
+    },
+    SkyFace {
+        normal: [0.0, 0.0, -1.0],
+        s: [1.0, 0.0, 0.0],
+        t: [0.0, -1.0, 0.0],
+    },
+];
+
+/// The map's skybox: the six outer faces its sky shader names.
+pub struct Sky {
+    faces: Vec<(Texture, SkyFace)>,
+}
+
+impl Sky {
+    /// Loads the faces `shader_name`'s `skyParms` names. A shader with no sky
+    /// parms, or a face that is not in any pak, leaves the map without a
+    /// skybox rather than stopping the client.
+    fn load(vk: &mut Vulkan, assets: &Assets, shader_name: &str) -> Result<Option<Sky>, String> {
+        let scripts = shader_scripts(assets);
+        let Some(names) = sky_outerbox(&scripts, shader_name) else {
+            return Ok(None);
+        };
+
+        let mut faces = Vec::with_capacity(SKY_FACES.len());
+        for (index, name) in names.iter().enumerate() {
+            let Some((width, height, rgba)) = load_image(assets, name) else {
+                return Ok(None);
+            };
+            let texture = vk.create_repeating_texture(width, height, &rgba)?;
+            faces.push((texture, SKY_FACES[index]));
+        }
+        Ok(Some(Sky { faces }))
+    }
+
+    /// Draws the box around the camera. It writes no depth, so the map's
+    /// geometry draws over it even when the sky is submitted first.
+    pub fn draw(&self, vk: &mut Vulkan, camera: &Camera, mvp: &[f32; 16]) -> Result<(), String> {
+        for (texture, face) in &self.faces {
+            vk.draw_sky(texture, &face.vertices(camera.origin), mvp)?;
+        }
+        Ok(())
+    }
+
+    /// Releases the six textures; the renderer must outlive this call.
+    pub fn shutdown(self, vk: &mut Vulkan) {
+        for (texture, _) in self.faces {
+            vk.destroy_texture(texture);
+        }
+    }
+}
+
+/// The `scripts/*.shader` files, as text, in pak order.
+fn shader_scripts(assets: &Assets) -> Vec<String> {
+    assets
+        .files("scripts/", ".shader")
+        .into_iter()
+        .filter_map(|path| assets.read(&path))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .collect()
+}
+
+/// `FindShaderInShaderText` plus `ParseShader`, reduced to what the skybox
+/// needs: the six outer face names of the named shader.
+fn sky_outerbox(scripts: &[String], shader_name: &str) -> Option<[String; 6]> {
+    let texts: Vec<&str> = scripts.iter().map(String::as_str).collect();
+    let index = ShaderTextIndex::build(&texts);
+    let text = index.find(shader_name)?;
+
+    let mut script = ShaderScript::default();
+    script.name = shader_name.to_string();
+    let mut parser = Parser::new(text);
+    parser.parse_shader(&mut script).ok()?;
+    script.sky?.outerbox
+}
+
+/// An image by exact path, falling back to the `.jpg` beside a `.tga` — the
+/// same pair `R_LoadImage` tries.
+fn load_image(assets: &Assets, path: &str) -> Option<(u32, u32, Vec<u8>)> {
+    let mut candidates = vec![path.to_string()];
+    if let Some(stem) = path.strip_suffix(".tga") {
+        candidates.push(format!("{stem}.jpg"));
+    }
+    for candidate in candidates {
+        let Some(bytes) = assets.read(&candidate) else {
+            continue;
+        };
+        let decoded = if candidate.ends_with(".jpg") {
+            texture::jpeg(&bytes)
+        } else {
+            texture::tga(&bytes)
+        };
+        if let Ok(image) = decoded {
+            return Some((image.width, image.height, image.rgba));
+        }
+    }
+    None
 }
 
 /// One vertex of the world, with its lightmap folded into the colour.
@@ -720,6 +904,65 @@ mod tests {
         assert!(triangles
             .iter()
             .all(|vertex| (0.0..=128.0).contains(&vertex.pos[0])));
+    }
+
+    #[test]
+    fn the_six_sky_faces_close_the_box_around_the_camera() {
+        let origin = [120.0, -40.0, 64.0];
+        let mut sum = [0.0f32; 3];
+        for face in &SKY_FACES {
+            sum[0] += face.normal[0];
+            sum[1] += face.normal[1];
+            sum[2] += face.normal[2];
+            let vertices = face.vertices(origin);
+            assert_eq!(vertices.len(), 6);
+            for vertex in &vertices {
+                let offset = [
+                    vertex.pos[0] - origin[0],
+                    vertex.pos[1] - origin[1],
+                    vertex.pos[2] - origin[2],
+                ];
+                let length =
+                    (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt();
+                // A corner is normal + s*axis + t*axis, so between one and
+                // sqrt(3) radii out.
+                assert!(length >= SKY_RADIUS * 0.99, "{length}");
+                assert!(length <= SKY_RADIUS * 1.75, "{length}");
+                assert!((0.0..=1.0).contains(&vertex.uv[0]));
+                assert!((0.0..=1.0).contains(&vertex.uv[1]));
+            }
+        }
+        // Opposite faces cancel, so the box really closes.
+        assert_eq!(sum, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_moving_camera_carries_the_sky_with_it() {
+        let face = SKY_FACES[0];
+        let before = face.vertices([0.0; 3]);
+        let after = face.vertices([100.0, 0.0, 0.0]);
+        for (before, after) in before.iter().zip(after.iter()) {
+            assert!((after.pos[0] - before.pos[0] - 100.0).abs() < 1.0e-3);
+            assert!((after.pos[1] - before.pos[1]).abs() < 1.0e-3);
+            assert!((after.pos[2] - before.pos[2]).abs() < 1.0e-3);
+        }
+    }
+
+    #[test]
+    fn a_sky_shader_yields_its_six_outer_face_names() {
+        let script = "textures/skies/test\n{\n skyParms env/test 512 -\n}\n";
+        let names = sky_outerbox(&[script.to_string()], "textures/skies/test").unwrap();
+        assert_eq!(names[0], "env/test_rt.tga");
+        assert_eq!(names[3], "env/test_ft.tga");
+        assert_eq!(names[5], "env/test_dn.tga");
+    }
+
+    #[test]
+    fn a_shader_without_sky_parms_has_no_box() {
+        let script = "textures/stone\n{ { map textures/stone.tga } }\n";
+        assert!(sky_outerbox(&[script.to_string()], "textures/stone").is_none());
+        // A name that is not in the scripts at all is equally absent.
+        assert!(sky_outerbox(&[script.to_string()], "textures/other").is_none());
     }
 
     #[test]

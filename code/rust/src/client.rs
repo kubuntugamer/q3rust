@@ -867,6 +867,11 @@ impl Client {
         let aspect = width as f32 / height.max(1) as f32;
         let mvp = world::view_projection(&camera, aspect, fov);
 
+        // The skybox first: it writes no depth, so the map draws over it.
+        if let Some(sky) = world.sky.as_ref() {
+            sky.draw(&mut self.renderer.vk, &camera, &mvp)?;
+        }
+
         for batch in &world.batches {
             let vertices = &world.vertices[batch.first..batch.first + batch.count];
             let (_, texture) = &world.textures()[batch.texture];

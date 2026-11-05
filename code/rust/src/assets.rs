@@ -110,6 +110,24 @@ impl Assets {
         Assets::mount(&Assets::default_directory())
     }
 
+    /// Every mounted file whose path starts with `prefix` and ends with
+    /// `suffix`, first pak wins and in pak order. This stands in for the
+    /// directory listing the C uses to find `scripts/*.shader`.
+    pub fn files(&self, prefix: &str, suffix: &str) -> Vec<String> {
+        let mut found: Vec<String> = Vec::new();
+        for pak in &self.paks {
+            for name in pak.entry_names() {
+                if name.starts_with(prefix)
+                    && name.ends_with(suffix)
+                    && !found.iter().any(|seen| seen == name)
+                {
+                    found.push(name.to_string());
+                }
+            }
+        }
+        found
+    }
+
     /// Reads a file by Quake path, first pak wins. `FS_ReadFile` strips one
     /// leading separator and takes backslashes as separators, so this does too.
     ///
