@@ -16,9 +16,12 @@ use std::collections::HashMap;
 
 use crate::assets::Assets;
 use crate::bsp::{Bsp, BspFace, DrawVert, LIGHTMAP_SIZE, SURFACE_PATCH};
-use crate::shader::{Parser, ShaderScript, ShaderTextIndex};
+use crate::shader::{
+    Parser, ShaderScript, ShaderStage, ShaderTextIndex, TexMod, TextureMap, GLS_DSTBLEND_ONE,
+    GLS_SRCBLEND_ONE,
+};
 use crate::texture;
-use crate::vk::{Texture, Vertex3D, Vulkan};
+use crate::vk::{BlendMode, Texture, Vertex3D, Vulkan};
 
 /// `DEFAULT_VIEWHEIGHT`: the eye sits this far above the player origin.
 pub const DEFAULT_VIEW_HEIGHT: f32 = 26.0;
@@ -33,12 +36,24 @@ const FAR_PLANE: f32 = 4096.0;
 /// `cg_fov`'s default: a horizontal field of view measured on a 4:3 screen.
 pub const DEFAULT_FOV: f32 = 90.0;
 
-/// One drawable run of triangles sharing a texture.
+/// One stage of a shader batch: the image it draws, how it blends, and how its
+/// texture coordinates move. `lit` is true for the pass the baked lightmap
+/// tints; detail and additive passes carry their own colour.
 #[derive(Clone, Copy, Debug)]
+pub struct Stage {
+    pub texture: usize,
+    pub blend: BlendMode,
+    /// `[scale_s, scale_t, scroll_s, scroll_t]`. Scroll is per second.
+    pub uv: [f32; 4],
+    pub lit: bool,
+}
+
+/// One drawable run of triangles sharing a shader, drawn once per stage.
+#[derive(Clone, Debug)]
 pub struct Batch {
     pub first: usize,
     pub count: usize,
-    pub texture: usize,
+    pub stages: Vec<Stage>,
 }
 
 /// The map's static geometry, uploaded once.
@@ -167,8 +182,10 @@ impl World {
         // texture upload order.
         let mut shaders: Vec<usize> = by_shader.keys().copied().collect();
         shaders.sort_unstable();
-        let mut cache: HashMap<usize, usize> = HashMap::new();
+        let mut cache: HashMap<String, usize> = HashMap::new();
         let checker = checker_texture(vk)?;
+        let scripts = shader_scripts(assets);
+        let index = shader_index(&scripts);
 
         for shader in shaders {
             let Some(vertices) = by_shader.remove(&shader) else {
@@ -177,39 +194,52 @@ impl World {
             if vertices.is_empty() {
                 continue;
             }
-            let index = match cache.get(&shader) {
-                Some(index) => *index,
-                None => {
-                    let name = textures
-                        .get(shader)
-                        .map(|texture| texture.name.clone())
-                        .unwrap_or_default();
-                    let texture = match load_texture(vk, assets, &name) {
-                        Ok(texture) => texture,
-                        Err(_) => {
-                            world.missing.push(name.clone());
-                            vk.create_repeating_texture(64, 64, &checker.1)?
-                        }
-                    };
-                    let index = world.textures.len();
-                    world.textures.push((name, texture));
-                    cache.insert(shader, index);
-                    index
-                }
-            };
+            let name = textures
+                .get(shader)
+                .map(|texture| texture.name.clone())
+                .unwrap_or_default();
+
+            // One draw per stage, so a shader's detail, blend and additive
+            // passes land on the same triangles in the script's order.
+            let mut stages = Vec::new();
+            for spec in stage_list(&index, &name) {
+                let texture = match cache.get(&spec.image) {
+                    Some(index) => *index,
+                    None => {
+                        let loaded = match load_texture(vk, assets, &spec.image) {
+                            Ok(texture) => texture,
+                            Err(_) => {
+                                world.missing.push(spec.image.clone());
+                                vk.create_repeating_texture(64, 64, &checker.1)?
+                            }
+                        };
+                        let at = world.textures.len();
+                        world.textures.push((spec.image, loaded));
+                        cache.insert(world.textures[at].0.clone(), at);
+                        at
+                    }
+                };
+                stages.push(Stage {
+                    texture,
+                    blend: spec.blend,
+                    uv: spec.uv,
+                    lit: spec.lit,
+                });
+            }
+
             let first = world.vertices.len();
             let count = vertices.len();
             world.vertices.extend(vertices);
             world.batches.push(Batch {
                 first,
                 count,
-                texture: index,
+                stages,
             });
         }
 
         world.sky = sky_name
             .as_deref()
-            .and_then(|name| Sky::load(vk, assets, name).ok().flatten());
+            .and_then(|name| Sky::load(vk, assets, name, &index).ok().flatten());
 
         Ok(world)
     }
@@ -317,9 +347,13 @@ impl Sky {
     /// Loads the faces `shader_name`'s `skyParms` names. A shader with no sky
     /// parms, or a face that is not in any pak, leaves the map without a
     /// skybox rather than stopping the client.
-    fn load(vk: &mut Vulkan, assets: &Assets, shader_name: &str) -> Result<Option<Sky>, String> {
-        let scripts = shader_scripts(assets);
-        let Some(names) = sky_outerbox(&scripts, shader_name) else {
+    fn load(
+        vk: &mut Vulkan,
+        assets: &Assets,
+        shader_name: &str,
+        index: &ShaderTextIndex,
+    ) -> Result<Option<Sky>, String> {
+        let Some(names) = sky_outerbox(index, shader_name) else {
             return Ok(None);
         };
 
@@ -361,18 +395,115 @@ fn shader_scripts(assets: &Assets) -> Vec<String> {
         .collect()
 }
 
-/// `FindShaderInShaderText` plus `ParseShader`, reduced to what the skybox
-/// needs: the six outer face names of the named shader.
-fn sky_outerbox(scripts: &[String], shader_name: &str) -> Option<[String; 6]> {
+/// The shader text index the world and the skybox both look names up in.
+fn shader_index(scripts: &[String]) -> ShaderTextIndex {
     let texts: Vec<&str> = scripts.iter().map(String::as_str).collect();
-    let index = ShaderTextIndex::build(&texts);
-    let text = index.find(shader_name)?;
+    ShaderTextIndex::build(&texts)
+}
 
+/// `FindShaderInShaderText` plus `ParseShader`: the named shader's definition,
+/// or none when no script claims the name.
+fn shader_script(index: &ShaderTextIndex, shader_name: &str) -> Option<ShaderScript> {
+    let text = index.find(shader_name)?;
     let mut script = ShaderScript::default();
     script.name = shader_name.to_string();
     let mut parser = Parser::new(text);
     parser.parse_shader(&mut script).ok()?;
-    script.sky?.outerbox
+    Some(script)
+}
+
+/// The six outer face names `skyParms` names, if the shader has a sky.
+fn sky_outerbox(index: &ShaderTextIndex, shader_name: &str) -> Option<[String; 6]> {
+    shader_script(index, shader_name)?.sky?.outerbox
+}
+
+/// `MAX_STAGES`: how many stage passes one batch may draw.
+const MAX_STAGES: usize = 4;
+
+/// A stage before its texture is uploaded.
+struct StageSpec {
+    image: String,
+    blend: BlendMode,
+    uv: [f32; 4],
+    lit: bool,
+}
+
+/// The stages a shader draws, in script order. A shader no script defines is
+/// an implicit one: its own name is the image, drawn lit and opaque.
+fn stage_list(index: &ShaderTextIndex, name: &str) -> Vec<StageSpec> {
+    let mut stages = Vec::new();
+    if let Some(script) = shader_script(index, name) {
+        for stage in script.stages.iter().filter(|stage| stage.active) {
+            let Some(image) = stage_image(stage) else {
+                continue;
+            };
+            stages.push(StageSpec {
+                image: image.to_string(),
+                blend: blend_mode(stage.state_bits),
+                uv: stage_transform(&stage.bundle.tex_mods),
+                // Only the first pass carries the surface's lightmap.
+                lit: stages.is_empty(),
+            });
+            if stages.len() == MAX_STAGES {
+                break;
+            }
+        }
+    }
+    if stages.is_empty() {
+        stages.push(StageSpec {
+            image: name.to_string(),
+            blend: BlendMode::Opaque,
+            uv: [1.0, 1.0, 0.0, 0.0],
+            lit: true,
+        });
+    }
+    stages
+}
+
+/// The image a stage draws with. The lightmap is already in the vertex colour
+/// and a video map has no texture to upload, so both leave the stage out.
+fn stage_image(stage: &ShaderStage) -> Option<&str> {
+    match stage.bundle.map.as_ref()? {
+        TextureMap::File { name, .. } => Some(name.as_str()),
+        TextureMap::Anim { frames, .. } => frames.first().map(String::as_str),
+        TextureMap::WhiteImage | TextureMap::Lightmap | TextureMap::Video(_) => None,
+    }
+}
+
+/// `state_bits` reduced to the blends the renderer has pipelines for. Anything
+/// unusual draws as `blend`, which is what a translucent stage needs.
+fn blend_mode(state_bits: u32) -> BlendMode {
+    let source = state_bits & 0x0f;
+    let destination = state_bits & 0xf0;
+    if source == 0 && destination == 0 {
+        BlendMode::Opaque
+    } else if source == GLS_SRCBLEND_ONE && destination == GLS_DSTBLEND_ONE {
+        BlendMode::Add
+    } else {
+        BlendMode::Blend
+    }
+}
+
+/// The stage's static texture-coordinate transform: scale and per-second
+/// scroll. Rotation, turbulent and stretch need the clock per vertex and are
+/// not applied yet.
+fn stage_transform(tex_mods: &[TexMod]) -> [f32; 4] {
+    let mut scale = [1.0f32, 1.0];
+    let mut scroll = [0.0f32, 0.0];
+    for tex_mod in tex_mods {
+        match tex_mod {
+            TexMod::Scale { scale: factor } => {
+                scale[0] *= factor[0];
+                scale[1] *= factor[1];
+            }
+            TexMod::Scroll { scroll: step } => {
+                scroll[0] += step[0];
+                scroll[1] += step[1];
+            }
+            _ => {}
+        }
+    }
+    [scale[0], scale[1], scroll[0], scroll[1]]
 }
 
 /// An image by exact path, falling back to the `.jpg` beside a `.tga` — the
@@ -429,13 +560,17 @@ fn lightmap_color(face: &crate::bsp::BspFace, vertex: &crate::bsp::DrawVert, lig
     }
 }
 
-/// A shader's image: `textures/<name>.tga`, then the `.jpg` beside it, the
-/// same fallback `R_LoadImage` makes.
+/// A shader's image: the name as written when it already carries an extension
+/// (`map` lines in a script do), then the `.tga` and `.jpg` forms the same
+/// fallback `R_LoadImage` makes.
 fn load_texture(vk: &mut Vulkan, assets: &Assets, name: &str) -> Result<Texture, String> {
     if name.is_empty() {
         return Err("shader has no name".into());
     }
-    let mut candidates = Vec::with_capacity(2);
+    let mut candidates = Vec::with_capacity(3);
+    if name.contains('.') {
+        candidates.push(name.to_string());
+    }
     for extension in ["tga", "jpg"] {
         candidates.push(format!("{name}.{extension}"));
     }
@@ -907,6 +1042,45 @@ mod tests {
     }
 
     #[test]
+    fn stages_come_out_of_the_script_in_order() {
+        let script = "textures/test\n{\n {\n map textures/test1.tga\n }\n {\n map textures/test2.tga\n blendFunc add\n }\n}\n";
+        let index = shader_index(&[script.to_string()]);
+        let stages = stage_list(&index, "textures/test");
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].image, "textures/test1.tga");
+        assert_eq!(stages[0].blend, BlendMode::Opaque);
+        assert!(stages[0].lit);
+        assert_eq!(stages[1].blend, BlendMode::Add);
+        assert!(!stages[1].lit);
+    }
+
+    #[test]
+    fn a_shader_with_no_script_draws_its_name_as_one_lit_stage() {
+        let index = shader_index(&[String::new()]);
+        let stages = stage_list(&index, "textures/base_wall/foo");
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].image, "textures/base_wall/foo");
+        assert_eq!(stages[0].blend, BlendMode::Opaque);
+        assert_eq!(stages[0].uv, [1.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_scroll_texmod_becomes_a_per_second_offset() {
+        let script = "textures/test\n{\n {\n map textures/t.tga\n tcMod scroll 0.25 -0.5\n tcMod scale 2 4\n }\n}\n";
+        let index = shader_index(&[script.to_string()]);
+        let stages = stage_list(&index, "textures/test");
+        assert_eq!(stages[0].uv, [2.0, 4.0, 0.25, -0.5]);
+    }
+
+    #[test]
+    fn a_lightmap_stage_is_not_uploaded_as_a_texture() {
+        let script = "textures/test\n{\n {\n map textures/t.tga\n }\n {\n map $lightmap\n }\n}\n";
+        let index = shader_index(&[script.to_string()]);
+        let stages = stage_list(&index, "textures/test");
+        assert_eq!(stages.len(), 1);
+    }
+
+    #[test]
     fn the_six_sky_faces_close_the_box_around_the_camera() {
         let origin = [120.0, -40.0, 64.0];
         let mut sum = [0.0f32; 3];
@@ -951,7 +1125,7 @@ mod tests {
     #[test]
     fn a_sky_shader_yields_its_six_outer_face_names() {
         let script = "textures/skies/test\n{\n skyParms env/test 512 -\n}\n";
-        let names = sky_outerbox(&[script.to_string()], "textures/skies/test").unwrap();
+        let names = sky_outerbox(&shader_index(&[script.to_string()]), "textures/skies/test").unwrap();
         assert_eq!(names[0], "env/test_rt.tga");
         assert_eq!(names[3], "env/test_ft.tga");
         assert_eq!(names[5], "env/test_dn.tga");
@@ -960,9 +1134,9 @@ mod tests {
     #[test]
     fn a_shader_without_sky_parms_has_no_box() {
         let script = "textures/stone\n{ { map textures/stone.tga } }\n";
-        assert!(sky_outerbox(&[script.to_string()], "textures/stone").is_none());
+        assert!(sky_outerbox(&shader_index(&[script.to_string()]), "textures/stone").is_none());
         // A name that is not in the scripts at all is equally absent.
-        assert!(sky_outerbox(&[script.to_string()], "textures/other").is_none());
+        assert!(sky_outerbox(&shader_index(&[script.to_string()]), "textures/other").is_none());
     }
 
     #[test]

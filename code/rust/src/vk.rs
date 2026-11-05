@@ -55,6 +55,10 @@ pub struct Vulkan {
     depth_memory: vk::DeviceMemory,
     depth_view: vk::ImageView,
     world_pipeline: vk::Pipeline,
+    /// `blendFunc blend`: the stage's alpha blends with the frame.
+    world_blend_pipeline: vk::Pipeline,
+    /// `blendFunc add`: the stage sums with the frame.
+    world_add_pipeline: vk::Pipeline,
     /// The skybox: the world shaders again, but it neither tests nor writes
     /// depth, so the map always draws over it.
     sky_pipeline: vk::Pipeline,
@@ -127,6 +131,27 @@ const INITIAL_VERTEX_CAPACITY: usize = 4096;
 /// Textures one renderer can hold at once; the game's media pool is far below.
 const MAX_TEXTURES: u32 = 1024;
 
+/// How a world stage combines with the frame — `blendFunc` in a shader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlendMode {
+    /// Writes over the frame and writes depth.
+    Opaque,
+    /// `blendFunc blend`: source alpha over the frame.
+    Blend,
+    /// `blendFunc add`: the stage sums with the frame.
+    Add,
+}
+
+/// Which world pipeline to build. The vertex and fragment shaders are the same
+/// for all four; only depth and blending differ.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PipelineKind {
+    Opaque,
+    Blend,
+    Add,
+    Sky,
+}
+
 impl Vulkan {
     /// Creates the device and swapchain for a surface SDL already created.
     pub fn new(
@@ -193,6 +218,8 @@ impl Vulkan {
                 depth_memory: vk::DeviceMemory::null(),
                 depth_view: vk::ImageView::null(),
                 world_pipeline: vk::Pipeline::null(),
+                world_blend_pipeline: vk::Pipeline::null(),
+                world_add_pipeline: vk::Pipeline::null(),
                 sky_pipeline: vk::Pipeline::null(),
                 world_buffer: vk::Buffer::null(),
                 world_memory: vk::DeviceMemory::null(),
@@ -801,29 +828,39 @@ impl Vulkan {
     /// The world pipeline: 3D vertexes, one texture, depth tested and written,
     /// and no blending. It is rebuilt with the render pass on resize.
     fn create_world_pipeline(&mut self) -> Result<(), String> {
-        self.create_world_pipeline_with(false)
+        self.create_stage_pipeline(PipelineKind::Opaque)
+    }
+
+    fn create_world_blend_pipeline(&mut self) -> Result<(), String> {
+        self.create_stage_pipeline(PipelineKind::Blend)
+    }
+
+    fn create_world_add_pipeline(&mut self) -> Result<(), String> {
+        self.create_stage_pipeline(PipelineKind::Add)
     }
 
     /// The skybox pipeline: the same vertexes and shaders, with depth testing
     /// and depth writing off.
     fn create_sky_pipeline(&mut self) -> Result<(), String> {
-        self.create_world_pipeline_with(true)
+        self.create_stage_pipeline(PipelineKind::Sky)
     }
 
-    fn create_world_pipeline_with(&mut self, sky: bool) -> Result<(), String> {
-        let existing = if sky {
-            self.sky_pipeline
-        } else {
-            self.world_pipeline
+    fn create_stage_pipeline(&mut self, kind: PipelineKind) -> Result<(), String> {
+        let existing = match kind {
+            PipelineKind::Opaque => self.world_pipeline,
+            PipelineKind::Blend => self.world_blend_pipeline,
+            PipelineKind::Add => self.world_add_pipeline,
+            PipelineKind::Sky => self.sky_pipeline,
         };
         if existing != vk::Pipeline::null() {
             unsafe {
                 self.device.destroy_pipeline(existing, None);
             }
-            if sky {
-                self.sky_pipeline = vk::Pipeline::null();
-            } else {
-                self.world_pipeline = vk::Pipeline::null();
+            match kind {
+                PipelineKind::Opaque => self.world_pipeline = vk::Pipeline::null(),
+                PipelineKind::Blend => self.world_blend_pipeline = vk::Pipeline::null(),
+                PipelineKind::Add => self.world_add_pipeline = vk::Pipeline::null(),
+                PipelineKind::Sky => self.sky_pipeline = vk::Pipeline::null(),
             }
         }
 
@@ -898,14 +935,38 @@ impl Vulkan {
             let multisample = vk::PipelineMultisampleStateCreateInfo::default()
                 .rasterization_samples(vk::SampleCountFlags::TYPE_1);
             let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-                .depth_test_enable(!sky)
-                .depth_write_enable(!sky)
+                .depth_test_enable(!matches!(kind, PipelineKind::Sky))
+                .depth_write_enable(matches!(kind, PipelineKind::Opaque))
                 .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
                 .depth_bounds_test_enable(false)
                 .stencil_test_enable(false);
-            let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
-                .blend_enable(false)
-                .color_write_mask(vk::ColorComponentFlags::RGBA);
+            // Opaque stages write over the frame; `blend` and `add` only test
+            // depth, so a later stage can still cover what they drew.
+            let blend_attachment = match kind {
+                PipelineKind::Opaque | PipelineKind::Sky => {
+                    vk::PipelineColorBlendAttachmentState::default()
+                        .blend_enable(false)
+                        .color_write_mask(vk::ColorComponentFlags::RGBA)
+                }
+                PipelineKind::Blend => vk::PipelineColorBlendAttachmentState::default()
+                    .blend_enable(true)
+                    .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                    .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                    .color_blend_op(vk::BlendOp::ADD)
+                    .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                    .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                    .alpha_blend_op(vk::BlendOp::ADD)
+                    .color_write_mask(vk::ColorComponentFlags::RGBA),
+                PipelineKind::Add => vk::PipelineColorBlendAttachmentState::default()
+                    .blend_enable(true)
+                    .src_color_blend_factor(vk::BlendFactor::ONE)
+                    .dst_color_blend_factor(vk::BlendFactor::ONE)
+                    .color_blend_op(vk::BlendOp::ADD)
+                    .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                    .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+                    .alpha_blend_op(vk::BlendOp::ADD)
+                    .color_write_mask(vk::ColorComponentFlags::RGBA),
+            };
             let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
                 .attachments(std::slice::from_ref(&blend_attachment));
             let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
@@ -937,10 +998,11 @@ impl Vulkan {
 
             self.device.destroy_shader_module(vertex_module, None);
             self.device.destroy_shader_module(fragment_module, None);
-            if sky {
-                self.sky_pipeline = created[0];
-            } else {
-                self.world_pipeline = created[0];
+            match kind {
+                PipelineKind::Opaque => self.world_pipeline = created[0],
+                PipelineKind::Blend => self.world_blend_pipeline = created[0],
+                PipelineKind::Add => self.world_add_pipeline = created[0],
+                PipelineKind::Sky => self.sky_pipeline = created[0],
             }
             Ok(())
         }
@@ -1009,7 +1071,43 @@ impl Vulkan {
         vertices: &[Vertex3D],
         mvp: &[f32; 16],
     ) -> Result<(), String> {
-        self.draw_world_with(self.world_pipeline, texture, vertices, mvp)
+        self.draw_world_with(
+            PipelineKind::Opaque,
+            texture,
+            vertices,
+            mvp,
+            [1.0, 1.0, 0.0, 0.0],
+            true,
+        )
+    }
+
+    /// Adds one shader stage of a batch to the frame: its own texture, its own
+    /// UV transform, its own blend mode, and whether the baked lightmap in the
+    /// vertex colour applies to it.
+    pub fn draw_stage(
+        &mut self,
+        texture: &Texture,
+        vertices: &[Vertex3D],
+        mvp: &[f32; 16],
+        uv: [f32; 4],
+        blend: BlendMode,
+        lit: bool,
+    ) -> Result<(), String> {
+        let kind = match blend {
+            BlendMode::Opaque => PipelineKind::Opaque,
+            BlendMode::Blend => PipelineKind::Blend,
+            BlendMode::Add => PipelineKind::Add,
+        };
+        self.draw_world_with(kind, texture, vertices, mvp, uv, lit)
+    }
+
+    fn pipeline_for(&self, kind: PipelineKind) -> vk::Pipeline {
+        match kind {
+            PipelineKind::Opaque => self.world_pipeline,
+            PipelineKind::Blend => self.world_blend_pipeline,
+            PipelineKind::Add => self.world_add_pipeline,
+            PipelineKind::Sky => self.sky_pipeline,
+        }
     }
 
     /// Adds one sky face to the frame, through the pipeline that leaves depth
@@ -1020,17 +1118,26 @@ impl Vulkan {
         vertices: &[Vertex3D],
         mvp: &[f32; 16],
     ) -> Result<(), String> {
-        self.draw_world_with(self.sky_pipeline, texture, vertices, mvp)
+        self.draw_world_with(
+            PipelineKind::Sky,
+            texture,
+            vertices,
+            mvp,
+            [1.0, 1.0, 0.0, 0.0],
+            false,
+        )
     }
 
     /// Adds one world batch to the frame. `mvp` is the 16-float view-projection
     /// matrix; the depth buffer settles what overlaps what.
     fn draw_world_with(
         &mut self,
-        pipeline: vk::Pipeline,
+        kind: PipelineKind,
         texture: &Texture,
         vertices: &[Vertex3D],
         mvp: &[f32; 16],
+        uv: [f32; 4],
+        lit: bool,
     ) -> Result<(), String> {
         if vertices.is_empty() {
             return Ok(());
@@ -1061,13 +1168,24 @@ impl Vulkan {
         self.world_used += bytes;
 
         let command_buffer = self.command_buffers[image_index as usize];
-        let mut constants = [0u8; 64];
+        // The view-projection, the stage's UV transform and the lit flag. The
+        // last vec4's x is 1 for a stage the lightmap must not tint.
+        let mut constants = [0u8; 96];
         for (index, value) in mvp.iter().enumerate() {
             constants[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
         }
+        for (index, value) in uv.iter().enumerate() {
+            let at = 64 + index * 4;
+            constants[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        constants[80..84].copy_from_slice(&if lit { 0.0f32 } else { 1.0f32 }.to_le_bytes());
         unsafe {
             self.device
-                .cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                .cmd_bind_pipeline(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.pipeline_for(kind),
+                );
             self.device
                 .cmd_bind_vertex_buffers(command_buffer, 0, &[self.world_buffer], &[offset]);
             self.device.cmd_bind_descriptor_sets(
@@ -1502,12 +1620,12 @@ impl Vulkan {
                 .create_sampler(&repeat_info, None)
                 .map_err(|e| format!("creating the repeating texture sampler: {e}"))?;
 
-            // 16 bytes for the 2D mapping, 64 for the world's view-projection
-            // matrix; one range has to cover both pushes.
+            // 16 bytes for the 2D mapping, 96 for the world's view-projection,
+            // UV transform and lit flag; one range has to cover both pushes.
             let push_range = vk::PushConstantRange::default()
-                .stage_flags(vk::ShaderStageFlags::VERTEX)
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
                 .offset(0)
-                .size(64);
+                .size(96);
             self.pipeline_layout = self
                 .device
                 .create_pipeline_layout(
@@ -1673,6 +1791,8 @@ impl Vulkan {
             self.pipeline = created[0];
             self.additive_pipeline = created[1];
             self.create_world_pipeline()?;
+            self.create_world_blend_pipeline()?;
+            self.create_world_add_pipeline()?;
             self.create_sky_pipeline()?;
             Ok(())
         }
@@ -1896,6 +2016,12 @@ impl Drop for Vulkan {
             }
             if self.sky_pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(self.sky_pipeline, None);
+            }
+            if self.world_blend_pipeline != vk::Pipeline::null() {
+                self.device.destroy_pipeline(self.world_blend_pipeline, None);
+            }
+            if self.world_add_pipeline != vk::Pipeline::null() {
+                self.device.destroy_pipeline(self.world_add_pipeline, None);
             }
             if !self.world_mapped.is_null() {
                 self.device.unmap_memory(self.world_memory);

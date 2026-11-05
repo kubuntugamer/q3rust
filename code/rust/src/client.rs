@@ -535,7 +535,7 @@ impl Client {
                         "world: {} surfaces, {} triangles, {} textures, {} shaders without art",
                         built.drawn,
                         built.vertices.len() / 3,
-                        built.batches.len(),
+                        built.textures().len(),
                         built.missing.len()
                     );
                     world = Some(built);
@@ -608,7 +608,7 @@ impl Client {
                 "world: {} surfaces, {} triangles, {} textures\n",
                 world.drawn,
                 world.vertices.len() / 3,
-                world.batches.len()
+                world.textures().len()
             ));
             if !world.missing.is_empty() {
                 banner.push_str(&format!(
@@ -872,10 +872,22 @@ impl Client {
             sky.draw(&mut self.renderer.vk, &camera, &mvp)?;
         }
 
+        // A scrolling texmod is the one part of a stage that needs the clock.
+        let seconds = self.millis() as f32 / 1000.0;
         for batch in &world.batches {
             let vertices = &world.vertices[batch.first..batch.first + batch.count];
-            let (_, texture) = &world.textures()[batch.texture];
-            self.renderer.vk.draw_world(texture, vertices, &mvp)?;
+            for stage in &batch.stages {
+                let (_, texture) = &world.textures()[stage.texture];
+                let uv = [
+                    stage.uv[0],
+                    stage.uv[1],
+                    stage.uv[2] * seconds,
+                    stage.uv[3] * seconds,
+                ];
+                self.renderer
+                    .vk
+                    .draw_stage(texture, vertices, &mvp, uv, stage.blend, stage.lit)?;
+            }
         }
         Ok(())
     }
