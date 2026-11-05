@@ -28,12 +28,14 @@ use crate::vk::{BlendMode, Texture, Vertex3D, Vulkan};
 /// audits cleanly is one the renderer can draw.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MapAudit {
+    pub rooms: usize,
     pub faces: usize,
-    pub patches: usize,
     /// Triangles straight from the BSP's index list.
     pub triangles: usize,
     /// Triangles the patch tessellator produced.
     pub patch_triangles: usize,
+    /// Non-triangle faces those room groups contain.
+    pub patch_faces: usize,
     /// Surfaces a shader marks `SURF_NODRAW`: not drawn, by design.
     pub nodraw: usize,
     /// Patches whose control grid would not tessellate.
@@ -61,15 +63,32 @@ impl MapAudit {
 /// textures, no device, no window.
 pub fn audit_map(bytes: &[u8]) -> Result<MapAudit, String> {
     let bsp = Bsp::load(bytes.to_vec()).map_err(|e| format!("{e:?}"))?;
+    audit_bsp(&bsp)
+}
+
+/// The cheap map listing the game code wants before the collision geometry is
+/// built: entity blocks, spawn points and the room count, read straight from a
+/// loaded BSP. It goes through the same counter as [`audit_map`], so the two
+/// can never disagree about a map.
+pub fn map_edges(bsp: &Bsp) -> MapAudit {
+    audit_bsp(bsp).unwrap_or_default()
+}
+
+/// The one surface counter both entry points use.
+fn audit_bsp(bsp: &Bsp) -> Result<MapAudit, String> {
     let faces = bsp.faces().map_err(|e| format!("{e:?}"))?;
     let textures = bsp.textures().map_err(|e| format!("{e:?}"))?;
     let verts = bsp.draw_verts().map_err(|e| format!("{e:?}"))?;
     let indexes = bsp.draw_indexes().map_err(|e| format!("{e:?}"))?;
+    let models = bsp.models().map_err(|e| format!("{e:?}"))?;
     let lightmaps = bsp.lightmaps();
 
     let mut audit = MapAudit {
+        // One inline model per piece of geometry: the world plus each `*N`
+        // submodel. A shipped map always has at least model 0.
+        rooms: models.len(),
         faces: faces.len(),
-        ..MapAudit::default()
+        ..Default::default()
     };
     for face in &faces {
         // `World::build` drops these before looking at the geometry, so the
@@ -86,7 +105,7 @@ pub fn audit_map(bytes: &[u8]) -> Result<MapAudit, String> {
         };
 
         if face.surface_type == SURFACE_PATCH {
-            audit.patches += 1;
+            audit.patch_faces += 1;
             match tessellate_patch(face, face_verts, lightmaps) {
                 Some(vertices) if !vertices.is_empty() => {
                     audit.patch_triangles += vertices.len() / 3;
@@ -134,6 +153,42 @@ pub fn audit_map(bytes: &[u8]) -> Result<MapAudit, String> {
         .filter(|entity| entity.classname.as_deref() == Some("info_player_deathmatch"))
         .count();
     Ok(audit)
+}
+
+#[cfg(test)]
+mod map_edges_tests {
+    use super::*;
+
+    #[test]
+    fn map_edges_comes_from_the_bsp_models() {
+        use crate::bsp::tests::build_bsp;
+        let bytes = build_bsp(b"{}");
+        let bsp = crate::bsp::Bsp::load(bytes).unwrap();
+        let audit = map_edges(&bsp);
+        assert_eq!(audit.rooms, bsp.models().unwrap().len());
+    }
+
+    #[test]
+    fn map_edges_mirrors_audit_map_on_a_test_bsp() {
+        use crate::bsp::tests::build_bsp;
+        let bytes = build_bsp(b"{}");
+        let audit = audit_map(&bytes).unwrap();
+        let edges = map_edges(&crate::bsp::Bsp::load(bytes).unwrap());
+        assert_eq!(audit, edges);
+    }
+
+    #[test]
+    fn a_map_with_entities_counts_them_the_same_way() {
+        use crate::bsp::tests::build_bsp;
+        let bytes = build_bsp(
+            b"{ \"classname\" \"worldspawn\" }\n\
+              { \"classname\" \"info_player_deathmatch\" \"origin\" \"64 128 16\" }",
+        );
+        let audit = map_edges(&crate::bsp::Bsp::load(bytes.clone()).unwrap());
+        assert_eq!(audit, audit_map(&bytes).unwrap());
+        assert_eq!(audit.entities, 2);
+        assert_eq!(audit.player_spawns, 1);
+    }
 }
 
 /// `DEFAULT_VIEWHEIGHT`: the eye sits this far above the player origin.
