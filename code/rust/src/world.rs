@@ -23,6 +23,107 @@ use crate::shader::{
 use crate::texture;
 use crate::vk::{BlendMode, Texture, Vertex3D, Vulkan};
 
+/// What a map's geometry costs, counted without a GPU. `audit_map` reads the
+/// same lumps and runs the same tessellation `World::build` does, so a map that
+/// audits cleanly is one the renderer can draw.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MapAudit {
+    pub faces: usize,
+    pub patches: usize,
+    /// Triangles straight from the BSP's index list.
+    pub triangles: usize,
+    /// Triangles the patch tessellator produced.
+    pub patch_triangles: usize,
+    /// Surfaces a shader marks `SURF_NODRAW`: not drawn, by design.
+    pub nodraw: usize,
+    /// Patches whose control grid would not tessellate.
+    pub patch_failed: usize,
+    /// Faces that carry no triangle at all (fewer than three vertexes or
+    /// indexes). q3map emits a few of these; they draw nothing by nature.
+    pub empty: usize,
+    /// Faces or triangles whose indexes or vertex range fall outside the data.
+    pub out_of_range: usize,
+}
+
+impl MapAudit {
+    /// Every surface that produced no triangles, whether on purpose or not.
+    pub fn skipped(&self) -> usize {
+        self.nodraw + self.patch_failed + self.empty + self.out_of_range
+    }
+}
+
+/// Counts one map's surfaces. This is the headless half of `World::build`: no
+/// textures, no device, no window.
+pub fn audit_map(bytes: &[u8]) -> Result<MapAudit, String> {
+    let bsp = Bsp::load(bytes.to_vec()).map_err(|e| format!("{e:?}"))?;
+    let faces = bsp.faces().map_err(|e| format!("{e:?}"))?;
+    let textures = bsp.textures().map_err(|e| format!("{e:?}"))?;
+    let verts = bsp.draw_verts().map_err(|e| format!("{e:?}"))?;
+    let indexes = bsp.draw_indexes().map_err(|e| format!("{e:?}"))?;
+    let lightmaps = bsp.lightmaps();
+
+    let mut audit = MapAudit {
+        faces: faces.len(),
+        ..MapAudit::default()
+    };
+    for face in &faces {
+        // `World::build` drops these before looking at the geometry, so the
+        // audit must not count them as a failure.
+        if let Some(shader) = textures.get(face.shader) {
+            if shader.surface_flags & SURF_NODRAW != 0 {
+                audit.nodraw += 1;
+                continue;
+            }
+        }
+        let Some(face_verts) = verts.get(face.first_vert..face.first_vert + face.num_verts) else {
+            audit.out_of_range += 1;
+            continue;
+        };
+
+        if face.surface_type == SURFACE_PATCH {
+            audit.patches += 1;
+            match tessellate_patch(face, face_verts, lightmaps) {
+                Some(vertices) if !vertices.is_empty() => {
+                    audit.patch_triangles += vertices.len() / 3;
+                }
+                _ => audit.patch_failed += 1,
+            }
+            continue;
+        }
+
+        if face.num_verts < 3 || face.num_indexes < 3 {
+            audit.empty += 1;
+            continue;
+        }
+        let Some(list) = indexes.get(face.first_index..face.first_index + face.num_indexes) else {
+            audit.out_of_range += 1;
+            continue;
+        };
+
+        // Same tolerant read as `World::build`: relative indexes are the norm,
+        // but a few tools emit absolute ones.
+        let relative = list
+            .iter()
+            .all(|&index| index >= 0 && (index as usize) < face.num_verts);
+        for triangle in list.chunks_exact(3) {
+            let resolves = triangle.iter().all(|&index| {
+                let at = if relative {
+                    index as usize
+                } else {
+                    index.wrapping_sub(face.first_vert as i32) as usize
+                };
+                face_verts.get(at).is_some()
+            });
+            if resolves {
+                audit.triangles += 1;
+            } else {
+                audit.out_of_range += 1;
+            }
+        }
+    }
+    Ok(audit)
+}
+
 /// `DEFAULT_VIEWHEIGHT`: the eye sits this far above the player origin.
 pub const DEFAULT_VIEW_HEIGHT: f32 = 26.0;
 /// `SURF_NODRAW`: a shader the map never draws.
@@ -1039,6 +1140,12 @@ mod tests {
         assert!(triangles
             .iter()
             .all(|vertex| (0.0..=128.0).contains(&vertex.pos[0])));
+    }
+
+    #[test]
+    fn an_empty_map_audits_to_nothing() {
+        let bytes = crate::bsp::tests::build_bsp(b"");
+        assert_eq!(audit_map(&bytes).unwrap(), MapAudit::default());
     }
 
     #[test]
