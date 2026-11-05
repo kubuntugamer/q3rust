@@ -30,6 +30,7 @@ use crate::font::Face;
 use crate::prediction::{Input, Prediction};
 use crate::texture;
 use crate::vk::{Texture, Vertex2D, Vulkan};
+use crate::world::{self, Camera, World};
 
 /// Set by the `quit` command and cleared when the client shuts down.
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -383,6 +384,8 @@ pub struct Client {
     console_rows: usize,
     /// The predicted player, when a map loaded.
     prediction: Option<Prediction>,
+    /// The map's static geometry, once it uploaded.
+    world: Option<World>,
     /// Movement keys held this frame.
     input: Input,
 }
@@ -392,6 +395,29 @@ impl Client {
     /// and its Vulkan surface, then the renderer on that surface.
     pub fn new(width: u32, height: u32) -> Result<Self, String> {
         QUIT_REQUESTED.store(false, Ordering::SeqCst);
+
+        // A TV wants the panel's own mode. `Q3_WIDTH`/`Q3_HEIGHT` pick a size
+        // and `Q3_FULLSCREEN=1` asks for borderless desktop fullscreen, which
+        // SDL maps to the native mode without a mode switch.
+        let fullscreen = std::env::var("Q3_FULLSCREEN")
+            .map(|value| value != "0")
+            .unwrap_or(false);
+        // A typo or an impossible size must not build a window the desktop
+        // cannot show: a fullscreen window at a mode the panel lacks is how a
+        // resolution test takes the whole session with it. The request is
+        // clamped, and what the surface grants is what gets drawn and reported.
+        const MIN_DIMENSION: u32 = 320;
+        const MAX_DIMENSION: u32 = 16384;
+        let requested = |key: &str, fallback: u32| -> u32 {
+            std::env::var(key)
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .map(|value| value.clamp(MIN_DIMENSION, MAX_DIMENSION))
+                .unwrap_or(fallback)
+        };
+        let requested_width = requested("Q3_WIDTH", width);
+        let requested_height = requested("Q3_HEIGHT", height);
+        let (mut width, mut height) = (requested_width, requested_height);
 
         // Game data first: the charset and the console backdrop decide what the
         // first frame looks like.
@@ -408,11 +434,12 @@ impl Client {
         };
         let Media { face, console, log } = media;
 
-        // The map to predict on: `$Q3_MAP` overrides the stock first map.
+        // The map to predict and draw: `$Q3_MAP` overrides the stock first
+        // map. The bytes are kept for the renderer as well.
+        let map_name = std::env::var("Q3_MAP").unwrap_or_else(|_| "q3dm1".to_string());
         let mut map_line = "map: none (no game data)".to_string();
         let prediction = assets.as_ref().and_then(|assets| {
-            let map = std::env::var("Q3_MAP").unwrap_or_else(|_| "q3dm1".to_string());
-            match Prediction::load(assets, &map) {
+            match Prediction::load(assets, &map_name) {
                 Ok(prediction) => {
                     map_line = format!("map: {}", prediction.map());
                     Some(prediction)
@@ -422,6 +449,11 @@ impl Client {
                     None
                 }
             }
+        });
+        let map_bytes = assets.as_ref().and_then(|assets| {
+            assets
+                .read(&format!("maps/{map_name}.bsp"))
+                .map(|bytes| bytes.into_owned())
         });
 
         // Wayland only on Linux. The hint has to be set before SDL brings the
@@ -442,13 +474,32 @@ impl Client {
                 ));
             }
         }
-        let window = video
-            .window("quake3 (rust)", width, height)
-            .vulkan()
-            .position_centered()
+        // The panel's own bounds: asking for more than the desktop has would
+        // otherwise give a window that covers every output at once.
+        let mut clamped_to_desktop = false;
+        if let Ok(mode) = video.desktop_display_mode(0) {
+            let desktop_width = mode.w.max(1) as u32;
+            let desktop_height = mode.h.max(1) as u32;
+            if width > desktop_width || height > desktop_height {
+                width = width.min(desktop_width);
+                height = height.min(desktop_height);
+                clamped_to_desktop = true;
+            }
+        }
+
+        let mut window_builder = video.window("quake3 (rust)", width, height);
+        window_builder.vulkan().position_centered();
+        if fullscreen {
+            window_builder.fullscreen_desktop();
+        }
+        let window = window_builder
             .build()
             .map_err(|e| format!("creating the window: {e}"))?;
         let event_pump = sdl.event_pump()?;
+
+        // Relative motion is what mouse look needs; the console releases the
+        // pointer while it is open.
+        let _ = sdl.mouse().set_relative_mouse_mode(true);
 
         let audio = match Audio::init(&sdl) {
             Ok(audio) => Some(audio),
@@ -463,7 +514,7 @@ impl Client {
         let surface = window
             .vulkan_create_surface(instance.handle().as_raw() as usize)
             .map_err(|e| format!("creating the Vulkan surface: {e}"))?;
-        let renderer = Renderer::new(
+        let mut renderer = Renderer::new(
             entry,
             instance,
             SurfaceKHR::from_raw(surface),
@@ -472,6 +523,26 @@ impl Client {
             face,
             console,
         )?;
+
+        // The world is uploaded after the renderer exists, since its batches
+        // live in device memory. A map that will not parse still leaves the
+        // console usable.
+        let mut world = None;
+        if let (Some(bytes), Some(assets)) = (map_bytes.as_deref(), assets.as_ref()) {
+            match World::build(&mut renderer.vk, assets, bytes) {
+                Ok(built) => {
+                    println!(
+                        "world: {} surfaces, {} triangles, {} textures, {} shaders without art",
+                        built.drawn,
+                        built.vertices.len() / 3,
+                        built.batches.len(),
+                        built.missing.len()
+                    );
+                    world = Some(built);
+                }
+                Err(e) => console::print(&format!("world: {e}")),
+            }
+        }
 
         let mut cmd = CmdSystem::new();
         cmd.add_command("quit", Some(quit_command));
@@ -483,6 +554,9 @@ impl Client {
         cvars.get("com_timescale", "1", 0);
         cvars.get("name", "Player", CVAR_ARCHIVE);
         cvars.get("rate", "25000", CVAR_ARCHIVE);
+        cvars.get("cg_fov", "90", CVAR_ARCHIVE);
+        cvars.get("sensitivity", "5", CVAR_ARCHIVE);
+        cvars.get("r_fullscreen", if fullscreen { "1" } else { "0" }, CVAR_ARCHIVE);
 
         let audio_line = match audio.as_ref() {
             Some(audio) => {
@@ -494,7 +568,23 @@ impl Client {
             }
             None => "audio: unavailable".to_string(),
         };
-        let (width, height) = renderer.size();
+        // The swapchain has the final say on the size; report that rather than
+        // the request, so a mode the panel does not have stays visible.
+        let (granted_width, granted_height) = renderer.size();
+        cvars.get("r_width", &granted_width.to_string(), CVAR_ARCHIVE);
+        cvars.get("r_height", &granted_height.to_string(), CVAR_ARCHIVE);
+        let mut display_line = format!("display: {granted_width}x{granted_height}");
+        if fullscreen {
+            display_line.push_str(", fullscreen desktop; the panel picks the mode");
+        } else if clamped_to_desktop {
+            display_line.push_str(&format!(
+                " (Q3_WIDTH/Q3_HEIGHT asked {requested_width}x{requested_height}, clamped to the desktop)"
+            ));
+        } else if granted_width != requested_width || granted_height != requested_height {
+            display_line.push_str(&format!(
+                " (asked {requested_width}x{requested_height}; the surface granted its own size)"
+            ));
+        }
 
         let data_line = match assets.as_ref() {
             Some(assets) => format!(
@@ -507,12 +597,26 @@ impl Client {
         };
         let mut banner = format!(
             "Quake III Arena - Rust client {}\nrenderer: Vulkan, {}\n{audio_line}\n{data_line}\
-             \ndisplay: {width}x{height}\n",
+             \n{display_line}\n",
             crate::version(),
             renderer.device_name(),
         );
         banner.push_str(&map_line);
         banner.push('\n');
+        if let Some(world) = world.as_ref() {
+            banner.push_str(&format!(
+                "world: {} surfaces, {} triangles, {} textures\n",
+                world.drawn,
+                world.vertices.len() / 3,
+                world.batches.len()
+            ));
+            if !world.missing.is_empty() {
+                banner.push_str(&format!(
+                    "world: {} shaders had no image; drawing the checker\n",
+                    world.missing.len()
+                ));
+            }
+        }
         for line in &log {
             banner.push_str(line);
             banner.push('\n');
@@ -522,7 +626,9 @@ impl Client {
         }
         banner.push_str(
             "console open: Esc closes it, Tab completes, Up/Down walks history\n\
-             move: WASD, jump: Space, turn: Left/Right",
+             move: WASD, jump: Space, turn: Left/Right, look: mouse\n\
+             display: Q3_WIDTH/Q3_HEIGHT pick a resolution, Q3_FULLSCREEN=1 a native TV mode\n\
+             cg_fov widens with the aspect ratio; the vertical view stays 4:3",
         );
         console::print(&banner);
 
@@ -540,6 +646,7 @@ impl Client {
             frames: 0,
             console_rows: 1,
             prediction,
+            world,
             input: Input::default(),
         })
     }
@@ -597,6 +704,13 @@ impl Client {
         }
     }
 
+    /// Grabs the pointer for mouse look, and gives it back while the console
+    /// is open so the cursor can be used there.
+    fn sync_mouse(&self) {
+        let open = console::lock().is_open();
+        let _ = self._sdl.mouse().set_relative_mouse_mode(!open);
+    }
+
     /// Routes a movement key. Returns `false` when the console owns the key,
     /// so the caller can fall through to the console's own bindings.
     fn movement_key(&mut self, key: Keycode, down: bool) -> bool {
@@ -639,6 +753,7 @@ impl Client {
                 // Keys held when the console opens would otherwise stay down.
                 self.input = Input::default();
                 console::lock().set_open(true);
+                self.sync_mouse();
             }
             return true;
         }
@@ -647,6 +762,7 @@ impl Client {
             Keycode::Escape => {
                 if !repeat {
                     console::lock().toggle();
+                    self.sync_mouse();
                 }
             }
             Keycode::Return | Keycode::KpEnter => self.submit_input(),
@@ -694,6 +810,20 @@ impl Client {
                 } => {
                     self.movement_key(key, false);
                 }
+                Event::MouseMotion { xrel, yrel, .. } => {
+                    if !console::lock().is_open() {
+                        let sensitivity = self
+                            .cvars
+                            .find("sensitivity")
+                            .map(|cvar| cvar.value)
+                            .unwrap_or(5.0);
+                        // `m_yaw` and `m_pitch` are 0.022 in the C client.
+                        let scale = sensitivity * 0.022;
+                        if let Some(prediction) = self.prediction.as_mut() {
+                            prediction.turn(-(xrel as f32) * scale, (yrel as f32) * scale);
+                        }
+                    }
+                }
                 Event::TextInput { text, .. } => {
                     let mut console = console::lock();
                     if console.is_open() {
@@ -706,6 +836,43 @@ impl Client {
             }
         }
         Ok(true)
+    }
+
+    /// Draws the map under the console, through the depth-tested world
+    /// pipeline. The camera sits at the predicted origin at eye height.
+    fn draw_world(&mut self) -> Result<(), String> {
+        let Some(world) = self.world.as_ref() else {
+            return Ok(());
+        };
+        let Some(prediction) = self.prediction.as_ref() else {
+            return Ok(());
+        };
+
+        let origin = prediction.origin();
+        let camera = Camera {
+            origin: [
+                origin[0],
+                origin[1],
+                origin[2] + world::DEFAULT_VIEW_HEIGHT,
+            ],
+            yaw: prediction.yaw(),
+            pitch: prediction.pitch(),
+        };
+        let fov = self
+            .cvars
+            .find("cg_fov")
+            .map(|cvar| cvar.value)
+            .unwrap_or(world::DEFAULT_FOV);
+        let (width, height) = self.renderer.size();
+        let aspect = width as f32 / height.max(1) as f32;
+        let mvp = world::view_projection(&camera, aspect, fov);
+
+        for batch in &world.batches {
+            let vertices = &world.vertices[batch.first..batch.first + batch.count];
+            let (_, texture) = &world.textures()[batch.texture];
+            self.renderer.vk.draw_world(texture, vertices, &mvp)?;
+        }
+        Ok(())
     }
 
     /// Draws the console: the backdrop, the scrollback, and the input line with
@@ -806,6 +973,7 @@ impl Client {
         }
 
         self.renderer.vk.begin_frame([0.0, 0.0, 0.0, 1.0])?;
+        self.draw_world()?;
         self.draw_console()?;
         self.draw_status()?;
         self.renderer.vk.end_frame()?;
@@ -831,9 +999,16 @@ impl Client {
     /// Releases the renderer, its media and the audio device.
     pub fn shutdown(self) {
         let Client {
-            renderer, audio, ..
+            mut renderer,
+            world,
+            audio,
+            ..
         } = self;
         drop(audio);
+        // The world's textures belong to the renderer, so they go first.
+        if let Some(world) = world {
+            world.shutdown(&mut renderer.vk);
+        }
         renderer.shutdown();
         QUIT_REQUESTED.store(false, Ordering::SeqCst);
     }

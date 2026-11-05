@@ -8,7 +8,12 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-const SHADERS: &[(&str, &str)] = &[("q3_2d.vert", "vert"), ("q3_2d.frag", "frag")];
+const SHADERS: &[(&str, &str)] = &[
+    ("q3_2d.vert", "vert"),
+    ("q3_2d.frag", "frag"),
+    ("q3_world.vert", "vert"),
+    ("q3_world.frag", "frag"),
+];
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));

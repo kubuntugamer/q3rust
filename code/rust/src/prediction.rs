@@ -41,6 +41,7 @@ pub struct Prediction {
     map: String,
     pm: Pmove<'static>,
     yaw: f32,
+    pitch: f32,
     /// The previous command time, so turning follows the frame length instead
     /// of the frame count.
     last_time: i32,
@@ -67,6 +68,7 @@ impl Prediction {
             map: map.to_string(),
             pm: Pmove::new(spawn, world),
             yaw: 0.0,
+            pitch: 0.0,
             last_time: 0,
         })
     }
@@ -89,6 +91,23 @@ impl Prediction {
         self.pm.ps.ground_entity_num != ENTITYNUM_NONE
     }
 
+    /// `cl.viewangles[YAW]`: degrees, growing to the left.
+    pub fn yaw(&self) -> f32 {
+        self.yaw
+    }
+
+    /// `cl.viewangles[PITCH]`: degrees, positive looking down.
+    pub fn pitch(&self) -> f32 {
+        self.pitch
+    }
+
+    /// Mouse look, in degrees. `CL_MouseMove` clamps pitch the same way, so
+    /// the view cannot roll over the poles.
+    pub fn turn(&mut self, yaw: f32, pitch: f32) {
+        self.yaw = (self.yaw + yaw).rem_euclid(360.0);
+        self.pitch = (self.pitch + pitch).clamp(-89.0, 89.0);
+    }
+
     /// Builds this frame's command and runs `Pmove` over it.
     ///
     /// `now` is the client's millisecond clock. `Pmove` chops a long gap into
@@ -104,7 +123,7 @@ impl Prediction {
 
         self.pm.cmd = UserCmd {
             server_time: now,
-            angles: [0, self.yaw.round() as i32, 0],
+            angles: [self.pitch.round() as i32, self.yaw.round() as i32, 0],
             forward_move: (input.forward as i32 - input.back as i32) * MOVE_SCALE,
             right_move: (input.right as i32 - input.left as i32) * MOVE_SCALE,
             up_move: if input.jump { MOVE_SCALE } else { 0 },

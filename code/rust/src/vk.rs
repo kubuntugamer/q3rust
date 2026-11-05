@@ -51,6 +51,17 @@ pub struct Vulkan {
     vertex_capacity: usize,
     frame_vertices: u32,
     current_image: Option<u32>,
+    depth_image: vk::Image,
+    depth_memory: vk::DeviceMemory,
+    depth_view: vk::ImageView,
+    world_pipeline: vk::Pipeline,
+    world_buffer: vk::Buffer,
+    world_memory: vk::DeviceMemory,
+    world_mapped: *mut u8,
+    /// Capacity of the world buffer, in bytes.
+    world_capacity: usize,
+    /// Bytes of the world buffer this frame has filled.
+    world_used: usize,
 }
 
 /// The mapping the 2D vertex shader applies to engine pixels.
@@ -77,6 +88,16 @@ impl Mapping {
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Vertex2D {
     pub pos: [f32; 2],
+    pub uv: [f32; 2],
+    pub color: [u8; 4],
+}
+
+/// One vertex of the world batch: map space, texture coordinates, and the
+/// lightmap colour the fragment shader multiplies in.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Vertex3D {
+    pub pos: [f32; 3],
     pub uv: [f32; 2],
     pub color: [u8; 4],
 }
@@ -165,10 +186,20 @@ impl Vulkan {
                 vertex_capacity: 0,
                 frame_vertices: 0,
                 current_image: None,
+                depth_image: vk::Image::null(),
+                depth_memory: vk::DeviceMemory::null(),
+                depth_view: vk::ImageView::null(),
+                world_pipeline: vk::Pipeline::null(),
+                world_buffer: vk::Buffer::null(),
+                world_memory: vk::DeviceMemory::null(),
+                world_mapped: std::ptr::null_mut(),
+                world_capacity: 0,
+                world_used: 0,
             };
 
             vk.create_swapchain(vk::SwapchainKHR::null())?;
             vk.create_render_pass()?;
+            vk.create_depth_resources()?;
             vk.create_framebuffers()?;
             vk.create_command_pool()?;
             vk.create_sync()?;
@@ -234,9 +265,17 @@ impl Vulkan {
                 .begin_command_buffer(command_buffer, &begin)
                 .map_err(|e| format!("beginning the command buffer: {e}"))?;
 
-            let clears = [vk::ClearValue {
-                color: vk::ClearColorValue { float32: color },
-            }];
+            let clears = [
+                vk::ClearValue {
+                    color: vk::ClearColorValue { float32: color },
+                },
+                vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
+                    },
+                },
+            ];
             let render_area = vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
                 extent: self.extent,
@@ -265,6 +304,7 @@ impl Vulkan {
                 .cmd_set_scissor(command_buffer, 0, &[render_area]);
 
             self.frame_vertices = 0;
+            self.world_used = 0;
             self.current_image = Some(image_index);
             Ok(true)
         }
@@ -460,7 +500,7 @@ impl Vulkan {
                 .image_views
                 .iter()
                 .map(|view| {
-                    let attachments = [*view];
+                    let attachments = [*view, self.depth_view];
                     let framebuffer_info = vk::FramebufferCreateInfo::default()
                         .render_pass(self.render_pass)
                         .attachments(&attachments)
@@ -478,7 +518,7 @@ impl Vulkan {
 
     fn create_render_pass(&mut self) -> Result<(), String> {
         unsafe {
-            let attachment = vk::AttachmentDescription::default()
+            let color = vk::AttachmentDescription::default()
                 .format(self.format)
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .load_op(vk::AttachmentLoadOp::CLEAR)
@@ -488,23 +528,48 @@ impl Vulkan {
                 .initial_layout(vk::ImageLayout::UNDEFINED)
                 .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
 
+            // The world needs a depth buffer to sort its triangles; the 2D
+            // pass simply leaves depth testing off.
+            let depth = vk::AttachmentDescription::default()
+                .format(vk::Format::D32_SFLOAT)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+
             let color_attachment = vk::AttachmentReference::default()
                 .attachment(0)
                 .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+            let depth_attachment = vk::AttachmentReference::default()
+                .attachment(1)
+                .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 
             let color_attachments = [color_attachment];
             let subpass = vk::SubpassDescription::default()
                 .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-                .color_attachments(&color_attachments);
+                .color_attachments(&color_attachments)
+                .depth_stencil_attachment(&depth_attachment);
 
             let dependency = vk::SubpassDependency::default()
                 .src_subpass(vk::SUBPASS_EXTERNAL)
                 .dst_subpass(0)
-                .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+                .src_stage_mask(
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                )
+                .dst_stage_mask(
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                        | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                )
+                .dst_access_mask(
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                        | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                );
 
-            let attachments = [attachment];
+            let attachments = [color, depth];
             let subpasses = [subpass];
             let dependencies = [dependency];
             let render_pass_info = vk::RenderPassCreateInfo::default()
@@ -581,6 +646,7 @@ impl Vulkan {
                 self.device.destroy_image_view(view, None);
             }
             self.destroy_frame_objects();
+            self.destroy_depth();
 
             let old = self.swapchain;
             self.swapchain = vk::SwapchainKHR::null();
@@ -598,6 +664,7 @@ impl Vulkan {
                 self.render_pass = vk::RenderPass::null();
             }
             self.create_render_pass()?;
+            self.create_depth_resources()?;
             self.create_pipeline()?;
             self.create_framebuffers()?;
             self.create_command_pool()?;
@@ -637,6 +704,344 @@ impl Vulkan {
             unsafe { self.device.destroy_image_view(view, None) };
         }
         self.destroy_frame_objects();
+        self.destroy_depth();
+    }
+
+    /// Creates the depth attachment the world pipeline tests against. The
+    /// render pass clears it each frame, so it needs no explicit transition.
+    fn create_depth_resources(&mut self) -> Result<(), String> {
+        unsafe {
+            self.destroy_depth();
+            let image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::D32_SFLOAT)
+                .extent(vk::Extent3D {
+                    width: self.extent.width.max(1),
+                    height: self.extent.height.max(1),
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            let image = self
+                .device
+                .create_image(&image_info, None)
+                .map_err(|e| format!("creating the depth image: {e}"))?;
+            let requirements = self.device.get_image_memory_requirements(image);
+            let memory_type = self.find_memory_type(
+                requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )?;
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_type);
+            let memory = self
+                .device
+                .allocate_memory(&alloc, None)
+                .map_err(|e| format!("allocating the depth image: {e}"))?;
+            if let Err(e) = self.device.bind_image_memory(image, memory, 0) {
+                self.device.destroy_image(image, None);
+                self.device.free_memory(memory, None);
+                return Err(format!("binding the depth image: {e}"));
+            }
+
+            let range = vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::DEPTH,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            };
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(vk::Format::D32_SFLOAT)
+                .subresource_range(range);
+            let view = match self.device.create_image_view(&view_info, None) {
+                Ok(view) => view,
+                Err(e) => {
+                    self.device.destroy_image(image, None);
+                    self.device.free_memory(memory, None);
+                    return Err(format!("creating the depth view: {e}"));
+                }
+            };
+
+            self.depth_image = image;
+            self.depth_memory = memory;
+            self.depth_view = view;
+            Ok(())
+        }
+    }
+
+    fn destroy_depth(&mut self) {
+        unsafe {
+            if self.depth_view != vk::ImageView::null() {
+                self.device.destroy_image_view(self.depth_view, None);
+                self.depth_view = vk::ImageView::null();
+            }
+            if self.depth_image != vk::Image::null() {
+                self.device.destroy_image(self.depth_image, None);
+                self.depth_image = vk::Image::null();
+            }
+            if self.depth_memory != vk::DeviceMemory::null() {
+                self.device.free_memory(self.depth_memory, None);
+                self.depth_memory = vk::DeviceMemory::null();
+            }
+        }
+    }
+
+    /// The world pipeline: 3D vertexes, one texture, depth tested and written,
+    /// and no blending. It is rebuilt with the render pass on resize.
+    fn create_world_pipeline(&mut self) -> Result<(), String> {
+        if self.world_pipeline != vk::Pipeline::null() {
+            unsafe {
+                self.device.destroy_pipeline(self.world_pipeline, None);
+                self.world_pipeline = vk::Pipeline::null();
+            }
+        }
+
+        let vertex_code = read_spirv(include_bytes!(concat!(env!("OUT_DIR"), "/q3_world.vert.spv")))?;
+        let fragment_code = read_spirv(include_bytes!(concat!(env!("OUT_DIR"), "/q3_world.frag.spv")))?;
+        let entry = CStr::from_bytes_with_nul(b"main\0").unwrap();
+
+        unsafe {
+            let vertex_module = self
+                .device
+                .create_shader_module(
+                    &vk::ShaderModuleCreateInfo::default().code(&vertex_code),
+                    None,
+                )
+                .map_err(|e| format!("creating the world vertex module: {e}"))?;
+            let fragment_module = self
+                .device
+                .create_shader_module(
+                    &vk::ShaderModuleCreateInfo::default().code(&fragment_code),
+                    None,
+                )
+                .map_err(|e| format!("creating the world fragment module: {e}"))?;
+
+            let stages = [
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::VERTEX)
+                    .module(vertex_module)
+                    .name(entry),
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                    .module(fragment_module)
+                    .name(entry),
+            ];
+
+            let bindings = [vk::VertexInputBindingDescription::default()
+                .binding(0)
+                .stride(std::mem::size_of::<Vertex3D>() as u32)
+                .input_rate(vk::VertexInputRate::VERTEX)];
+            let attributes = [
+                vk::VertexInputAttributeDescription::default()
+                    .location(0)
+                    .binding(0)
+                    .format(vk::Format::R32G32B32_SFLOAT)
+                    .offset(0),
+                vk::VertexInputAttributeDescription::default()
+                    .location(1)
+                    .binding(0)
+                    .format(vk::Format::R32G32_SFLOAT)
+                    .offset(12),
+                vk::VertexInputAttributeDescription::default()
+                    .location(2)
+                    .binding(0)
+                    .format(vk::Format::R8G8B8A8_UNORM)
+                    .offset(20),
+            ];
+            let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(&bindings)
+                .vertex_attribute_descriptions(&attributes);
+
+            let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+            let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+                .viewport_count(1)
+                .scissor_count(1);
+            // Maps have surfaces wound both ways, and the stock renderer disables
+            // culling for many of them; drawing both sides is the safe default.
+            let rasterization = vk::PipelineRasterizationStateCreateInfo::default()
+                .polygon_mode(vk::PolygonMode::FILL)
+                .cull_mode(vk::CullModeFlags::NONE)
+                .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+                .line_width(1.0);
+            let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
+                .depth_test_enable(true)
+                .depth_write_enable(true)
+                .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
+                .depth_bounds_test_enable(false)
+                .stencil_test_enable(false);
+            let blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+                .blend_enable(false)
+                .color_write_mask(vk::ColorComponentFlags::RGBA);
+            let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+                .attachments(std::slice::from_ref(&blend_attachment));
+            let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+            let dynamic = vk::PipelineDynamicStateCreateInfo::default()
+                .dynamic_states(&dynamic_states);
+
+            let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+                .stages(&stages)
+                .vertex_input_state(&vertex_input)
+                .input_assembly_state(&input_assembly)
+                .viewport_state(&viewport_state)
+                .rasterization_state(&rasterization)
+                .multisample_state(&multisample)
+                .depth_stencil_state(&depth_stencil)
+                .color_blend_state(&color_blend)
+                .dynamic_state(&dynamic)
+                .layout(self.pipeline_layout)
+                .render_pass(self.render_pass)
+                .subpass(0);
+
+            let created = self
+                .device
+                .create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    &[pipeline_info],
+                    None,
+                )
+                .map_err(|(_, e)| format!("creating the world pipeline: {e}"))?;
+
+            self.device.destroy_shader_module(vertex_module, None);
+            self.device.destroy_shader_module(fragment_module, None);
+            self.world_pipeline = created[0];
+            Ok(())
+        }
+    }
+
+    fn create_world_buffer(&mut self, capacity: usize) -> Result<(), String> {
+        unsafe {
+            let size = capacity as vk::DeviceSize;
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(size)
+                .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = self
+                .device
+                .create_buffer(&buffer_info, None)
+                .map_err(|e| format!("creating the world vertex buffer: {e}"))?;
+            let requirements = self.device.get_buffer_memory_requirements(buffer);
+            let memory_type = self.find_memory_type(
+                requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_type);
+            let memory = self
+                .device
+                .allocate_memory(&alloc, None)
+                .map_err(|e| format!("allocating the world vertex buffer: {e}"))?;
+            self.device
+                .bind_buffer_memory(buffer, memory, 0)
+                .map_err(|e| format!("binding the world vertex buffer: {e}"))?;
+            let mapped = self
+                .device
+                .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+                .map_err(|e| format!("mapping the world vertex buffer: {e}"))?
+                as *mut u8;
+
+            // Carry the batches already recorded this frame into the new
+            // buffer, the way the 2D buffer does.
+            if !self.world_mapped.is_null() && self.world_used > 0 {
+                std::ptr::copy_nonoverlapping(self.world_mapped, mapped, self.world_used);
+            }
+            if !self.world_mapped.is_null() {
+                self.device.unmap_memory(self.world_memory);
+            }
+            if self.world_buffer != vk::Buffer::null() {
+                self.device.destroy_buffer(self.world_buffer, None);
+            }
+            if self.world_memory != vk::DeviceMemory::null() {
+                self.device.free_memory(self.world_memory, None);
+            }
+
+            self.world_buffer = buffer;
+            self.world_memory = memory;
+            self.world_mapped = mapped;
+            self.world_capacity = capacity;
+            Ok(())
+        }
+    }
+
+    /// Adds one world batch to the frame. `mvp` is the 16-float view-projection
+    /// matrix; the depth buffer settles what overlaps what.
+    pub fn draw_world(
+        &mut self,
+        texture: &Texture,
+        vertices: &[Vertex3D],
+        mvp: &[f32; 16],
+    ) -> Result<(), String> {
+        if vertices.is_empty() {
+            return Ok(());
+        }
+        let image_index = match self.current_image {
+            Some(index) => index,
+            None => return Err("draw_world called outside of a frame".into()),
+        };
+
+        let stride = std::mem::size_of::<Vertex3D>();
+        let bytes = vertices.len() * stride;
+        if self.world_used + bytes > self.world_capacity {
+            let mut capacity = self.world_capacity.max(64 * 1024);
+            while capacity < self.world_used + bytes {
+                capacity *= 2;
+            }
+            self.create_world_buffer(capacity)?;
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                vertices.as_ptr() as *const u8,
+                self.world_mapped.add(self.world_used),
+                bytes,
+            );
+        }
+        let offset = self.world_used as vk::DeviceSize;
+        self.world_used += bytes;
+
+        let command_buffer = self.command_buffers[image_index as usize];
+        let mut constants = [0u8; 64];
+        for (index, value) in mvp.iter().enumerate() {
+            constants[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        unsafe {
+            self.device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.world_pipeline,
+            );
+            self.device
+                .cmd_bind_vertex_buffers(command_buffer, 0, &[self.world_buffer], &[offset]);
+            self.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout,
+                0,
+                &[texture.descriptor],
+                &[],
+            );
+            self.device.cmd_push_constants(
+                command_buffer,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                &constants,
+            );
+            self.device
+                .cmd_draw(command_buffer, vertices.len() as u32, 1, 0, 0);
+        }
+        Ok(())
     }
 
     fn queue_family_index(&self) -> Result<u32, String> {
@@ -1050,10 +1455,12 @@ impl Vulkan {
                 .create_sampler(&repeat_info, None)
                 .map_err(|e| format!("creating the repeating texture sampler: {e}"))?;
 
+            // 16 bytes for the 2D mapping, 64 for the world's view-projection
+            // matrix; one range has to cover both pushes.
             let push_range = vk::PushConstantRange::default()
                 .stage_flags(vk::ShaderStageFlags::VERTEX)
                 .offset(0)
-                .size(16);
+                .size(64);
             self.pipeline_layout = self
                 .device
                 .create_pipeline_layout(
@@ -1218,6 +1625,7 @@ impl Vulkan {
 
             self.pipeline = created[0];
             self.additive_pipeline = created[1];
+            self.create_world_pipeline()?;
             Ok(())
         }
     }
@@ -1434,6 +1842,18 @@ impl Drop for Vulkan {
             }
             if self.additive_pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(self.additive_pipeline, None);
+            }
+            if self.world_pipeline != vk::Pipeline::null() {
+                self.device.destroy_pipeline(self.world_pipeline, None);
+            }
+            if !self.world_mapped.is_null() {
+                self.device.unmap_memory(self.world_memory);
+            }
+            if self.world_buffer != vk::Buffer::null() {
+                self.device.destroy_buffer(self.world_buffer, None);
+            }
+            if self.world_memory != vk::DeviceMemory::null() {
+                self.device.free_memory(self.world_memory, None);
             }
             if self.pipeline_layout != vk::PipelineLayout::null() {
                 self.device.destroy_pipeline_layout(self.pipeline_layout, None);

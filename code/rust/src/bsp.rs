@@ -37,8 +37,24 @@ pub const LUMP_MODELS: usize = 7;
 pub const LUMP_BRUSHES: usize = 8;
 /// `LUMP_BRUSHSIDES`: the planes bounding each brush.
 pub const LUMP_BRUSHSIDES: usize = 9;
+/// `LUMP_DRAWVERTS`: the shared vertexes the surfaces draw.
+pub const LUMP_DRAWVERTS: usize = 10;
+/// `LUMP_DRAWINDEXES`: triangle indexes into the vertexes of one surface.
+pub const LUMP_DRAWINDEXES: usize = 11;
+/// `LUMP_FACES`: one record per drawable surface.
+pub const LUMP_FACES: usize = 12;
+/// `LUMP_LIGHTMAPS`: 128x128 RGB pages the faces sample.
+pub const LUMP_LIGHTMAPS: usize = 13;
+/// Width and height of one lightmap page, in texels.
+pub const LIGHTMAP_SIZE: usize = 128;
 /// `sizeof( dmodel_t )`: mins, maxs, radius, headnode, firstface, numfaces.
 const DMODEL_SIZE: usize = 40;
+/// `sizeof( dshader_t )`: name[64], surfaceFlags, contentFlags.
+const DSHADER_SIZE: usize = 72;
+/// `sizeof( drawVert_t )`: xyz, st, lightmap, normal, colour.
+const DRAWVERT_SIZE: usize = 44;
+/// `sizeof( dface_t )`: shader, fog, type, vertex and index ranges, lightmap.
+const DFACE_SIZE: usize = 104;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum BspError {
@@ -78,11 +94,50 @@ pub struct BspModel {
     pub maxs: [f32; 3],
 }
 
+/// One entry of `LUMP_SHADERS`: the shader name and the flags q3map baked
+/// into the surface, so the renderer can skip what is never drawn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BspTexture {
+    pub name: String,
+    pub surface_flags: u32,
+}
+
+/// One `dface_t`: a triangle range of the shared vertex array, the shader it
+/// draws with, and where its lightmap sits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BspFace {
+    pub shader: usize,
+    pub surface_type: i32,
+    pub first_vert: usize,
+    pub num_verts: usize,
+    pub first_index: usize,
+    pub num_indexes: usize,
+    /// `lightmapNum`, or -1 when the face is fullbright.
+    pub lightmap: i32,
+    pub lightmap_x: i32,
+    pub lightmap_y: i32,
+}
+
+/// One `drawVert_t`. `st` is the texture coordinate the map was built with
+/// and `lightmap` is the texel offset into this face's lightmap rectangle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrawVert {
+    pub xyz: [f32; 3],
+    pub st: [f32; 2],
+    pub lightmap: [f32; 2],
+    pub normal: [f32; 3],
+}
+
 /// A loaded BSP: the file bytes and the directory that says where each lump
 /// sits.
 pub struct Bsp {
     bytes: Vec<u8>,
     lumps: [(usize, usize); HEADER_LUMPS],
+    /// Where the surfaces and lightmaps were found. The retail maps leave
+    /// lump 12 empty and start the surfaces at 13, while the header documents
+    /// 12/13, so both layouts are detected from the directory.
+    faces_lump: usize,
+    lightmaps_lump: usize,
 }
 
 impl Bsp {
@@ -115,7 +170,29 @@ impl Bsp {
             *slot = (offset as usize, length as usize);
         }
 
-        Ok(Bsp { bytes, lumps })
+        // The retail maps leave lump 12 empty and start the surfaces at 13;
+        // the documented layout starts them at 12. Pick whichever one holds
+        // whole face records, and the lightmap pages beside it.
+        let length = |index: usize| lumps.get(index).map(|&(_, length)| length).unwrap_or(0);
+        let faces_lump = [LUMP_FACES, LUMP_FACES + 1]
+            .into_iter()
+            .find(|&index| length(index) > 0 && length(index) % DFACE_SIZE == 0)
+            .unwrap_or(LUMP_FACES);
+        let lightmaps_lump = [LUMP_LIGHTMAPS, LUMP_LIGHTMAPS + 1]
+            .into_iter()
+            .find(|&index| {
+                index != faces_lump
+                    && length(index) > 0
+                    && length(index) % (LIGHTMAP_SIZE * LIGHTMAP_SIZE * 3) == 0
+            })
+            .unwrap_or(LUMP_LIGHTMAPS);
+
+        Ok(Bsp {
+            bytes,
+            lumps,
+            faces_lump,
+            lightmaps_lump,
+        })
     }
 
     /// One lump's bytes. The index is a `LUMP_*` constant.
@@ -130,6 +207,93 @@ impl Bsp {
     /// `G_GET_ENTITY_TOKEN`.
     pub fn entities(&self) -> &[u8] {
         self.lump(LUMP_ENTITIES)
+    }
+
+    /// The shader names and surface flags, in face order.
+    pub fn textures(&self) -> Result<Vec<BspTexture>, BspError> {
+        let lump = self.lump(LUMP_SHADERS);
+        if lump.len() % DSHADER_SIZE != 0 {
+            return Err(BspError::BadLumpSize(LUMP_SHADERS));
+        }
+        Ok(lump
+            .chunks_exact(DSHADER_SIZE)
+            .map(|entry| {
+                let end = entry[..64]
+                    .iter()
+                    .position(|&byte| byte == 0)
+                    .unwrap_or(64);
+                BspTexture {
+                    name: String::from_utf8_lossy(&entry[..end]).into_owned(),
+                    surface_flags: u32::from_le_bytes(entry[64..68].try_into().unwrap()),
+                }
+            })
+            .collect())
+    }
+
+    /// The drawable surfaces.
+    pub fn faces(&self) -> Result<Vec<BspFace>, BspError> {
+        let lump = self.lump(self.faces_lump);
+        if lump.len() % DFACE_SIZE != 0 {
+            return Err(BspError::BadLumpSize(self.faces_lump));
+        }
+        Ok(lump
+            .chunks_exact(DFACE_SIZE)
+            .map(|entry| {
+                let field = |index: usize| {
+                    i32::from_le_bytes(entry[index * 4..index * 4 + 4].try_into().unwrap())
+                };
+                BspFace {
+                    shader: field(0).max(0) as usize,
+                    surface_type: field(2),
+                    first_vert: field(3).max(0) as usize,
+                    num_verts: field(4).max(0) as usize,
+                    first_index: field(5).max(0) as usize,
+                    num_indexes: field(6).max(0) as usize,
+                    lightmap: field(7),
+                    lightmap_x: field(8),
+                    lightmap_y: field(9),
+                }
+            })
+            .collect())
+    }
+
+    /// The shared vertex array the faces index into.
+    pub fn draw_verts(&self) -> Result<Vec<DrawVert>, BspError> {
+        let lump = self.lump(LUMP_DRAWVERTS);
+        if lump.len() % DRAWVERT_SIZE != 0 {
+            return Err(BspError::BadLumpSize(LUMP_DRAWVERTS));
+        }
+        Ok(lump
+            .chunks_exact(DRAWVERT_SIZE)
+            .map(|entry| {
+                let float = |at: usize| {
+                    f32::from_le_bytes(entry[at..at + 4].try_into().unwrap())
+                };
+                DrawVert {
+                    xyz: [float(0), float(4), float(8)],
+                    st: [float(12), float(16)],
+                    lightmap: [float(20), float(24)],
+                    normal: [float(28), float(32), float(36)],
+                }
+            })
+            .collect())
+    }
+
+    /// The triangle indexes, three per triangle.
+    pub fn draw_indexes(&self) -> Result<Vec<i32>, BspError> {
+        let lump = self.lump(LUMP_DRAWINDEXES);
+        if lump.len() % 4 != 0 {
+            return Err(BspError::BadLumpSize(LUMP_DRAWINDEXES));
+        }
+        Ok(lump
+            .chunks_exact(4)
+            .map(|entry| i32::from_le_bytes(entry.try_into().unwrap()))
+            .collect())
+    }
+
+    /// The 128x128 RGB lightmap pages, indexed by `BspFace::lightmap`.
+    pub fn lightmaps(&self) -> &[u8] {
+        self.lump(self.lightmaps_lump)
     }
 
     /// The submodels, indexed by the `*N` a map gives a brush entity.
