@@ -83,7 +83,7 @@ typedef struct {
 	byte				file[65536];
 	short				sqrTable[256];
 
-	unsigned int		mcomp[256];
+	int					mcomp[256];		// signed byte offset from the destination to the source
 	byte				*qStatus[2][32768];
 
 	long				oldXOff, oldYOff, oldysize, oldxsize;
@@ -1050,8 +1050,11 @@ static void readQuadInfo( byte *qData )
 	cinTable[currentHandle].VQ0 = cinTable[currentHandle].VQNormal;
 	cinTable[currentHandle].VQ1 = cinTable[currentHandle].VQBuffer;
 
-	cinTable[currentHandle].t[0] = (0 - (unsigned int)cin.linbuf)+(unsigned int)cin.linbuf+cinTable[currentHandle].screenDelta;
-	cinTable[currentHandle].t[1] = (0 - ((unsigned int)cin.linbuf + cinTable[currentHandle].screenDelta))+(unsigned int)cin.linbuf;
+	// mcomp[] is a signed offset between the two frame buffers. The original
+	// expression wrapped 32-bit pointer arithmetic to produce it, which only
+	// works while pointers are 32 bits wide; say what the offsets are instead.
+	cinTable[currentHandle].t[0] = cinTable[currentHandle].screenDelta;
+	cinTable[currentHandle].t[1] = -cinTable[currentHandle].screenDelta;
 
         cinTable[currentHandle].drawX = cinTable[currentHandle].CIN_WIDTH;
         cinTable[currentHandle].drawY = cinTable[currentHandle].CIN_HEIGHT;
@@ -1093,7 +1096,7 @@ static void RoQPrepMcomp( long xoff, long yoff )
 		temp2 = (y+yoff-8)*i;
 		for(x=0;x<16;x++) {
 			temp = (x+xoff-8)*j;
-			cin.mcomp[(x*16)+y] = cinTable[currentHandle].normalBuffer0-(temp2+temp);
+			cin.mcomp[(x*16)+y] = (int)(cinTable[currentHandle].normalBuffer0-(temp2+temp));
 		}
 	}
 }
