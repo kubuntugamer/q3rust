@@ -43,6 +43,11 @@ pub struct MapAudit {
     pub empty: usize,
     /// Faces or triangles whose indexes or vertex range fall outside the data.
     pub out_of_range: usize,
+    /// Entity blocks in the map.
+    pub entities: usize,
+    /// How many of those are `info_player_deathmatch` start points, which is
+    /// what a match needs before it can spawn anyone.
+    pub player_spawns: usize,
 }
 
 impl MapAudit {
@@ -121,6 +126,13 @@ pub fn audit_map(bytes: &[u8]) -> Result<MapAudit, String> {
             }
         }
     }
+
+    let entities = crate::entities::parse(bsp.entities());
+    audit.entities = entities.len();
+    audit.player_spawns = entities
+        .iter()
+        .filter(|entity| entity.classname.as_deref() == Some("info_player_deathmatch"))
+        .count();
     Ok(audit)
 }
 
@@ -1146,6 +1158,18 @@ mod tests {
     fn an_empty_map_audits_to_nothing() {
         let bytes = crate::bsp::tests::build_bsp(b"");
         assert_eq!(audit_map(&bytes).unwrap(), MapAudit::default());
+    }
+
+    #[test]
+    fn the_audit_counts_entities_and_player_spawns() {
+        let bytes = crate::bsp::tests::build_bsp(
+            b"{ \"classname\" \"worldspawn\" }\n\
+              { \"classname\" \"info_player_deathmatch\" \"origin\" \"64 128 16\" }\n\
+              { \"classname\" \"item_health\" \"origin\" \"8 8 8\" }",
+        );
+        let audit = audit_map(&bytes).unwrap();
+        assert_eq!(audit.entities, 3);
+        assert_eq!(audit.player_spawns, 1);
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub mod cmd;
 pub mod collision;
 pub mod console;
 pub mod cvar;
+pub mod entities;
 pub mod font;
 pub mod fs;
 pub mod game;

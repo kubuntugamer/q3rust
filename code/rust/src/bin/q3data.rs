@@ -60,11 +60,14 @@ fn main() -> ExitCode {
                     notes.push(format!("{} out of range", audit.out_of_range));
                 }
                 println!(
-                    "{map:<30} {:>5} faces {:>4} patches {:>7} tris ({:>7} tessellated){}",
+                    "{map:<30} {:>5} faces {:>4} patches {:>7} tris ({:>7} tessellated) \
+                     {:>4} ents {:>3} spawns{}",
                     audit.faces,
                     audit.patches,
                     audit.triangles,
                     audit.patch_triangles,
+                    audit.entities,
+                    audit.player_spawns,
                     if notes.is_empty() {
                         String::new()
                     } else {
@@ -79,6 +82,8 @@ fn main() -> ExitCode {
                 totals.patch_failed += audit.patch_failed;
                 totals.empty += audit.empty;
                 totals.out_of_range += audit.out_of_range;
+                totals.entities += audit.entities;
+                totals.player_spawns += audit.player_spawns;
             }
             Err(e) => {
                 eprintln!("{map}: {e}");
@@ -89,12 +94,15 @@ fn main() -> ExitCode {
 
     println!(
         "{} maps: {} faces ({} patches), {} triangles ({} tessellated), \
-         {} nodraw, {} patches failed, {} empty, {} out of range, {} maps failed",
+         {} entities ({} player spawns), {} nodraw, {} patches failed, {} empty, \
+         {} out of range, {} maps failed",
         maps.len(),
         totals.faces,
         totals.patches,
         totals.triangles,
         totals.patch_triangles,
+        totals.entities,
+        totals.player_spawns,
         totals.nodraw,
         totals.patch_failed,
         totals.empty,
