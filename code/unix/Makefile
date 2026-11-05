@@ -106,12 +106,24 @@ ifeq ($(PLATFORM),linux)
       RPMARCH=ppc
       VENDOR=unknown
       DLL_ONLY=true
-    else #default to i386
-      MESADIR=../Mesa/
-      ARCH=i386
-      RPMARCH=i386
-      VENDOR=unknown
-      DLL_ONLY=false
+    else
+      # The only 64-bit host this tree still builds is x86_64, and the modules
+      # have to carry that name: Sys_LoadDll looks for qagamex86_64.so from a
+      # 64-bit process. Labelling a 64-bit build "i386" produced modules the
+      # engine could never find.
+      ifneq (,$(findstring x86_64,$(shell uname -m)))
+        MESADIR=../Mesa/
+        ARCH=x86_64
+        RPMARCH=x86_64
+        VENDOR=unknown
+        DLL_ONLY=false
+      else #default to i386
+        MESADIR=../Mesa/
+        ARCH=i386
+        RPMARCH=i386
+        VENDOR=unknown
+        DLL_ONLY=false
+      endif
     endif
   endif
 

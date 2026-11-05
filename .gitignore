@@ -1,1 +1,17 @@
 target/
+
+# Compiled QVMs. The i386 copies are build outputs of the debug tree, not
+# sources; the game code lives in code/game, code/cgame and code/q3_ui.
+code/unix/debugx86_64/*/*i386.so
+
+# The i386 build tree is output for a dead target: the 2005 release already
+# covers that architecture, and no 32-bit object can be loaded by the 64-bit
+# engine anyway.
+code/unix/debugi386/
+/build_phase*.log
+
+# Retail game data belongs to id, not to this repository. The engine reads it
+# from the player's own installation (~/.q3a/baseq3); never vendor a pak here,
+# and never extract the QVMs or media out of one into the tree.
+*.pk3
+*.qvm
