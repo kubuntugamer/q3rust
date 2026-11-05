@@ -116,11 +116,19 @@ pub struct BspFace {
     pub lightmap: i32,
     pub lightmap_x: i32,
     pub lightmap_y: i32,
+    /// Size of the control grid a patch stores in its vertex range; zero on a
+    /// triangle surface.
+    pub patch_width: i32,
+    pub patch_height: i32,
 }
+
+/// `SURFACE_PATCH`: a curved surface whose vertex range is a control grid,
+/// not a triangle list.
+pub const SURFACE_PATCH: i32 = 2;
 
 /// One `drawVert_t`. `st` is the texture coordinate the map was built with
 /// and `lightmap` is the texel offset into this face's lightmap rectangle.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DrawVert {
     pub xyz: [f32; 3],
     pub st: [f32; 2],
@@ -252,6 +260,10 @@ impl Bsp {
                     lightmap: field(7),
                     lightmap_x: field(8),
                     lightmap_y: field(9),
+                    // Past lightmapWidth/Height, lightmapOrigin and the three
+                    // lightmapVecs: `patchWidth` then `patchHeight`.
+                    patch_width: field(24).max(0),
+                    patch_height: field(25).max(0),
                 }
             })
             .collect())
@@ -441,6 +453,20 @@ pub mod tests {
         let length = i32::from_le_bytes(bytes[12..16].try_into().unwrap()) + 100;
         bytes[12..16].copy_from_slice(&length.to_le_bytes());
         assert!(matches!(Bsp::load(bytes), Err(BspError::LumpOutOfRange(0))));
+    }
+
+    #[test]
+    fn a_patch_face_carries_its_control_grid_size() {
+        let mut face = [0u8; DFACE_SIZE];
+        face[8..12].copy_from_slice(&SURFACE_PATCH.to_le_bytes());
+        face[96..100].copy_from_slice(&5i32.to_le_bytes());
+        face[100..104].copy_from_slice(&3i32.to_le_bytes());
+
+        let bsp = Bsp::load(build_bsp_with(&[(LUMP_FACES, &face)])).unwrap();
+        let faces = bsp.faces().unwrap();
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0].surface_type, SURFACE_PATCH);
+        assert_eq!((faces[0].patch_width, faces[0].patch_height), (5, 3));
     }
 
     #[test]
