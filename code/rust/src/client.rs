@@ -1134,6 +1134,19 @@ impl Client {
                     mouse_btn: MouseButton::Left,
                     ..
                 } => self.input.attack = false,
+                Event::MouseWheel { y, precise_y, .. } => {
+                    if !console::lock().is_open() {
+                        // A notch of the wheel is one step; a trackpad's
+                        // fractional scroll is rounded so a soft flick does not
+                        // fly through the whole kit.
+                        let lines = if y != 0 { y } else { precise_y as i32 };
+                        if lines != 0 {
+                            if let Some(prediction) = self.prediction.as_mut() {
+                                prediction.cycle_weapon(lines.signum());
+                            }
+                        }
+                    }
+                }
                 Event::MouseMotion { xrel, yrel, .. } => {
                     if !console::lock().is_open() {
                         let sensitivity = self

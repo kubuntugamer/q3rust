@@ -26,7 +26,7 @@ use crate::collision::Collision;
 use crate::entities;
 use crate::game::MapError;
 use crate::items::ItemField;
-use crate::pmove::{World, MASK_PLAYERSOLID};
+use crate::pmove::MASK_PLAYERSOLID;
 use crate::world::DEFAULT_VIEW_HEIGHT;
 
 /// The full deflection of a `usercmd_t` move axis: the C client's 127.
@@ -425,6 +425,37 @@ impl Prediction {
         }
         self.requested_weapon = weapon;
         true
+    }
+
+    /// Steps to the next weapon the player carries, in the direction given and
+    /// wrapping round. This is what the mouse wheel does in the stock config,
+    /// and it skips weapons that are not owned.
+    pub fn cycle_weapon(&mut self, step: i32) -> bool {
+        if step == 0 {
+            return false;
+        }
+        const ORDER: [i32; 9] = [
+            WP_GAUNTLET,
+            WP_MACHINEGUN,
+            WP_SHOTGUN,
+            WP_GRENADE_LAUNCHER,
+            WP_ROCKET_LAUNCHER,
+            WP_LIGHTNING,
+            WP_RAILGUN,
+            WP_PLASMAGUN,
+            WP_BFG,
+        ];
+        let current = self.pm.ps.weapon;
+        let start = ORDER.iter().position(|slot| *slot == current).unwrap_or(0);
+        let count = ORDER.len() as i32;
+        for step_index in 1..=count {
+            let index = (start as i32 + step.signum() * step_index).rem_euclid(count);
+            let weapon = ORDER[index as usize];
+            if self.pm.ps.stats[STAT_WEAPONS] & (1 << weapon) != 0 {
+                return self.select_weapon(weapon);
+            }
+        }
+        false
     }
 
     /// The trigger, for the length of one round: spends a cartridge, then
@@ -989,6 +1020,33 @@ mod tests {
         }
         assert_eq!(prediction.weapon(), WP_ROCKET_LAUNCHER);
         assert_eq!(prediction.ammo(), 10);
+    }
+
+    #[test]
+    fn the_wheel_steps_to_the_next_weapon_you_carry() {
+        let assets = assets_with_map(MAP_WITH_ROCKETS);
+        let mut prediction = Prediction::load(&assets, "q3dm1").unwrap();
+        let mut field = ItemField::new(&crate::items::item_marks(MAP_WITH_ROCKETS));
+        prediction.step(16, &Input::default());
+        prediction.collect(&mut field, 16);
+        for tick in 1..60 {
+            prediction.step(16 + tick * 20, &Input::default());
+        }
+        assert_eq!(prediction.weapon(), WP_ROCKET_LAUNCHER);
+
+        // Backwards from the launcher skips everything not held.
+        assert!(prediction.cycle_weapon(-1));
+        for tick in 0..60 {
+            prediction.step(1_300 + tick * 20, &Input::default());
+        }
+        assert_eq!(prediction.weapon(), WP_MACHINEGUN);
+
+        // And forward wraps all the way round back to the launcher.
+        assert!(prediction.cycle_weapon(1));
+        for tick in 0..60 {
+            prediction.step(2_600 + tick * 20, &Input::default());
+        }
+        assert_eq!(prediction.weapon(), WP_ROCKET_LAUNCHER);
     }
 
     #[test]
