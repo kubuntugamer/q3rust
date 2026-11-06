@@ -13,6 +13,7 @@
 //! ship an X11 session, so the fallback is refused instead of quietly used.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ash::vk::{Handle, SurfaceKHR};
@@ -37,6 +38,7 @@ use crate::items::{self, ItemField};
 use crate::prediction::{Input, Prediction};
 use crate::texture;
 use crate::vk::{BlendMode, Texture, Vertex2D, Vulkan};
+use crate::wav;
 use crate::world::{self, Camera, World};
 
 /// Set by the `quit` command and cleared when the client shuts down.
@@ -407,6 +409,10 @@ pub struct Client {
     items: Option<ItemField>,
     /// Where recent shots landed, and when the mark should go away.
     sparks: Vec<Spark>,
+    /// The machinegun's shot sounds, decoded once and shared per shot.
+    sounds: Vec<Arc<Vec<f32>>>,
+    /// Which of those the next shot uses, so repeated fire varies.
+    next_sound: usize,
     /// Movement keys held this frame.
     input: Input,
 }
@@ -521,6 +527,22 @@ impl Client {
         // Relative motion is what mouse look needs; the console releases the
         // pointer while it is open.
         let _ = sdl.mouse().set_relative_mouse_mode(true);
+
+        // The machinegun's four shot sounds, decoded once into the mixer's
+        // format; every shot reuses one of them.
+        let mut sounds = Vec::new();
+        if let Some(assets) = assets.as_ref() {
+            for name in ["machgf1b", "machgf2b", "machgf3b", "machgf4b"] {
+                let path = format!("sound/weapons/machinegun/{name}.wav");
+                let Some(bytes) = assets.read(&path) else {
+                    continue;
+                };
+                match wav::decode(&bytes) {
+                    Ok(samples) => sounds.push(Arc::new(samples)),
+                    Err(e) => eprintln!("{path}: {e:?}"),
+                }
+            }
+        }
 
         let audio = match Audio::init(&sdl) {
             Ok(audio) => Some(audio),
@@ -676,6 +698,8 @@ impl Client {
             world,
             items,
             sparks: Vec::new(),
+            sounds,
+            next_sound: 0,
             input: Input::default(),
         })
     }
@@ -1175,6 +1199,13 @@ impl Client {
                             color: [255, 225, 140, 255],
                             until: now + 150,
                         });
+                    }
+                    if let Some(audio) = self.audio.as_ref() {
+                        if !self.sounds.is_empty() {
+                            let sound = Arc::clone(&self.sounds[self.next_sound % self.sounds.len()]);
+                            self.next_sound += 1;
+                            audio.play(sound);
+                        }
                     }
                 }
             }

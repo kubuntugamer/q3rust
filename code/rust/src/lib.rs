@@ -37,6 +37,7 @@ pub mod shared_entity;
 pub mod texture;
 pub mod vk;
 pub mod vm;
+pub mod wav;
 pub mod world;
 pub mod zone;
 
