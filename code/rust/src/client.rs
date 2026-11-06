@@ -1201,7 +1201,7 @@ impl Client {
         }
         // The ear is where the camera is, so sounds can fall off with distance.
         if let (Some(audio), Some(prediction)) = (self.audio.as_ref(), self.prediction.as_ref()) {
-            audio.set_listener(prediction.origin());
+            audio.set_listener(prediction.origin(), prediction.yaw());
         }
 
         // Bring back what has waited long enough, then take what the player is
