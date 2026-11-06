@@ -413,6 +413,8 @@ const BOLT_DAMAGE: i32 = 7;
 /// How hard a bolt is pulled down on the way, so it lobs rather than flying
 /// flat and can drop onto someone behind a ledge.
 const BOLT_GRAVITY: f32 = 320.0;
+/// How long a post that has just stood back up takes to aim again.
+const RECOVERY_GRACE_MS: u32 = 700;
 
 /// How much of your movement a post allows for when it fires. A post that
 /// aimed exactly where you are would never touch a moving target; one that
@@ -1985,9 +1987,13 @@ impl Client {
         }
         self.sparks.retain(|spark| spark.until > now);
         self.beams.retain(|beam| beam.until > now);
-        // A post that has been down long enough stands back up.
+        // A post that has been down long enough stands back up. It takes it a
+        // moment to bring its gun up, so a post that just got back up does not
+        // shoot at you the instant it is standing.
         if let Some(field) = self.targets.as_mut() {
-            field.recover(now);
+            if field.recover(now) > 0 {
+                self.next_bolt = self.next_bolt.max(now + RECOVERY_GRACE_MS);
+            }
         }
         self.update_bolts(now);
 
