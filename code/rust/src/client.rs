@@ -458,6 +458,16 @@ const RECOVERY_GRACE_MS: u32 = 700;
 /// is the warning you get from the far edge of its range.
 const BOLT_TELEGRAPH: u32 = 450;
 
+/// How long a short line like "post down" stays on screen before it fades out.
+const NOTICE_MS: u32 = 1_600;
+
+/// How solid a notice line is: full for most of its life and fading out at the
+/// end, so it leaves without a flicker.
+fn notice_alpha(left_ms: u32) -> u8 {
+    let left = left_ms.min(NOTICE_MS) as f32 / NOTICE_MS as f32;
+    (255.0 * (left * 3.0).min(1.0)) as u8
+}
+
 /// How long before a post that keeps shooting at you gets another line in the
 /// console. A post holds its rhythm whether or not the last line was read, so
 /// without this the log fills up during a fight.
@@ -658,6 +668,9 @@ pub struct Client {
     /// The last post the console named a shot for, and when, so a post that
     /// keeps firing does not fill the log.
     bolt_call: Option<(usize, u32)>,
+    /// A short line of text and when it should have gone: what just happened to
+    /// a post, said on screen as well as in the console.
+    notice: Option<(String, u32)>,
     /// The last frame's clock, for the distance a bolt travels in one frame.
     bolts_moved_at: u32,
     /// The practice posts built from the map's own markers.
@@ -1067,6 +1080,7 @@ impl Client {
             next_bolt: 0,
             wind_up: None,
             bolt_call: None,
+            notice: None,
             bolts_moved_at: 0,
             sounds,
             shotgun_sound,
@@ -1899,6 +1913,22 @@ impl Client {
             )?;
         }
 
+        // A short line in the middle of the frame says when a post goes down or
+        // comes back up, so a fight reads without opening the console.
+        if matches!(self.notice.as_ref(), Some((_, until)) if now >= *until) {
+            self.notice = None;
+        }
+        if let Some((text, until)) = self.notice.clone() {
+            let text_width = self.renderer.face().width(&text, scale);
+            self.renderer.text(
+                &text,
+                (width as f32 - text_width) * 0.5,
+                height as f32 * 0.32,
+                scale,
+                [235, 200, 110, notice_alpha(until.saturating_sub(now))],
+            )?;
+        }
+
         self.renderer
             .text(&status, 8.0, 8.0, scale, [235, 235, 235, 255])?;
         self.renderer.text(
@@ -2295,6 +2325,7 @@ impl Client {
                             if destroyed {
                                 self.posts_down += 1;
                                 console::print("target down");
+                                self.notice = Some(("post down".to_string(), now + NOTICE_MS));
                             }
                         }
                         if shot.splash > 0.0 {
@@ -2303,6 +2334,7 @@ impl Client {
                             self.posts_down += (field.downed() - before) as u32;
                             if down > 0 {
                                 console::print("target down");
+                                self.notice = Some(("post down".to_string(), now + NOTICE_MS));
                             }
                         }
                     }
@@ -2317,6 +2349,7 @@ impl Client {
         if let Some(field) = self.targets.as_mut() {
             if field.recover(now) > 0 {
                 self.next_bolt = self.next_bolt.max(now + RECOVERY_GRACE_MS);
+                self.notice = Some(("post back up".to_string(), now + NOTICE_MS));
             }
         }
         self.update_bolts(now);
@@ -2498,6 +2531,15 @@ mod bolt_arc_tests {
         assert!(bearing(eye, 90.0, [0.0, 100.0, 24.0]).abs() < 0.01);
         // And it wraps rather than jumping at north.
         assert!(bearing(eye, 350.0, [100.0, 20.0, 24.0]) > 0.0);
+    }
+
+    #[test]
+    fn a_notice_fades_out_at_the_end() {
+        assert_eq!(notice_alpha(NOTICE_MS), 255, "full while it is fresh");
+        assert_eq!(notice_alpha(NOTICE_MS / 2), 255);
+        let fading = notice_alpha(NOTICE_MS / 6);
+        assert!(fading < 255 && fading > 0, "{fading}");
+        assert_eq!(notice_alpha(0), 0, "gone by the time it runs out");
     }
 
     #[test]
