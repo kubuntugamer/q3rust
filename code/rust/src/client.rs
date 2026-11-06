@@ -957,7 +957,16 @@ impl Client {
                     else {
                         continue;
                     };
-                    let placed = world::translate(&mvp, item.origin);
+                    // The stock game spins and bobs a pickup so it reads as
+                    // something to take rather than map decoration. The rates
+                    // are the client's own choice: the cgame that holds the
+                    // original numbers is not in this tree.
+                    let phase = item.origin[0] + item.origin[1];
+                    let spin = (now as f32 + phase * 7.0) * 0.04;
+                    let bob = 5.0 * ((now as f32 + phase * 50.0) / 700.0).sin();
+                    let mut at = item.origin;
+                    at[2] += bob;
+                    let placed = world::place(&mvp, at, spin);
                     for surface in &model.surfaces {
                         let (_, texture) = &world.textures()[surface.texture];
                         self.renderer.vk.draw_stage(

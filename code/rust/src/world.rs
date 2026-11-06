@@ -570,6 +570,34 @@ fn flat_texture(vk: &mut Vulkan, textures: &mut Vec<(String, Texture)>) -> Resul
     Ok(textures.len() - 1)
 }
 
+/// The camera matrix with a model's world origin and yaw folded in, so one
+/// static set of triangles can be drawn anywhere, at any angle, without
+/// copying it.
+///
+/// `mvp * (translate * rotate_yaw)`, with the rotation applied to the matrix's
+/// first two columns and the origin to its translation column. Degrees grow to
+/// the left, the same way the player's yaw does.
+pub fn place(mvp: &[f32; 16], origin: [f32; 3], yaw: f32) -> [f32; 16] {
+    let radians = yaw.to_radians();
+    let (sin, cos) = radians.sin_cos();
+    let mut placed = *mvp;
+
+    for row in 0..4 {
+        let x = mvp[row];
+        let y = mvp[4 + row];
+        placed[row] = x * cos + y * sin;
+        placed[4 + row] = -x * sin + y * cos;
+    }
+    // `mvp * (translate * rotate)`: the origin moves through the unrotated
+    // matrix, and the model spins inside that placement.
+    for row in 0..4 {
+        placed[12 + row] += mvp[row] * origin[0]
+            + mvp[4 + row] * origin[1]
+            + mvp[8 + row] * origin[2];
+    }
+    placed
+}
+
 /// The camera matrix with a model's world origin folded in, so one static set
 /// of triangles can be drawn anywhere without copying it.
 ///
@@ -583,6 +611,42 @@ pub fn translate(mvp: &[f32; 16], origin: [f32; 3]) -> [f32; 16] {
             + mvp[8 + row] * origin[2];
     }
     moved
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::{place, translate};
+
+    const IDENTITY: [f32; 16] = [
+        1.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0, //
+        0.0, 0.0, 0.0, 1.0,
+    ];
+
+    #[test]
+    fn a_model_origin_moves_the_matrix_not_its_triangles() {
+        let moved = translate(&IDENTITY, [3.0, -4.0, 5.0]);
+        assert_eq!(moved[12..16], [3.0, -4.0, 5.0, 1.0]);
+        assert_eq!(moved[0..12], IDENTITY[0..12]);
+    }
+
+    #[test]
+    fn a_turned_model_turns_its_x_axis_into_y() {
+        let turned = place(&IDENTITY, [0.0; 3], 90.0);
+        // The first column is where +x goes: a quarter turn to the left puts it
+        // on +y, with x itself coming from +y.
+        assert!((turned[0] - 0.0).abs() < 1e-6, "{:?}", &turned[0..4]);
+        assert!((turned[1] - 1.0).abs() < 1e-6, "{:?}", &turned[0..4]);
+        assert!((turned[4] + 1.0).abs() < 1e-6, "{:?}", &turned[4..8]);
+        assert!((turned[5] - 0.0).abs() < 1e-6, "{:?}", &turned[4..8]);
+    }
+
+    #[test]
+    fn a_turned_model_still_stands_at_its_origin() {
+        let placed = place(&IDENTITY, [8.0, -2.0, 4.0], 37.0);
+        assert_eq!(placed[12..16], [8.0, -2.0, 4.0, 1.0]);
+    }
 }
 
 /// How far the skybox sits from the camera. It has to stay inside
