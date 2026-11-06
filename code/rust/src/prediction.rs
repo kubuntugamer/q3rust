@@ -24,6 +24,8 @@ use crate::collision::Collision;
 use crate::entities;
 use crate::game::MapError;
 use crate::items::ItemField;
+use crate::pmove::MASK_PLAYERSOLID;
+use crate::world::DEFAULT_VIEW_HEIGHT;
 
 /// The full deflection of a `usercmd_t` move axis: the C client's 127.
 const MOVE_SCALE: i32 = 127;
@@ -32,6 +34,19 @@ const TURN_SPEED: f32 = 180.0;
 /// `G_InitPlayer`'s starting clip. Handing the player the machinegun means the
 /// readout and the ammo rules start where the game does instead of at zero.
 const STARTING_AMMO: i32 = 50;
+/// The machinegun's shot interval: `fireTime` is 100 ms.
+const FIRE_TIME: i32 = 100;
+/// `MAX_SHOT_RANGE`: a shot that hits nothing travels this far.
+const SHOT_RANGE: f32 = 8192.0;
+
+/// One round leaving the weapon: where it started, where it stopped, and
+/// whether it stopped on something.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shot {
+    pub from: [f32; 3],
+    pub to: [f32; 3],
+    pub hit: bool,
+}
 
 /// The movement keys the client is holding. The client sets these from SDL
 /// key events; [`Prediction::step`] turns them into a command.
@@ -44,6 +59,8 @@ pub struct Input {
     pub jump: bool,
     pub turn_left: bool,
     pub turn_right: bool,
+    /// The trigger.
+    pub attack: bool,
 }
 
 /// A predicted player on a loaded map.
@@ -58,6 +75,8 @@ pub struct Prediction {
     /// The weapon asked for, which `PM_Weapon` drops the old one and raises.
     /// It differs from the weapon in hand while a change is playing out.
     requested_weapon: i32,
+    /// When the last round left, so the trigger cannot outrun the weapon.
+    last_shot: i32,
 }
 
 impl Prediction {
@@ -90,6 +109,7 @@ impl Prediction {
             pitch: 0.0,
             last_time: 0,
             requested_weapon: WP_MACHINEGUN,
+            last_shot: -1000,
         })
     }
 
@@ -147,6 +167,61 @@ impl Prediction {
         }
         self.requested_weapon = weapon;
         true
+    }
+
+    /// The trigger, for the length of one round: spends a cartridge, then
+    /// traces the bullet from the eye along the view to whatever stops it.
+    ///
+    /// Only the machinegun fires so far; the other weapons need their own shot
+    /// patterns, which is a bigger port than one hitscan line.
+    pub fn fire(&mut self, now: u32) -> Option<Shot> {
+        if self.pm.ps.weapon != WP_MACHINEGUN {
+            return None;
+        }
+        let now = now as i32;
+        if now - self.last_shot < FIRE_TIME {
+            return None;
+        }
+        let slot = WP_MACHINEGUN as usize;
+        let ammo = *self.pm.ps.ammo.get(slot)?;
+        if ammo <= 0 {
+            return None;
+        }
+        self.last_shot = now;
+        if let Some(clip) = self.pm.ps.ammo.get_mut(slot) {
+            *clip = ammo - 1;
+        }
+
+        let from = [
+            self.pm.mv.origin[0],
+            self.pm.mv.origin[1],
+            self.pm.mv.origin[2] + DEFAULT_VIEW_HEIGHT,
+        ];
+        // `AngleVectors`: a positive pitch looks down, and yaw grows to the
+        // left, which is the basis the camera uses too.
+        let (yaw, pitch) = (self.yaw.to_radians(), self.pitch.to_radians());
+        let forward = [
+            pitch.cos() * yaw.cos(),
+            pitch.cos() * yaw.sin(),
+            -pitch.sin(),
+        ];
+        let to = [
+            from[0] + forward[0] * SHOT_RANGE,
+            from[1] + forward[1] * SHOT_RANGE,
+            from[2] + forward[2] * SHOT_RANGE,
+        ];
+
+        // Shots stop on the same surfaces the player's body does; bodies and
+        // glass are part of `MASK_SHOT`, which has nothing to hit yet.
+        let trace = self
+            .pm
+            .world
+            .trace(from, to, [0.0; 3], [0.0; 3], MASK_PLAYERSOLID);
+        Some(Shot {
+            from,
+            to: trace.endpos,
+            hit: trace.fraction < 1.0,
+        })
     }
 
     /// `CG_TouchItem`: take every pickup the player is standing in, and say
@@ -445,6 +520,51 @@ mod tests {
         assert_eq!(prediction.health(), 100);
         assert_eq!(prediction.armor(), 0);
         assert_eq!(prediction.ammo(), STARTING_AMMO);
+    }
+
+    #[test]
+    fn the_trigger_spends_a_round_at_the_machineguns_rate() {
+        let mut prediction = prediction_on_a_test_map();
+        assert_eq!(prediction.ammo(), STARTING_AMMO);
+
+        let shot = prediction.fire(1_000).expect("the first press fires");
+        assert!(!shot.hit, "the test map has no geometry to stop a bullet");
+        let travel = ((shot.to[0] - shot.from[0]).powi(2)
+            + (shot.to[1] - shot.from[1]).powi(2)
+            + (shot.to[2] - shot.from[2]).powi(2))
+        .sqrt();
+        assert!(travel > 1_000.0, "the round went nowhere: {:?}", shot);
+        assert_eq!(prediction.ammo(), STARTING_AMMO - 1);
+
+        assert!(prediction.fire(1_050).is_none(), "too soon for a second round");
+        assert!(prediction.fire(1_100).is_some());
+        assert_eq!(prediction.ammo(), STARTING_AMMO - 2);
+    }
+
+    #[test]
+    fn the_trigger_looks_where_the_player_looks() {
+        let mut prediction = prediction_on_a_test_map();
+        prediction.turn(90.0 - prediction.yaw(), 0.0);
+        let shot = prediction.fire(1_000).unwrap();
+        assert!(shot.to[1] > shot.from[1], "{:?}", shot);
+        assert!((shot.to[0] - shot.from[0]).abs() < 1.0, "{:?}", shot);
+
+        let mut prediction = prediction_on_a_test_map();
+        prediction.turn(0.0, 90.0);
+        let shot = prediction.fire(1_000).unwrap();
+        assert!(shot.to[2] < shot.from[2], "looking down shoots down: {:?}", shot);
+    }
+
+    #[test]
+    fn an_empty_clip_stops_firing() {
+        let mut prediction = prediction_on_a_test_map();
+        let mut now = 0;
+        for _ in 0..STARTING_AMMO {
+            now += 100;
+            assert!(prediction.fire(now as u32).is_some());
+        }
+        assert_eq!(prediction.ammo(), 0);
+        assert!(prediction.fire((now + 500) as u32).is_none());
     }
 
     #[test]

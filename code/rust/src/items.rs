@@ -227,6 +227,19 @@ fn push_box(vertices: &mut Vec<Vertex3D>, origin: [f32; 3], color: [u8; 4]) {
         origin[1] + ITEM_MAXS[1],
         origin[2] + ITEM_MAXS[2],
     ];
+    push_corners(vertices, min, max, color);
+}
+
+/// A small cube centred on `origin`, for the mark a shot leaves.
+pub fn cube(origin: [f32; 3], half: f32, color: [u8; 4]) -> Vec<Vertex3D> {
+    let min = [origin[0] - half, origin[1] - half, origin[2] - half];
+    let max = [origin[0] + half, origin[1] + half, origin[2] + half];
+    let mut vertices = Vec::with_capacity(36);
+    push_corners(&mut vertices, min, max, color);
+    vertices
+}
+
+fn push_corners(vertices: &mut Vec<Vertex3D>, min: [f32; 3], max: [f32; 3], color: [u8; 4]) {
     // Bit 0 picks x, bit 1 y, bit 2 z: the corners in cube order.
     let corner = |index: usize| -> [f32; 3] {
         [

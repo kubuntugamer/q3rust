@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use ash::vk::{Handle, SurfaceKHR};
 use sdl2::event::{Event, WindowEvent};
 use sdl2::keyboard::Keycode;
+use sdl2::mouse::MouseButton;
 use sdl2::video::Window;
 use sdl2::{EventPump, Sdl, VideoSubsystem};
 
@@ -32,7 +33,7 @@ use crate::cmd::CmdSystem;
 use crate::console;
 use crate::cvar::{Cvars, CVAR_ARCHIVE};
 use crate::font::Face;
-use crate::items::ItemField;
+use crate::items::{self, ItemField};
 use crate::prediction::{Input, Prediction};
 use crate::texture;
 use crate::vk::{BlendMode, Texture, Vertex2D, Vulkan};
@@ -371,6 +372,12 @@ fn quad(
     ]
 }
 
+/// A shot's mark: where it stopped and how long it stays.
+struct Spark {
+    at: [f32; 3],
+    until: u32,
+}
+
 /// Engine state that survives a frame: SDL, the command buffer, the cvars, the
 /// renderer and the clock.
 pub struct Client {
@@ -394,6 +401,8 @@ pub struct Client {
     world: Option<World>,
     /// The map's pickups and which of them are on the map right now.
     items: Option<ItemField>,
+    /// Where recent shots landed, and when the mark should go away.
+    sparks: Vec<Spark>,
     /// Movement keys held this frame.
     input: Input,
 }
@@ -639,7 +648,7 @@ impl Client {
         }
         banner.push_str(
             "console open: Esc closes it, Tab completes, Up/Down walks history\n\
-             move: WASD, jump: Space, turn: Left/Right, look: mouse\n\
+             move: WASD, jump: Space, turn: Left/Right, look: mouse, fire: left mouse\n\
              weapons: 1-9 switch to a weapon you are carrying\n\
              display: Q3_WIDTH/Q3_HEIGHT pick a resolution, Q3_FULLSCREEN=1 a native TV mode\n\
              cg_fov widens with the aspect ratio; the vertical view stays 4:3",
@@ -662,6 +671,7 @@ impl Client {
             prediction,
             world,
             items,
+            sparks: Vec::new(),
             input: Input::default(),
         })
     }
@@ -848,6 +858,18 @@ impl Client {
                 } => {
                     self.movement_key(key, false);
                 }
+                Event::MouseButtonDown {
+                    mouse_btn: MouseButton::Left,
+                    ..
+                } => {
+                    if !console::lock().is_open() {
+                        self.input.attack = true;
+                    }
+                }
+                Event::MouseButtonUp {
+                    mouse_btn: MouseButton::Left,
+                    ..
+                } => self.input.attack = false,
                 Event::MouseMotion { xrel, yrel, .. } => {
                     if !console::lock().is_open() {
                         let sensitivity = self
@@ -926,6 +948,19 @@ impl Client {
                     .vk
                     .draw_stage(texture, vertices, &mvp, uv, stage.blend, stage.lit)?;
             }
+        }
+
+        // The marks this frame's shots left.
+        for spark in &self.sparks {
+            let mark = items::cube(spark.at, 2.0, [255, 225, 140, 255]);
+            self.renderer.vk.draw_stage(
+                &self.renderer.white,
+                &mark,
+                &mvp,
+                [1.0, 1.0, 0.0, 0.0],
+                BlendMode::Opaque,
+                true,
+            )?;
         }
 
         // The pickups still on the map, as the models the paks hold. Each one
@@ -1113,6 +1148,20 @@ impl Client {
                 console::print(&format!("picked up {class_name}"));
             }
         }
+        // The trigger. A hit leaves a brief mark where the bullet stopped.
+        if self.input.attack {
+            if let Some(prediction) = self.prediction.as_mut() {
+                if let Some(shot) = prediction.fire(now) {
+                    if shot.hit {
+                        self.sparks.push(Spark {
+                            at: shot.to,
+                            until: now + 150,
+                        });
+                    }
+                }
+            }
+        }
+        self.sparks.retain(|spark| spark.until > now);
 
         self.renderer.vk.begin_frame([0.0, 0.0, 0.0, 1.0])?;
         self.draw_world()?;
