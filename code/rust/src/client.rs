@@ -474,13 +474,21 @@ const BOLT_TELEGRAPH: u32 = 450;
 /// stepped out of, and how wide it starts.
 const DODGE_FLASH_MS: u32 = 240;
 const DODGE_FLASH_WIDTH: f32 = 26.0;
+/// The narrowest the dodge bar ever draws while it is up, so the smallest
+/// payoff still looks deliberate.
+const DODGE_FLASH_FLOOR: f32 = 8.0;
 
 /// How wide the dodge bar is with `left_ms` still to run and a dodge worth
 /// `strength` of a full push: widest for a bolt that nearly clipped you, and
-/// gone by the time the bar has run out.
+/// gone by the time the bar has run out. A small payoff keeps a floor width so
+/// it reads as a small reward rather than a drawing glitch.
 fn dodge_bar_width(left_ms: u32, strength: f32) -> f32 {
     let left = left_ms.min(DODGE_FLASH_MS) as f32 / DODGE_FLASH_MS as f32;
-    DODGE_FLASH_WIDTH * left * strength.clamp(0.0, 1.0)
+    let weight = left * strength.clamp(0.0, 1.0);
+    if weight <= 0.0 {
+        return 0.0;
+    }
+    DODGE_FLASH_FLOOR.max(DODGE_FLASH_WIDTH * weight)
 }
 
 /// How much of a full dodge push `push` is, for the bar that shows it.
@@ -2723,7 +2731,14 @@ mod bolt_arc_tests {
         let close = dodge_bar_width(DODGE_FLASH_MS, dodge_strength(DODGE_PUSH_NEAR));
         let far = dodge_bar_width(DODGE_FLASH_MS, dodge_strength(DODGE_PUSH_FAR + 0.01));
         assert!(close > far, "{close} {far}");
-        assert!(far < 1.0, "a barely-paid dodge is a sliver, not a full bar");
+        assert_eq!(far, DODGE_FLASH_FLOOR, "a barely-paid dodge keeps a floor width");
+        assert!(far > DODGE_FLASH_WIDTH * 0.25, "and that floor is a bar, not a hair");
+        assert_eq!(
+            dodge_bar_width(1, 1.0),
+            DODGE_FLASH_FLOOR,
+            "even on its last frame it is visible"
+        );
+        assert_eq!(dodge_bar_width(0, 1.0), 0.0, "but it does go");
     }
 
     #[test]
