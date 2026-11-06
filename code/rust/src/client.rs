@@ -2688,7 +2688,7 @@ impl Client {
                             if destroyed {
                                 self.posts_down += 1;
                                 console::print("target down");
-                                push_notice(&mut self.notices, &down_line(1, field.down_wait_ms()), now);
+                                push_notice(&mut self.notices, &down_line(1, field.wait_at(now)), now);
                             }
                         }
                         if shot.splash > 0.0 {
@@ -2699,7 +2699,7 @@ impl Client {
                                 console::print("target down");
                                 push_notice(
                                     &mut self.notices,
-                                    &down_line(down as u32, field.down_wait_ms()),
+                                    &down_line(down as u32, field.wait_at(now)),
                                     now,
                                 );
                             }

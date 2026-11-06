@@ -132,12 +132,15 @@ impl TargetField {
         &self.targets
     }
 
-    /// The longest any post currently on the floor will lie there, so the line
-    /// that says one went down can say how long the wait is.
-    pub fn down_wait_ms(&self) -> u32 {
+    /// How long the posts knocked down at `when` will lie there, so the line
+    /// that says a post went down can say how long *that* post's wait is
+    /// rather than the longest wait of anything already on the floor. Zero
+    /// when nothing went down at that moment.
+    pub fn wait_at(&self, when: u32) -> u32 {
+        let when = when.max(1);
         self.targets
             .iter()
-            .filter(|target| target.fallen_at != 0)
+            .filter(|target| target.fallen_at == when)
             .map(|target| recovery_for(target.downs))
             .max()
             .unwrap_or(0)
@@ -463,23 +466,50 @@ mod tests {
     #[test]
     fn a_down_post_can_say_how_long_it_will_lie_there() {
         let mut field = TargetField::new(&[[0.0, 0.0, 0.0], [400.0, 0.0, 0.0]]);
-        assert_eq!(field.down_wait_ms(), 0, "nothing is down yet");
+        assert_eq!(field.wait_at(500), 0, "nothing is down yet");
 
         let shot = ([0.0, 0.0, 40.0], [100.0, 0.0, 40.0]);
         field.shoot(shot.0, shot.1, 200, 500);
-        assert_eq!(field.down_wait_ms(), TARGET_RECOVERY_MS);
+        assert_eq!(field.wait_at(500), TARGET_RECOVERY_MS);
 
         // A post put down for the second time sets the wait for the pair.
         field.recover(500 + TARGET_RECOVERY_MS);
         field.shoot(shot.0, shot.1, 200, 10_000);
         assert_eq!(
-            field.down_wait_ms(),
+            field.wait_at(10_000),
             TARGET_RECOVERY_MS + TARGET_RECOVERY_STEP_MS
         );
 
         // Once they are all up there is no wait to speak of.
         field.recover(10_000 + TARGET_RECOVERY_MAX_MS);
-        assert_eq!(field.down_wait_ms(), 0);
+        assert_eq!(field.wait_at(10_000), 0);
+    }
+
+    #[test]
+    fn a_post_downed_now_says_its_own_wait_and_not_a_neighbours() {
+        let mut field = TargetField::new(&[[0.0, 0.0, 0.0], [400.0, 0.0, 0.0]]);
+        let near = ([0.0, 0.0, 40.0], [100.0, 0.0, 40.0]);
+        let far = ([300.0, 0.0, 40.0], [500.0, 0.0, 40.0]);
+
+        // The near post is put down a second time, so it is on the floor for
+        // eight seconds.
+        field.shoot(near.0, near.1, 200, 500);
+        field.recover(500 + TARGET_RECOVERY_MS);
+        field.shoot(near.0, near.1, 200, 7_000);
+        assert_eq!(
+            field.wait_at(7_000),
+            TARGET_RECOVERY_MS + TARGET_RECOVERY_STEP_MS
+        );
+
+        // The far post's first fall is six seconds, whatever the near one is
+        // serving.
+        field.shoot(far.0, far.1, 200, 9_000);
+        assert_eq!(field.wait_at(9_000), TARGET_RECOVERY_MS);
+        assert_eq!(
+            field.wait_at(7_000),
+            TARGET_RECOVERY_MS + TARGET_RECOVERY_STEP_MS,
+            "the near post still says its own wait"
+        );
     }
 
     #[test]
