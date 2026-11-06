@@ -1177,9 +1177,14 @@ impl Client {
         let scale = self.renderer.face().default_scale(height) * 0.75;
         let line_height = self.renderer.face().line_height(scale);
 
-        // The player's own numbers first: health, armour and the clip in hand.
+        // The player's own numbers first: health, armour, and which weapon and
+        // clip are in hand. There is no first-person model yet, so the name is
+        // how the readout says what is being held.
+        let weapon = bg_misc::class_of_weapon(prediction.weapon())
+            .map(|name| name.trim_start_matches("weapon_"))
+            .unwrap_or("none");
         let status = format!(
-            "HEALTH {}   ARMOR {}   AMMO {}",
+            "HEALTH {}   ARMOR {}   {weapon} {}",
             prediction.health(),
             prediction.armor(),
             prediction.ammo()
