@@ -18,7 +18,7 @@ use crate::assets::Assets;
 use crate::bg_misc::{self, ItemType};
 use crate::bg_pmove::{
     pmove, Pmove, UserCmd, ENTITYNUM_NONE, EV_FALL_FAR, EV_FALL_MEDIUM, STAT_ARMOR, STAT_HEALTH,
-    STAT_WEAPONS, WP_MACHINEGUN, WP_RAILGUN, WP_ROCKET_LAUNCHER, WP_SHOTGUN,
+    STAT_WEAPONS, WP_MACHINEGUN, WP_PLASMAGUN, WP_RAILGUN, WP_ROCKET_LAUNCHER, WP_SHOTGUN,
 };
 use crate::bsp::Bsp;
 use crate::collision::Collision;
@@ -44,18 +44,35 @@ const FALL_DAMAGE_MEDIUM: i32 = 5;
 const RESPAWN_DELAY: u32 = 1_700;
 /// A rocket's speed, from `g_weapon.c`: 900 units a second.
 const ROCKET_SPEED: f32 = 900.0;
-/// How long a rocket lives before it goes off in the air.
-const ROCKET_LIFE_MS: i32 = 5_000;
+/// A plasma ball is quicker and shorter-lived than a rocket.
+const PLASMA_SPEED: f32 = 2_000.0;
+/// How long a projectile lives before it goes off in the air.
+const PROJECTILE_LIFE_MS: i32 = 5_000;
 /// How wide a rocket's blast reaches.
 pub const ROCKET_RADIUS: f32 = 120.0;
+/// A plasma ball bursts in a smaller radius.
+pub const PLASMA_RADIUS: f32 = 60.0;
 
-/// A rocket in flight. It travels a frame at a time rather than landing the
-/// instant the trigger is pulled.
+/// Something in flight. It travels a frame at a time rather than landing the
+/// instant the trigger is pulled; a rocket and a plasma ball differ in speed,
+/// size and what they leave behind.
 #[derive(Clone, Copy, Debug)]
-pub struct Rocket {
+pub struct Projectile {
     pub origin: [f32; 3],
     velocity: [f32; 3],
     born: i32,
+    damage: i32,
+    radius: f32,
+    /// Blue for plasma, warm for a rocket.
+    pub plasma: bool,
+}
+
+/// Where a projectile went off, and what it does there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Blast {
+    pub at: [f32; 3],
+    pub radius: f32,
+    pub damage: i32,
 }
 
 /// One round leaving the weapon: where it started, where it stopped, and
@@ -82,9 +99,15 @@ struct Pattern {
     splash: f32,
     /// Per round, or per pellet for the shotgun.
     damage: i32,
+    /// How fast the round flies, or 0 for a shot that lands at once.
+    speed: f32,
+    /// How wide its blast is, or 0 for a round that only hits what it touches.
+    radius: f32,
+    /// Whether it is plasma rather than a rocket.
+    plasma: bool,
 }
 
-const PATTERNS: [Pattern; 4] = [
+const PATTERNS: [Pattern; 5] = [
     Pattern {
         weapon: WP_MACHINEGUN,
         interval: 100,
@@ -92,6 +115,9 @@ const PATTERNS: [Pattern; 4] = [
         spread: 0.0,
         splash: 0.0,
         damage: 34,
+        speed: 0.0,
+        radius: 0.0,
+        plasma: false,
     },
     Pattern {
         weapon: WP_SHOTGUN,
@@ -101,6 +127,9 @@ const PATTERNS: [Pattern; 4] = [
         splash: 0.0,
         // A pellet, not a shell: eleven of them at close range add up.
         damage: 12,
+        speed: 0.0,
+        radius: 0.0,
+        plasma: false,
     },
     Pattern {
         weapon: WP_ROCKET_LAUNCHER,
@@ -109,6 +138,9 @@ const PATTERNS: [Pattern; 4] = [
         spread: 0.0,
         splash: 120.0,
         damage: 100,
+        speed: ROCKET_SPEED,
+        radius: ROCKET_RADIUS,
+        plasma: false,
     },
     Pattern {
         weapon: WP_RAILGUN,
@@ -118,6 +150,21 @@ const PATTERNS: [Pattern; 4] = [
         splash: 0.0,
         // One slug, straight through: a post goes down in a single shot.
         damage: 100,
+        speed: 0.0,
+        radius: 0.0,
+        plasma: false,
+    },
+    Pattern {
+        weapon: WP_PLASMAGUN,
+        interval: 100,
+        pellets: 1,
+        spread: 0.0,
+        splash: 0.0,
+        // Balls that fly faster than a rocket and burst smaller.
+        damage: 20,
+        speed: PLASMA_SPEED,
+        radius: PLASMA_RADIUS,
+        plasma: true,
     },
 ];
 
@@ -171,9 +218,9 @@ pub struct Prediction {
     spawns: Vec<SpawnPoint>,
     /// When the body comes back, or 0 while the player is alive.
     respawn_at: u32,
-    /// Rockets in the air, and where the ones that went off did so.
-    rockets: Vec<Rocket>,
-    blasts: Vec<[f32; 3]>,
+    /// Projectiles in the air, and where the ones that went off did so.
+    projectiles: Vec<Projectile>,
+    blasts: Vec<Blast>,
 }
 
 impl Prediction {
@@ -210,7 +257,7 @@ impl Prediction {
             last_shot: -1000,
             spawns,
             respawn_at: 0,
-            rockets: Vec::new(),
+            projectiles: Vec::new(),
             blasts: Vec::new(),
         })
     }
@@ -303,9 +350,9 @@ impl Prediction {
             self.pm.mv.origin[2] + DEFAULT_VIEW_HEIGHT,
         ];
 
-        // A rocket is not a hitscan: it leaves the muzzle and travels, and the
-        // blast comes from `advance_rockets` when it arrives.
-        if pattern.splash > 0.0 {
+        // A rocket or a plasma ball is not a hitscan: it leaves the muzzle and
+        // travels, and the blast comes from `advance_rockets` when it arrives.
+        if pattern.speed > 0.0 {
             let (yaw, pitch) = (self.yaw.to_radians(), self.pitch.to_radians());
             let forward = [
                 pitch.cos() * yaw.cos(),
@@ -317,14 +364,17 @@ impl Prediction {
                 from[1] + forward[1] * 16.0,
                 from[2] + forward[2] * 16.0,
             ];
-            self.rockets.push(Rocket {
+            self.projectiles.push(Projectile {
                 origin: muzzle,
                 velocity: [
-                    forward[0] * ROCKET_SPEED,
-                    forward[1] * ROCKET_SPEED,
-                    forward[2] * ROCKET_SPEED,
+                    forward[0] * pattern.speed,
+                    forward[1] * pattern.speed,
+                    forward[2] * pattern.speed,
                 ],
                 born: now,
+                damage: pattern.damage,
+                radius: pattern.radius,
+                plasma: pattern.plasma,
             });
             return vec![Shot {
                 from,
@@ -461,40 +511,44 @@ impl Prediction {
         }
     }
 
-    /// Moves every rocket along its path. One that reaches a wall, or outlives
-    /// `ROCKET_LIFE_MS`, goes off where it stopped.
+    /// Moves every projectile along its path. One that reaches a wall, or
+    /// outlives `PROJECTILE_LIFE_MS`, goes off where it stopped.
     fn advance_rockets(&mut self, seconds: f32) {
-        let mut in_flight = Vec::with_capacity(self.rockets.len());
-        for rocket in std::mem::take(&mut self.rockets) {
+        let mut in_flight = Vec::with_capacity(self.projectiles.len());
+        for shot in std::mem::take(&mut self.projectiles) {
             let to = [
-                rocket.origin[0] + rocket.velocity[0] * seconds,
-                rocket.origin[1] + rocket.velocity[1] * seconds,
-                rocket.origin[2] + rocket.velocity[2] * seconds,
+                shot.origin[0] + shot.velocity[0] * seconds,
+                shot.origin[1] + shot.velocity[1] * seconds,
+                shot.origin[2] + shot.velocity[2] * seconds,
             ];
             let trace = self
                 .pm
                 .world
-                .trace(rocket.origin, to, [0.0; 3], [0.0; 3], MASK_PLAYERSOLID);
-            if trace.fraction < 1.0 || self.last_time - rocket.born >= ROCKET_LIFE_MS {
-                self.blasts.push(trace.endpos);
+                .trace(shot.origin, to, [0.0; 3], [0.0; 3], MASK_PLAYERSOLID);
+            if trace.fraction < 1.0 || self.last_time - shot.born >= PROJECTILE_LIFE_MS {
+                self.blasts.push(Blast {
+                    at: trace.endpos,
+                    radius: shot.radius,
+                    damage: shot.damage,
+                });
             } else {
-                in_flight.push(Rocket {
+                in_flight.push(Projectile {
                     origin: trace.endpos,
-                    ..rocket
+                    ..shot
                 });
             }
         }
-        self.rockets = in_flight;
+        self.projectiles = in_flight;
     }
 
-    /// The rockets still in the air, for drawing.
-    pub fn rockets(&self) -> &[Rocket] {
-        &self.rockets
+    /// The projectiles still in the air, for drawing.
+    pub fn projectiles(&self) -> &[Projectile] {
+        &self.projectiles
     }
 
-    /// Takes the explosions that happened this frame, so the client plays them
-    /// once each.
-    pub fn take_blasts(&mut self) -> Vec<[f32; 3]> {
+    /// Takes the blasts that happened this frame, so the client plays each one
+    /// once.
+    pub fn take_blasts(&mut self) -> Vec<Blast> {
         std::mem::take(&mut self.blasts)
     }
 
@@ -900,6 +954,37 @@ mod tests {
     }
 
     #[test]
+    fn the_plasma_gun_throws_fast_balls_that_burst_small() {
+        let mut prediction = prediction_on_a_test_map();
+        prediction.pm.ps.stats[STAT_WEAPONS] |= 1 << WP_PLASMAGUN;
+        prediction.pm.ps.ammo[WP_PLASMAGUN as usize] = 50;
+        assert!(prediction.select_weapon(WP_PLASMAGUN));
+        for tick in 0..40 {
+            prediction.step(1_000 + tick * 50, &Input::default());
+        }
+        assert_eq!(prediction.weapon(), WP_PLASMAGUN);
+
+        let now = 1_000 + 40 * 50;
+        let shots = prediction.fire(now);
+        assert_eq!(shots.len(), 1);
+        assert_eq!(prediction.ammo(), 49);
+        let ball = prediction.projectiles()[0];
+        assert!(ball.plasma, "it is plasma");
+        assert!((ball.radius - PLASMA_RADIUS).abs() < 0.001, "a small burst");
+
+        // It covers ground faster than a rocket does.
+        let start = ball.origin;
+        prediction.step(now + 50, &Input::default());
+        if let Some(moved) = prediction.projectiles().first() {
+            let gone = ((moved.origin[0] - start[0]).powi(2)
+                + (moved.origin[1] - start[1]).powi(2)
+                + (moved.origin[2] - start[2]).powi(2))
+            .sqrt();
+            assert!(gone > 10.0, "the ball travels: {gone}");
+        }
+    }
+
+    #[test]
     fn the_rocket_launcher_fires_one_round_that_splashes() {
         let mut prediction = prediction_on_a_test_map();
         prediction.pm.ps.stats[STAT_WEAPONS] |= 1 << WP_ROCKET_LAUNCHER;
@@ -914,18 +999,21 @@ mod tests {
         let shots = prediction.fire(now);
         assert_eq!(shots.len(), 1, "one round leaves the launcher");
         assert_eq!(prediction.ammo(), 4);
-        assert_eq!(prediction.rockets().len(), 1, "and it flies");
-        let start = prediction.rockets()[0].origin;
+        assert_eq!(prediction.projectiles().len(), 1, "and it flies");
+        let start = prediction.projectiles()[0].origin;
 
         // It travels rather than landing at once.
         prediction.step(now + 100, &Input::default());
-        let moved = prediction.rockets().first().map(|rocket| rocket.origin);
+        let moved = prediction.projectiles().first().map(|shot| shot.origin);
         assert!(moved.is_some_and(|at| at != start), "the rocket moves");
 
         // Given enough time it goes off, wherever it stopped.
         prediction.step(now + 6_000, &Input::default());
-        assert!(prediction.rockets().is_empty());
-        assert_eq!(prediction.take_blasts().len(), 1, "one blast, once");
+        assert!(prediction.projectiles().is_empty());
+        let blasts = prediction.take_blasts();
+        assert_eq!(blasts.len(), 1, "one blast, once");
+        assert_eq!(blasts[0].damage, 100, "a rocket's own damage");
+        assert_eq!(blasts[0].radius, ROCKET_RADIUS);
         assert!(prediction.take_blasts().is_empty(), "and it is only reported once");
     }
 

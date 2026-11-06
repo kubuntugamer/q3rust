@@ -411,8 +411,9 @@ pub struct Client {
     sparks: Vec<Spark>,
     /// The practice posts built from the map's own markers.
     targets: Option<TargetField>,
-    /// Where the rockets in the air are, copied from the move each frame.
-    rockets: Vec<[f32; 3]>,
+    /// Where the rounds in the air are and whether they are plasma, copied
+    /// from the move each frame.
+    rockets: Vec<([f32; 3], bool)>,
     /// The machinegun's shot sounds, decoded once and shared per shot.
     sounds: Vec<Arc<Vec<f32>>>,
     /// The shotgun's break, the rocket's launch, and what it leaves behind.
@@ -1066,13 +1067,13 @@ impl Client {
         // The rockets in the air, small bright boxes on their way.
         if !self.rockets.is_empty() {
             let mut flying = Vec::new();
-            for at in &self.rockets {
-                flying.extend(items::cuboid(
-                    *at,
-                    [-4.0; 3],
-                    [4.0; 3],
-                    [255, 240, 200, 255],
-                ));
+            for (at, plasma) in &self.rockets {
+                let color = if *plasma {
+                    [150, 200, 255, 255]
+                } else {
+                    [255, 240, 200, 255]
+                };
+                flying.extend(items::cuboid(*at, [-4.0; 3], [4.0; 3], color));
             }
             self.renderer.vk.draw_stage(
                 &self.renderer.white,
@@ -1268,15 +1269,20 @@ impl Client {
             // A rocket in flight is drawn like a shot's spark, and the ones that
             // arrive this frame are felt, heard and applied to the posts.
             self.rockets = prediction
-                .rockets()
+                .projectiles()
                 .iter()
-                .map(|rocket| rocket.origin)
+                .map(|shot| (shot.origin, shot.plasma))
                 .collect();
-            for at in prediction.take_blasts() {
+            for blast in prediction.take_blasts() {
+                let at = blast.at;
                 self.sparks.push(Spark {
                     at,
                     half: 12.0,
-                    color: [255, 190, 120, 255],
+                    color: if blast.radius < crate::prediction::ROCKET_RADIUS {
+                        [150, 200, 255, 255]
+                    } else {
+                        [255, 190, 120, 255]
+                    },
                     until: now + 200,
                 });
                 if let (Some(sound), Some(audio)) =
@@ -1285,7 +1291,7 @@ impl Client {
                     audio.play_at(sound, at);
                 }
                 if let Some(field) = self.targets.as_mut() {
-                    field.blast(at, crate::prediction::ROCKET_RADIUS, 100);
+                    field.blast(at, blast.radius, blast.damage);
                 }
                 // A rocket fired into the floor hurts the one who fired it, less
                 // the further away the blast is.
@@ -1294,20 +1300,25 @@ impl Client {
                     + (eye[1] - at[1]).powi(2)
                     + (eye[2] - at[2]).powi(2))
                 .sqrt();
-                let radius = crate::prediction::ROCKET_RADIUS;
+                let radius = blast.radius;
                 if away < radius {
-                    let hurt = ((1.0 - away / radius) * 50.0) as i32;
+                    // Your own rocket hurts more than a plasma ball does.
+                    let hurt = ((1.0 - away / radius) * blast.damage as f32 * 0.5) as i32;
                     if hurt > 0 {
                         prediction.hurt(hurt);
                     }
                 }
             }
             // A short-lived spark at each rocket leaves a trail behind it.
-            for at in self.rockets.clone() {
+            for (at, plasma) in self.rockets.clone() {
                 self.sparks.push(Spark {
                     at,
                     half: 2.5,
-                    color: [255, 210, 150, 255],
+                    color: if plasma {
+                        [170, 210, 255, 255]
+                    } else {
+                        [255, 210, 150, 255]
+                    },
                     until: now + 120,
                 });
             }
