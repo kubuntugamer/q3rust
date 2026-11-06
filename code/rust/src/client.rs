@@ -517,6 +517,8 @@ pub struct Client {
     kick_until: u32,
     /// When the red wash of a fresh hit should have faded out.
     hurt_until: u32,
+    /// When the hit marker on the crosshair should have faded out.
+    hit_until: u32,
     /// The pickup sounds, by the path the item table names.
     pickup_sounds: std::collections::HashMap<&'static str, Arc<Vec<f32>>>,
     /// Which of those the next shot uses, so repeated fire varies.
@@ -900,6 +902,7 @@ impl Client {
             next_impact: 0,
             kick_until: 0,
             hurt_until: 0,
+            hit_until: 0,
             pickup_sounds,
             next_sound: 0,
             input: Input::default(),
@@ -1501,6 +1504,31 @@ impl Client {
             if prediction.on_ground() { "ground" } else { "air" }
         );
 
+        // A crosshair in the middle of the frame. It is drawn by the client
+        // because the cgame that would draw one is not in this tree.
+        let mid_x = width as f32 * 0.5;
+        let mid_y = height as f32 * 0.5;
+        let (gap, length) = (3.0, 7.0);
+        for (x, y, w, h) in [
+            (mid_x - gap - length, mid_y - 1.0, length, 2.0),
+            (mid_x + gap, mid_y - 1.0, length, 2.0),
+            (mid_x - 1.0, mid_y - gap - length, 2.0, length),
+            (mid_x - 1.0, mid_y + gap, 2.0, length),
+        ] {
+            self.renderer.fill(x, y, w, h, [235, 235, 235, 190])?;
+        }
+        // A shot that hits a post flares the corners of the crosshair amber.
+        if now < self.hit_until {
+            for (x, y, w, h) in [
+                (mid_x - 12.0, mid_y - 12.0, 6.0, 2.0),
+                (mid_x + 6.0, mid_y - 12.0, 6.0, 2.0),
+                (mid_x - 12.0, mid_y + 10.0, 6.0, 2.0),
+                (mid_x + 6.0, mid_y + 10.0, 6.0, 2.0),
+            ] {
+                self.renderer.fill(x, y, w, h, [255, 210, 90, 255])?;
+            }
+        }
+
         // A fresh hit washes the frame red and fades out over a quarter second.
         if now < self.hurt_until {
             let left = (self.hurt_until - now) as f32 / HURT_FLASH_MS as f32;
@@ -1872,6 +1900,7 @@ impl Client {
                     }
                     if let Some(field) = self.targets.as_mut() {
                         if let Some((at, destroyed)) = field.shoot(shot.from, shot.to, shot.damage, now) {
+                            self.hit_until = now + 150;
                             self.sparks.push(Spark {
                                 at,
                                 half: 3.0,
