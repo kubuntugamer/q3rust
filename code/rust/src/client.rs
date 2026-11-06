@@ -505,6 +505,22 @@ fn ring_point(centre: [f32; 2], bearing: f32, radius: f32) -> [f32; 2] {
     [centre[0] - sin * radius, centre[1] - cos * radius]
 }
 
+/// Which way to say a post round `bearing` degrees off your view lies, in the
+/// words a player would use: ahead, off to one side, or behind you.
+fn side_words(bearing: f32) -> String {
+    let off = bearing.abs();
+    let side = if bearing > 0.0 { "left" } else { "right" };
+    if off < 15.0 {
+        "ahead".to_string()
+    } else if off < 60.0 {
+        format!("front {side}")
+    } else if off < 120.0 {
+        side.to_string()
+    } else {
+        format!("behind {side}")
+    }
+}
+
 /// The three corners of the arrow that points out from the crosshair at the
 /// post lining a shot up.
 fn threat_arrow(centre: [f32; 2], bearing: f32, radius: f32) -> [[f32; 2]; 3] {
@@ -1921,6 +1937,13 @@ impl Client {
                             .unwrap_or(std::cmp::Ordering::Equal)
                     });
                 if let Some((index, from, distance)) = nearest {
+                    // Say which post has you and which way to look, since a
+                    // post off screen is easy to miss otherwise.
+                    let heading = bearing(prediction.origin(), prediction.yaw(), from);
+                    console::print(&format!(
+                        "post lining up a shot: {} ({distance:.0} away)",
+                        side_words(heading)
+                    ));
                     // The wait for the next shot starts now, so a post whose
                     // shot is cancelled still keeps its rhythm.
                     self.next_bolt = now + BOLT_INTERVAL;
@@ -2427,6 +2450,18 @@ mod bolt_arc_tests {
         assert!(bearing(eye, 90.0, [0.0, 100.0, 24.0]).abs() < 0.01);
         // And it wraps rather than jumping at north.
         assert!(bearing(eye, 350.0, [100.0, 20.0, 24.0]) > 0.0);
+    }
+
+    #[test]
+    fn a_shot_is_announced_with_which_way_to_look() {
+        assert_eq!(side_words(0.0), "ahead");
+        assert_eq!(side_words(-8.0), "ahead");
+        assert_eq!(side_words(35.0), "front left");
+        assert_eq!(side_words(-35.0), "front right");
+        assert_eq!(side_words(90.0), "left");
+        assert_eq!(side_words(-95.0), "right");
+        assert_eq!(side_words(170.0), "behind left");
+        assert_eq!(side_words(-170.0), "behind right");
     }
 
     #[test]
