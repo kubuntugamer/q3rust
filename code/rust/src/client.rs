@@ -27,6 +27,7 @@ use crate::cmd::CmdSystem;
 use crate::console;
 use crate::cvar::{Cvars, CVAR_ARCHIVE};
 use crate::font::Face;
+use crate::items::ItemField;
 use crate::prediction::{Input, Prediction};
 use crate::texture;
 use crate::vk::{BlendMode, Texture, Vertex2D, Vulkan};
@@ -386,6 +387,8 @@ pub struct Client {
     prediction: Option<Prediction>,
     /// The map's static geometry, once it uploaded.
     world: Option<World>,
+    /// The map's pickups and which of them are on the map right now.
+    items: Option<ItemField>,
     /// Movement keys held this frame.
     input: Input,
 }
@@ -545,6 +548,9 @@ impl Client {
             }
         }
 
+        // The live pickups, from the same marks the world drew its boxes for.
+        let items = world.as_ref().map(|world| ItemField::new(&world.items));
+
         let mut cmd = CmdSystem::new();
         cmd.add_command("quit", Some(quit_command));
         cmd.add_command("clear", Some(clear_command));
@@ -648,6 +654,7 @@ impl Client {
             console_rows: 1,
             prediction,
             world,
+            items,
             input: Input::default(),
         })
     }
@@ -891,18 +898,21 @@ impl Client {
             }
         }
 
-        // The map's pickups: a box each, coloured by kind. The colour rides in
-        // the vertex colour, which is the lit path's tint, and the white
-        // texture leaves it alone.
-        if !world.item_vertices.is_empty() {
-            self.renderer.vk.draw_stage(
-                &self.renderer.white,
-                &world.item_vertices,
-                &mvp,
-                [1.0, 1.0, 0.0, 0.0],
-                BlendMode::Opaque,
-                true,
-            )?;
+        // The pickups still on the map: a box each, coloured by kind. The
+        // colour rides in the vertex colour, which is the lit path's tint, and
+        // the white texture leaves it alone.
+        if let Some(field) = self.items.as_ref() {
+            let vertices = field.vertices();
+            if !vertices.is_empty() {
+                self.renderer.vk.draw_stage(
+                    &self.renderer.white,
+                    vertices,
+                    &mvp,
+                    [1.0, 1.0, 0.0, 0.0],
+                    BlendMode::Opaque,
+                    true,
+                )?;
+            }
         }
         Ok(())
     }
@@ -978,15 +988,33 @@ impl Client {
         let Some(prediction) = self.prediction.as_ref() else {
             return Ok(());
         };
-        let [x, y, z] = prediction.origin();
         let (_, height) = self.renderer.size();
         let scale = self.renderer.face().default_scale(height) * 0.75;
+        let line_height = self.renderer.face().line_height(scale);
+
+        // The player's own numbers first: health, armour and the clip in hand.
+        let status = format!(
+            "HEALTH {}   ARMOR {}   AMMO {}",
+            prediction.health(),
+            prediction.armor(),
+            prediction.ammo()
+        );
+        self.renderer
+            .text(&status, 8.0, 8.0, scale, [235, 235, 235, 255])?;
+
+        let [x, y, z] = prediction.origin();
         let line = format!(
             "{x:.0} {y:.0} {z:.0}   {:.0} u/s   {}",
             prediction.speed(),
             if prediction.on_ground() { "ground" } else { "air" }
         );
-        self.renderer.text(&line, 8.0, 8.0, scale, [235, 235, 235, 255])
+        self.renderer.text(
+            &line,
+            8.0,
+            8.0 + line_height,
+            scale,
+            [180, 180, 180, 255],
+        )
     }
 
     /// Handles the pending SDL events and draws one frame. Returns `false`
@@ -1002,6 +1030,14 @@ impl Client {
         let now = self.millis();
         if let Some(prediction) = self.prediction.as_mut() {
             prediction.step(now, &self.input);
+        }
+        // Bring back what has waited long enough, then take what the player is
+        // standing in.
+        if let (Some(prediction), Some(field)) = (self.prediction.as_mut(), self.items.as_mut()) {
+            field.refresh(now);
+            for class_name in prediction.collect(field, now) {
+                console::print(&format!("picked up {class_name}"));
+            }
         }
 
         self.renderer.vk.begin_frame([0.0, 0.0, 0.0, 1.0])?;

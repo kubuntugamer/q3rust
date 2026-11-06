@@ -15,16 +15,22 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::assets::Assets;
-use crate::bg_pmove::{pmove, Pmove, UserCmd, ENTITYNUM_NONE};
+use crate::bg_pmove::{
+    pmove, Pmove, UserCmd, ENTITYNUM_NONE, STAT_ARMOR, STAT_HEALTH, STAT_WEAPONS, WP_MACHINEGUN,
+};
 use crate::bsp::Bsp;
 use crate::collision::Collision;
 use crate::entities;
 use crate::game::MapError;
+use crate::items::ItemField;
 
 /// The full deflection of a `usercmd_t` move axis: the C client's 127.
 const MOVE_SCALE: i32 = 127;
 /// Degrees per second the turn keys rotate the view.
 const TURN_SPEED: f32 = 180.0;
+/// `G_InitPlayer`'s starting clip. Handing the player the machinegun means the
+/// readout and the ammo rules start where the game does instead of at zero.
+const STARTING_AMMO: i32 = 50;
 
 /// The movement keys the client is holding. The client sets these from SDL
 /// key events; [`Prediction::step`] turns them into a command.
@@ -67,9 +73,15 @@ impl Prediction {
         let (spawn, yaw) = pick_spawn(&spawn_points(bsp.entities())).unwrap_or(([0.0; 3], 0.0));
 
         let world: &'static Collision = Box::leak(Box::new(Collision::load(&bsp)?));
+        let mut pm = Pmove::new(spawn, world);
+        // `G_InitPlayer`: the machinegun, held, with a clip.
+        pm.ps.stats[STAT_WEAPONS] |= 1 << WP_MACHINEGUN;
+        pm.ps.ammo[WP_MACHINEGUN as usize] = STARTING_AMMO;
+        pm.ps.weapon = WP_MACHINEGUN;
+        pm.cmd.weapon = WP_MACHINEGUN;
         Ok(Prediction {
             map: map.to_string(),
-            pm: Pmove::new(spawn, world),
+            pm,
             yaw,
             pitch: 0.0,
             last_time: 0,
@@ -92,6 +104,30 @@ impl Prediction {
 
     pub fn on_ground(&self) -> bool {
         self.pm.ps.ground_entity_num != ENTITYNUM_NONE
+    }
+
+    /// `ps.stats[STAT_HEALTH]`.
+    pub fn health(&self) -> i32 {
+        self.pm.ps.stats[STAT_HEALTH]
+    }
+
+    /// `ps.stats[STAT_ARMOR]`.
+    pub fn armor(&self) -> i32 {
+        self.pm.ps.stats[STAT_ARMOR]
+    }
+
+    /// Rounds left in the weapon in hand.
+    pub fn ammo(&self) -> i32 {
+        usize::try_from(self.pm.ps.weapon)
+            .ok()
+            .and_then(|slot| self.pm.ps.ammo.get(slot).copied())
+            .unwrap_or(0)
+    }
+
+    /// `CG_TouchItem`: take every pickup the player is standing in, and say
+    /// what was taken.
+    pub fn collect(&mut self, field: &mut ItemField, now: u32) -> Vec<&'static str> {
+        field.touch(&mut self.pm.ps, self.pm.mv.origin, now)
     }
 
     /// `cl.viewangles[YAW]`: degrees, growing to the left.
@@ -130,6 +166,9 @@ impl Prediction {
             forward_move: (input.forward as i32 - input.back as i32) * MOVE_SCALE,
             right_move: (input.right as i32 - input.left as i32) * MOVE_SCALE,
             up_move: if input.jump { MOVE_SCALE } else { 0 },
+            // Keep the weapon in hand: a command with no weapon would make
+            // `PM_Weapon` put it away every frame.
+            weapon: self.pm.ps.weapon,
             ..UserCmd::default()
         };
         pmove(&mut self.pm);
@@ -316,6 +355,14 @@ mod tests {
             .map(|_| pick_spawn(&spawn_points(spot)).unwrap().1)
             .collect();
         assert!(yaws.iter().all(|yaw| (0.0..360.0).contains(yaw)), "{yaws:?}");
+    }
+
+    #[test]
+    fn a_loaded_player_holds_the_machinegun_with_a_clip() {
+        let prediction = prediction_on_a_test_map();
+        assert_eq!(prediction.health(), 100);
+        assert_eq!(prediction.armor(), 0);
+        assert_eq!(prediction.ammo(), STARTING_AMMO);
     }
 
     #[test]

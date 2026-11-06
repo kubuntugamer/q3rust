@@ -26,6 +26,7 @@ pub mod items;
 pub mod mmap;
 pub mod model;
 pub mod pak;
+pub mod pickup;
 pub mod pmove;
 pub mod prediction;
 pub mod ref_types;

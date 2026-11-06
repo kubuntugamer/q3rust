@@ -157,12 +157,18 @@ pub fn tag_of(index: i32) -> i32 {
 /// `BG_FindItem`: the row a map's `classname` spawns. Index 0 is the empty row
 /// the C keeps clear, so the empty name finds nothing.
 pub fn find(class_name: &str) -> Option<&'static Item> {
+    index_of(class_name).and_then(|index| BG_ITEMLIST.get(index))
+}
+
+/// The table position a spawn name names. That index is what the wire format
+/// calls the item's `modelindex`, and what a holdable stat stores.
+pub fn index_of(class_name: &str) -> Option<usize> {
     if class_name.is_empty() {
         return None;
     }
     BG_ITEMLIST
         .iter()
-        .find(|item| item.class_name == class_name)
+        .position(|item| item.class_name == class_name)
 }
 
 #[cfg(test)]

@@ -233,10 +233,9 @@ pub struct World {
     /// Triangle-list vertexes; every batch indexes a range of this.
     pub vertices: Vec<Vertex3D>,
     pub batches: Vec<Batch>,
-    /// The pickups the map places, at the origins it gave them.
+    /// The pickups the map places, at the origins it gave them. The client
+    /// keeps the live copy in an [`crate::items::ItemField`].
     pub items: Vec<ItemMark>,
-    /// A box per pickup, built once at load.
-    pub item_vertices: Vec<Vertex3D>,
     /// The map's skybox, when its sky shader names one.
     pub sky: Option<Sky>,
     textures: Vec<(String, Texture)>,
@@ -347,7 +346,6 @@ impl World {
             vertices: Vec::new(),
             batches: Vec::new(),
             items: Vec::new(),
-            item_vertices: Vec::new(),
             sky: None,
             textures: Vec::new(),
             faces: faces.len(),
@@ -417,7 +415,6 @@ impl World {
 
         // The pickups, read from the same entity lump `audit_bsp` counts.
         world.items = items::item_marks(bsp.entities());
-        world.item_vertices = items::box_vertices(&world.items);
 
         world.sky = sky_name
             .as_deref()

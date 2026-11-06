@@ -176,6 +176,9 @@ pub const STAT_HEALTH: usize = 0;
 pub const STAT_HOLDABLE_ITEM: usize = 1;
 /// `STAT_WEAPONS`.
 pub const STAT_WEAPONS: usize = 2;
+/// `STAT_ARMOR`. Baseq3 numbering, without the Missionpack row the C puts
+/// between this and `STAT_HOLDABLE_ITEM`.
+pub const STAT_ARMOR: usize = 3;
 /// `STAT_MAX_HEALTH`.
 pub const STAT_MAX_HEALTH: usize = 6;
 
