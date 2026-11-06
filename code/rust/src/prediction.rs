@@ -49,6 +49,8 @@ const RESPAWN_DELAY: u32 = 1_700;
 const ROCKET_SPEED: f32 = 900.0;
 /// `sv_gravity`: what pulls a lobbed grenade down.
 const GRAVITY: f32 = 800.0;
+/// How much of its speed a bouncing grenade keeps.
+const BOUNCE: f32 = 0.6;
 /// A plasma ball is quicker and shorter-lived than a rocket.
 const PLASMA_SPEED: f32 = 2_000.0;
 /// How long a projectile lives before it goes off in the air.
@@ -57,6 +59,17 @@ const PROJECTILE_LIFE_MS: i32 = 5_000;
 pub const ROCKET_RADIUS: f32 = 120.0;
 /// A plasma ball bursts in a smaller radius.
 pub const PLASMA_RADIUS: f32 = 60.0;
+
+/// Reflects a velocity off a surface and keeps `keep` of its speed, which is
+/// how a grenade skips along a wall or the floor.
+pub fn bounce_off(velocity: [f32; 3], normal: [f32; 3], keep: f32) -> [f32; 3] {
+    let into = velocity[0] * normal[0] + velocity[1] * normal[1] + velocity[2] * normal[2];
+    [
+        (velocity[0] - 2.0 * into * normal[0]) * keep,
+        (velocity[1] - 2.0 * into * normal[1]) * keep,
+        (velocity[2] - 2.0 * into * normal[2]) * keep,
+    ]
+}
 
 /// Something in flight. It travels a frame at a time rather than landing the
 /// instant the trigger is pulled; a rocket and a plasma ball differ in speed,
@@ -595,7 +608,19 @@ impl Prediction {
                 .pm
                 .world
                 .trace(shot.origin, to, [0.0; 3], [0.0; 3], MASK_PLAYERSOLID);
-            if trace.fraction < 1.0 || self.last_time - shot.born >= PROJECTILE_LIFE_MS {
+            let old = self.last_time - shot.born >= PROJECTILE_LIFE_MS;
+            if trace.fraction < 1.0 && shot.gravity && !old {
+                // A grenade skips off what it hits instead of bursting, losing
+                // energy each time; it bursts when its time runs out.
+                let normal = trace.plane.normal;
+                shot.velocity = bounce_off(shot.velocity, normal, BOUNCE);
+                shot.origin = [
+                    trace.endpos[0] + normal[0] * 0.5,
+                    trace.endpos[1] + normal[1] * 0.5,
+                    trace.endpos[2] + normal[2] * 0.5,
+                ];
+                in_flight.push(shot);
+            } else if trace.fraction < 1.0 || old {
                 self.blasts.push(Blast {
                     at: trace.endpos,
                     radius: shot.radius,
@@ -1042,6 +1067,17 @@ mod tests {
         assert!(reach <= GAUNTLET_RANGE + 0.001, "it reaches {reach}");
         assert!(prediction.fire(now + 100).is_empty(), "and swings slowly");
         assert_eq!(prediction.fire(now + 400).len(), 1);
+    }
+
+    #[test]
+    fn a_grenade_skips_off_a_floor() {
+        let out = bounce_off([10.0, 0.0, -400.0], [0.0, 0.0, 1.0], BOUNCE);
+        assert!((out[0] - 6.0).abs() < 1e-3, "it keeps some travel: {out:?}");
+        assert!(out[2] > 200.0, "and it comes back up: {out:?}");
+
+        // Against a wall it comes away instead of stopping.
+        let out = bounce_off([300.0, 0.0, 0.0], [-1.0, 0.0, 0.0], BOUNCE);
+        assert!(out[0] < 0.0, "it turns away: {out:?}");
     }
 
     #[test]
