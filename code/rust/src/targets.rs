@@ -203,6 +203,12 @@ impl TargetField {
     /// A rocket's blast: every standing post within `radius` of `at` loses
     /// `damage`, which is what makes a rocket worth aiming at the floor near
     /// a post. Returns how many posts went down.
+    /// How many posts are on the floor right now. The client diffs this around
+    /// a hit to keep a tally of how many it has put down.
+    pub fn downed(&self) -> usize {
+        self.targets.iter().filter(|target| !target.alive()).count()
+    }
+
     pub fn blast(&mut self, at: [f32; 3], radius: f32, damage: i32, now: u32) -> usize {
         let mut down = 0;
         for index in 0..self.targets.len() {
@@ -307,6 +313,16 @@ mod tests {
         let positions = positions(POSTS);
         assert_eq!(positions.len(), 2);
         assert_eq!(positions[0], [256.0, 0.0, 24.0]);
+    }
+
+    #[test]
+    fn a_post_on_the_floor_is_counted_as_down_and_stops_being_counted_when_it_gets_up() {
+        let mut field = TargetField::new(&positions(POSTS));
+        assert_eq!(field.downed(), 0);
+        field.knock_down(0, [256.0, 0.0, 24.0], 100);
+        assert_eq!(field.downed(), 1);
+        field.recover(100 + TARGET_RECOVERY_MS);
+        assert_eq!(field.downed(), 0, "a recovered post is not down");
     }
 
     #[test]

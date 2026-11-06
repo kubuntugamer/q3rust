@@ -542,6 +542,8 @@ pub struct Client {
     hurt_until: u32,
     /// When the hit marker on the crosshair should have faded out.
     hit_until: u32,
+    /// How many practice posts have been put on the floor this session.
+    posts_down: u32,
     /// The pickup sounds, by the path the item table names.
     pickup_sounds: std::collections::HashMap<&'static str, Arc<Vec<f32>>>,
     /// Which of those the next shot uses, so repeated fire varies.
@@ -926,6 +928,7 @@ impl Client {
             kick_until: 0,
             hurt_until: 0,
             hit_until: 0,
+            posts_down: 0,
             pickup_sounds,
             next_sound: 0,
             input: Input::default(),
@@ -1512,7 +1515,10 @@ impl Client {
         let weapon = bg_misc::class_of_weapon(prediction.weapon())
             .map(|name| name.trim_start_matches("weapon_"))
             .unwrap_or("none");
-        let mut status = format!("HEALTH {health}   ARMOR {armor}   {weapon} {ammo}");
+        let mut status = format!(
+            "HEALTH {health}   ARMOR {armor}   {weapon} {ammo}   DOWN {}",
+            self.posts_down
+        );
         // A charged weapon shows how far the held charge has got, since
         // nothing else on screen says when it is ready to let go.
         let now = self.millis();
@@ -1775,7 +1781,9 @@ impl Client {
                     audio.play_at(sound, at);
                 }
                 if let Some(field) = self.targets.as_mut() {
+                    let before = field.downed();
                     field.blast(at, blast.radius, blast.damage, now);
+                    self.posts_down += (field.downed() - before) as u32;
                 }
                 // A rocket fired into the floor hurts the one who fired it, less
                 // the further away the blast is.
@@ -1947,11 +1955,14 @@ impl Client {
                                 until: now + 150,
                             });
                             if destroyed {
+                                self.posts_down += 1;
                                 console::print("target down");
                             }
                         }
                         if shot.splash > 0.0 {
+                            let before = field.downed();
                             let down = field.blast(shot.to, shot.splash, 100, now);
+                            self.posts_down += (field.downed() - before) as u32;
                             if down > 0 {
                                 console::print("target down");
                             }
