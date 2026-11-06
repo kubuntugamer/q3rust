@@ -1662,6 +1662,16 @@ impl Client {
             }
             bolt.until > now
         });
+        // A fading trail behind each bolt, so an incoming shot can be tracked
+        // and stepped out of.
+        for at in self.bolts.iter().map(|bolt| bolt.at) {
+            self.sparks.push(Spark {
+                at,
+                half: 1.8,
+                color: [170, 100, 225, 255],
+                until: now + 80,
+            });
+        }
         for at in strikes {
             self.sparks.push(Spark {
                 at,
