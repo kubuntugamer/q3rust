@@ -411,6 +411,8 @@ pub struct Client {
     sparks: Vec<Spark>,
     /// The practice posts built from the map's own markers.
     targets: Option<TargetField>,
+    /// Where the rockets in the air are, copied from the move each frame.
+    rockets: Vec<[f32; 3]>,
     /// The machinegun's shot sounds, decoded once and shared per shot.
     sounds: Vec<Arc<Vec<f32>>>,
     /// The shotgun's break, the rocket's launch, and what it leaves behind.
@@ -747,6 +749,7 @@ impl Client {
             world,
             items,
             targets,
+            rockets: Vec::new(),
             sparks: Vec::new(),
             sounds,
             shotgun_sound,
@@ -1060,6 +1063,27 @@ impl Client {
             }
         }
 
+        // The rockets in the air, small bright boxes on their way.
+        if !self.rockets.is_empty() {
+            let mut flying = Vec::new();
+            for at in &self.rockets {
+                flying.extend(items::cuboid(
+                    *at,
+                    [-4.0; 3],
+                    [4.0; 3],
+                    [255, 240, 200, 255],
+                ));
+            }
+            self.renderer.vk.draw_stage(
+                &self.renderer.white,
+                &flying,
+                &mvp,
+                [1.0, 1.0, 0.0, 0.0],
+                BlendMode::Opaque,
+                true,
+            )?;
+        }
+
         // The pickups still on the map, as the models the paks hold. Each one
         // reuses its kind's triangles, moved to the origin the map gave it.
         // If a map's models all failed to load, the coloured marker boxes
@@ -1239,6 +1263,29 @@ impl Client {
             if prediction.weapon() != before {
                 if let Some(name) = bg_misc::class_of_weapon(prediction.weapon()) {
                     console::print(&format!("weapon: {name}"));
+                }
+            }
+            // A rocket in flight is drawn like a shot's spark, and the ones that
+            // arrive this frame are felt, heard and applied to the posts.
+            self.rockets = prediction
+                .rockets()
+                .iter()
+                .map(|rocket| rocket.origin)
+                .collect();
+            for at in prediction.take_blasts() {
+                self.sparks.push(Spark {
+                    at,
+                    half: 12.0,
+                    color: [255, 190, 120, 255],
+                    until: now + 200,
+                });
+                if let (Some(sound), Some(audio)) =
+                    (self.explosion_sound.clone(), self.audio.as_ref())
+                {
+                    audio.play_at(sound, at);
+                }
+                if let Some(field) = self.targets.as_mut() {
+                    field.blast(at, crate::prediction::ROCKET_RADIUS, 100);
                 }
             }
         }

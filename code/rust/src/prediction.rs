@@ -42,6 +42,21 @@ const FALL_DAMAGE_FAR: i32 = 10;
 const FALL_DAMAGE_MEDIUM: i32 = 5;
 /// `player_die`'s `respawnTime`: how long a body lies before it comes back.
 const RESPAWN_DELAY: u32 = 1_700;
+/// A rocket's speed, from `g_weapon.c`: 900 units a second.
+const ROCKET_SPEED: f32 = 900.0;
+/// How long a rocket lives before it goes off in the air.
+const ROCKET_LIFE_MS: i32 = 5_000;
+/// How wide a rocket's blast reaches.
+pub const ROCKET_RADIUS: f32 = 120.0;
+
+/// A rocket in flight. It travels a frame at a time rather than landing the
+/// instant the trigger is pulled.
+#[derive(Clone, Copy, Debug)]
+pub struct Rocket {
+    pub origin: [f32; 3],
+    velocity: [f32; 3],
+    born: i32,
+}
 
 /// One round leaving the weapon: where it started, where it stopped, and
 /// whether it stopped on something.
@@ -139,6 +154,9 @@ pub struct Prediction {
     spawns: Vec<SpawnPoint>,
     /// When the body comes back, or 0 while the player is alive.
     respawn_at: u32,
+    /// Rockets in the air, and where the ones that went off did so.
+    rockets: Vec<Rocket>,
+    blasts: Vec<[f32; 3]>,
 }
 
 impl Prediction {
@@ -175,6 +193,8 @@ impl Prediction {
             last_shot: -1000,
             spawns,
             respawn_at: 0,
+            rockets: Vec::new(),
+            blasts: Vec::new(),
         })
     }
 
@@ -265,6 +285,37 @@ impl Prediction {
             self.pm.mv.origin[1],
             self.pm.mv.origin[2] + DEFAULT_VIEW_HEIGHT,
         ];
+
+        // A rocket is not a hitscan: it leaves the muzzle and travels, and the
+        // blast comes from `advance_rockets` when it arrives.
+        if pattern.splash > 0.0 {
+            let (yaw, pitch) = (self.yaw.to_radians(), self.pitch.to_radians());
+            let forward = [
+                pitch.cos() * yaw.cos(),
+                pitch.cos() * yaw.sin(),
+                -pitch.sin(),
+            ];
+            let muzzle = [
+                from[0] + forward[0] * 16.0,
+                from[1] + forward[1] * 16.0,
+                from[2] + forward[2] * 16.0,
+            ];
+            self.rockets.push(Rocket {
+                origin: muzzle,
+                velocity: [
+                    forward[0] * ROCKET_SPEED,
+                    forward[1] * ROCKET_SPEED,
+                    forward[2] * ROCKET_SPEED,
+                ],
+                born: now,
+            });
+            return vec![Shot {
+                from,
+                to: muzzle,
+                hit: false,
+                splash: 0.0,
+            }];
+        }
 
         let mut shots = Vec::with_capacity(pattern.pellets);
         for pellet in 0..pattern.pellets {
@@ -383,10 +434,49 @@ impl Prediction {
         let events = std::mem::take(&mut self.pm.ps.events);
         self.apply_events(&events);
 
+        self.advance_rockets(elapsed);
+
         // `player_die`: health that has run out starts the respawn clock.
         if self.health() <= 0 && self.respawn_at == 0 {
             self.respawn_at = self.last_time.max(0) as u32 + RESPAWN_DELAY;
         }
+    }
+
+    /// Moves every rocket along its path. One that reaches a wall, or outlives
+    /// `ROCKET_LIFE_MS`, goes off where it stopped.
+    fn advance_rockets(&mut self, seconds: f32) {
+        let mut in_flight = Vec::with_capacity(self.rockets.len());
+        for rocket in std::mem::take(&mut self.rockets) {
+            let to = [
+                rocket.origin[0] + rocket.velocity[0] * seconds,
+                rocket.origin[1] + rocket.velocity[1] * seconds,
+                rocket.origin[2] + rocket.velocity[2] * seconds,
+            ];
+            let trace = self
+                .pm
+                .world
+                .trace(rocket.origin, to, [0.0; 3], [0.0; 3], MASK_PLAYERSOLID);
+            if trace.fraction < 1.0 || self.last_time - rocket.born >= ROCKET_LIFE_MS {
+                self.blasts.push(trace.endpos);
+            } else {
+                in_flight.push(Rocket {
+                    origin: trace.endpos,
+                    ..rocket
+                });
+            }
+        }
+        self.rockets = in_flight;
+    }
+
+    /// The rockets still in the air, for drawing.
+    pub fn rockets(&self) -> &[Rocket] {
+        &self.rockets
+    }
+
+    /// Takes the explosions that happened this frame, so the client plays them
+    /// once each.
+    pub fn take_blasts(&mut self) -> Vec<[f32; 3]> {
+        std::mem::take(&mut self.blasts)
     }
 
     /// `PutClientInServer`: a fresh body on one of the map's spots, with the
@@ -801,10 +891,23 @@ mod tests {
         }
         assert_eq!(prediction.weapon(), WP_ROCKET_LAUNCHER);
 
-        let shots = prediction.fire(1_000 + 40 * 50);
-        assert_eq!(shots.len(), 1);
-        assert!(shots[0].splash > 0.0, "a rocket explodes");
+        let now = 1_000 + 40 * 50;
+        let shots = prediction.fire(now);
+        assert_eq!(shots.len(), 1, "one round leaves the launcher");
         assert_eq!(prediction.ammo(), 4);
+        assert_eq!(prediction.rockets().len(), 1, "and it flies");
+        let start = prediction.rockets()[0].origin;
+
+        // It travels rather than landing at once.
+        prediction.step(now + 100, &Input::default());
+        let moved = prediction.rockets().first().map(|rocket| rocket.origin);
+        assert!(moved.is_some_and(|at| at != start), "the rocket moves");
+
+        // Given enough time it goes off, wherever it stopped.
+        prediction.step(now + 6_000, &Input::default());
+        assert!(prediction.rockets().is_empty());
+        assert_eq!(prediction.take_blasts().len(), 1, "one blast, once");
+        assert!(prediction.take_blasts().is_empty(), "and it is only reported once");
     }
 
     #[test]
