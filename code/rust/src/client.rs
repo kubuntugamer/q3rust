@@ -401,6 +401,9 @@ struct Bolt {
     until: u32,
 }
 
+/// How long the red wash of a fresh hit lasts, in milliseconds.
+const HURT_FLASH_MS: u32 = 250;
+
 /// How close a post has to be to shoot, how often it fires, how fast its bolt
 /// flies, and what it takes off you when it lands.
 const BOLT_RANGE: f32 = 900.0;
@@ -490,6 +493,8 @@ pub struct Client {
     death_sound: Option<Arc<Vec<f32>>>,
     /// When the weapon in hand stops kicking after the last shot.
     kick_until: u32,
+    /// When the red wash of a fresh hit should have faded out.
+    hurt_until: u32,
     /// The pickup sounds, by the path the item table names.
     pickup_sounds: std::collections::HashMap<&'static str, Arc<Vec<f32>>>,
     /// Which of those the next shot uses, so repeated fire varies.
@@ -857,6 +862,7 @@ impl Client {
             pain_sound,
             death_sound,
             kick_until: 0,
+            hurt_until: 0,
             pickup_sounds,
             next_sound: 0,
             input: Input::default(),
@@ -1430,37 +1436,71 @@ impl Client {
         let Some(prediction) = self.prediction.as_ref() else {
             return Ok(());
         };
-        let (_, height) = self.renderer.size();
+        let (width, height) = self.renderer.size();
         let scale = self.renderer.face().default_scale(height) * 0.75;
         let line_height = self.renderer.face().line_height(scale);
 
         // The player's own numbers first: health, armour, and which weapon and
         // clip are in hand. There is no first-person model yet, so the name is
         // how the readout says what is being held.
+        let health = prediction.health();
+        let armor = prediction.armor();
+        let ammo = prediction.ammo();
         let weapon = bg_misc::class_of_weapon(prediction.weapon())
             .map(|name| name.trim_start_matches("weapon_"))
             .unwrap_or("none");
-        let mut status = format!(
-            "HEALTH {}   ARMOR {}   {weapon} {}",
-            prediction.health(),
-            prediction.armor(),
-            prediction.ammo()
-        );
+        let mut status = format!("HEALTH {health}   ARMOR {armor}   {weapon} {ammo}");
         // A charged weapon shows how far the held charge has got, since
         // nothing else on screen says when it is ready to let go.
-        let charging = prediction.charge(self.millis());
+        let now = self.millis();
+        let charging = prediction.charge(now);
         if charging > 0.0 {
             status.push_str(&format!("   CHARGING {}%", (charging * 100.0) as u32));
         }
-        self.renderer
-            .text(&status, 8.0, 8.0, scale, [235, 235, 235, 255])?;
-
         let [x, y, z] = prediction.origin();
         let line = format!(
             "{x:.0} {y:.0} {z:.0}   {:.0} u/s   {}",
             prediction.speed(),
             if prediction.on_ground() { "ground" } else { "air" }
         );
+
+        // A fresh hit washes the frame red and fades out over a quarter second.
+        if now < self.hurt_until {
+            let left = (self.hurt_until - now) as f32 / HURT_FLASH_MS as f32;
+            self.renderer.fill(
+                0.0,
+                0.0,
+                width as f32,
+                height as f32,
+                [190, 25, 25, (110.0 * left) as u8],
+            )?;
+        }
+
+        // A health bar along the bottom left, so health reads at a glance and
+        // not only by the number.
+        let bar_width = 220.0;
+        let bar_height = 14.0;
+        let left = 8.0;
+        let top = height as f32 - 8.0 - bar_height;
+        self.renderer.fill(
+            left - 2.0,
+            top - 2.0,
+            bar_width + 4.0,
+            bar_height + 4.0,
+            [0, 0, 0, 150],
+        )?;
+        let colour = if health > 50 {
+            [90, 200, 90, 255]
+        } else if health > 25 {
+            [225, 190, 60, 255]
+        } else {
+            [215, 60, 60, 255]
+        };
+        let filled = bar_width * (health.clamp(0, 100) as f32 / 100.0);
+        self.renderer.fill(left, top, filled, bar_height, colour)?;
+
+        self.renderer
+            .text(&status, 8.0, 8.0, scale, [235, 235, 235, 255])?;
         self.renderer.text(
             &line,
             8.0,
@@ -1570,7 +1610,13 @@ impl Client {
         let now = self.millis();
         if let Some(prediction) = self.prediction.as_mut() {
             let before = prediction.weapon();
+            let health_before = prediction.health();
             prediction.step(now, &self.input);
+            // Any loss of health, from a bolt, a fall or your own rocket, shows
+            // as a red wash for a moment.
+            if prediction.health() < health_before {
+                self.hurt_until = now + HURT_FLASH_MS;
+            }
             // Say so when a change finishes, so the keys are not silent.
             if prediction.weapon() != before {
                 if let Some(name) = bg_misc::class_of_weapon(prediction.weapon()) {
