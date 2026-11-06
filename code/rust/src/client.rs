@@ -456,6 +456,18 @@ const RECOVERY_GRACE_MS: u32 = 700;
 /// coming back never means being hit before you can move.
 const SPAWN_GRACE_MS: u32 = 1_000;
 
+/// How strongly the shield a respawn buys shows, from 0 to 1: a slow beat that
+/// fades out as the grace runs down, so it is hard to miss in the corner of the
+/// eye but never looks like damage.
+fn shield_glow(left_ms: u32, now: u32) -> f32 {
+    if left_ms == 0 {
+        return 0.0;
+    }
+    let left = left_ms.min(SPAWN_GRACE_MS) as f32 / SPAWN_GRACE_MS as f32;
+    let beat = (now as f32 / SPAWN_GRACE_MS as f32 * std::f32::consts::TAU * 3.0).sin();
+    ((0.5 + 0.3 * beat) * left).clamp(0.0, 1.0)
+}
+
 /// The shield note in the status line with `left_ms` of grace to run, or none
 /// once it has run out.
 fn shield_note(left_ms: u32) -> Option<String> {
@@ -1891,6 +1903,23 @@ impl Client {
             self.renderer.triangle(arrow, color)?;
         }
 
+        // The shield a respawn buys pulses at the edges of the frame while it
+        // lasts, so coming back is something seen rather than guessed at.
+        let grace_left = self.spawn_grace_until.saturating_sub(now);
+        if grace_left > 0 {
+            let alpha = (shield_glow(grace_left, now) * 255.0) as u8;
+            let edge = 6.0;
+            for (x, y, w, h) in [
+                (0.0, 0.0, width as f32, edge),
+                (0.0, height as f32 - edge, width as f32, edge),
+                (0.0, edge, edge, height as f32 - edge * 2.0),
+                (width as f32 - edge, edge, edge, height as f32 - edge * 2.0),
+            ] {
+                self.renderer
+                    .fill(x, y, w, h, [120, 220, 255, alpha])?;
+            }
+        }
+
         // A fresh hit washes the frame red and fades out over a quarter second.
         if now < self.hurt_until {
             let left = (self.hurt_until - now) as f32 / HURT_FLASH_MS as f32;
@@ -2706,6 +2735,28 @@ mod bolt_arc_tests {
             dodge_bar_width(DODGE_FLASH_MS * 2, 1.0),
             DODGE_FLASH_WIDTH,
             "a stale clock never makes it wider than it starts"
+        );
+    }
+
+    #[test]
+    fn the_shield_pulses_and_fades_as_it_runs_out() {
+        assert_eq!(shield_glow(0, 500), 0.0, "nothing to show once it is over");
+        let full = shield_glow(SPAWN_GRACE_MS, 500);
+        assert!(full > 0.2, "it is visible at the start: {full}");
+        assert!(full <= 1.0);
+        assert!(
+            shield_glow(SPAWN_GRACE_MS / 4, 500) < full,
+            "it fades as the grace runs down"
+        );
+        // It beats rather than holding steady: a quarter of one of its three
+        // beats per second later it is at its brightest.
+        let a = shield_glow(SPAWN_GRACE_MS, 0);
+        let b = shield_glow(SPAWN_GRACE_MS, SPAWN_GRACE_MS / 12);
+        assert!(b > a + 0.2, "{a} {b}");
+        assert_eq!(
+            shield_glow(SPAWN_GRACE_MS * 5, 0),
+            shield_glow(SPAWN_GRACE_MS, 0),
+            "a stale clock never glows past full"
         );
     }
 
