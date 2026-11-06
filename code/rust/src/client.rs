@@ -269,6 +269,18 @@ impl Renderer {
         self.vk.draw_quads(&self.white, &quad)
     }
 
+    /// Draws one flat triangle in screen pixels, for the shapes a rectangle
+    /// cannot make.
+    fn triangle(&mut self, points: [[f32; 2]; 3], color: [u8; 4]) -> Result<(), String> {
+        let vertex = |point: [f32; 2]| Vertex2D {
+            pos: point,
+            uv: [0.5, 0.5],
+            color,
+        };
+        let tri = points.map(vertex);
+        self.vk.draw_quads(&self.white, &tri)
+    }
+
     /// Draws one line of text, as a single batch.
     fn text(
         &mut self,
@@ -469,6 +481,52 @@ fn bolt_lead(eye: [f32; 3], velocity: [f32; 3], flight: f32) -> [f32; 3] {
         eye[0] + velocity[0] * flight * BOLT_LEAD,
         eye[1] + velocity[1] * flight * BOLT_LEAD,
         eye[2] + velocity[2] * flight * BOLT_LEAD,
+    ]
+}
+
+/// Where a post lies relative to where you face, in degrees: zero dead ahead,
+/// positive to your left (yaw grows left, the same way the camera turns), and
+/// past ±90 when it is behind you.
+fn bearing(eye: [f32; 3], yaw: f32, at: [f32; 3]) -> f32 {
+    let (dx, dy) = (at[0] - eye[0], at[1] - eye[1]);
+    if dx == 0.0 && dy == 0.0 {
+        return 0.0;
+    }
+    let facing = dy.atan2(dx).to_degrees();
+    (facing - yaw + 180.0).rem_euclid(360.0) - 180.0
+}
+
+/// A point `radius` pixels from `centre` in the direction of a post `bearing`
+/// degrees off your view: straight up for a post dead ahead, round to the left
+/// for one on your left. A post behind you sits at the side of the ring rather
+/// than wrapping round the bottom, so it still says which way to turn.
+fn ring_point(centre: [f32; 2], bearing: f32, radius: f32) -> [f32; 2] {
+    let (sin, cos) = bearing.clamp(-90.0, 90.0).to_radians().sin_cos();
+    [centre[0] - sin * radius, centre[1] - cos * radius]
+}
+
+/// The three corners of the arrow that points out from the crosshair at the
+/// post lining a shot up.
+fn threat_arrow(centre: [f32; 2], bearing: f32, radius: f32) -> [[f32; 2]; 3] {
+    let (sin, cos) = bearing.clamp(-90.0, 90.0).to_radians().sin_cos();
+    // Outward along the bearing, and across it so the head has a base.
+    let out = [-sin, -cos];
+    let across = [cos, -sin];
+    let base = ring_point(centre, bearing, radius);
+    let half = 5.0;
+    [
+        [
+            centre[0] + out[0] * (radius + 8.0),
+            centre[1] + out[1] * (radius + 8.0),
+        ],
+        [
+            base[0] + across[0] * half,
+            base[1] + across[1] * half,
+        ],
+        [
+            base[0] - across[0] * half,
+            base[1] - across[1] * half,
+        ],
     ]
 }
 
@@ -1651,6 +1709,17 @@ impl Client {
             }
         }
 
+        // A post lining a shot up shows on a ring around the crosshair, on the
+        // side the post is on and brighter as the shot gets closer, so a shot
+        // from off screen can be found and turned into before it fires.
+        if let Some(wind) = self.wind_up.as_ref().filter(|_| !prediction.dead()) {
+            let progress = wind.progress(now);
+            let heading = bearing(prediction.origin(), prediction.yaw(), wind.from);
+            let arrow = threat_arrow([mid_x, mid_y], heading, 34.0);
+            let color = [255, (210.0 - 90.0 * progress) as u8, 70, 230];
+            self.renderer.triangle(arrow, color)?;
+        }
+
         // A fresh hit washes the frame red and fades out over a quarter second.
         if now < self.hurt_until {
             let left = (self.hurt_until - now) as f32 / HURT_FLASH_MS as f32;
@@ -2343,6 +2412,49 @@ mod bolt_arc_tests {
         );
         // Even point blank there is a glow, just a brief one.
         assert!(BOLT_TELEGRAPH_NEAR >= 150);
+    }
+
+    #[test]
+    fn a_post_is_found_by_which_side_it_is_on() {
+        let eye = [0.0, 0.0, 24.0];
+        // Yaw 0 faces +X, and yaw grows to the left, so +Y is your left.
+        assert!((bearing(eye, 0.0, [100.0, 0.0, 24.0])).abs() < 0.01);
+        assert!((bearing(eye, 0.0, [0.0, 100.0, 24.0]) - 90.0).abs() < 0.01);
+        assert!((bearing(eye, 0.0, [0.0, -100.0, 24.0]) + 90.0).abs() < 0.01);
+        let behind = bearing(eye, 0.0, [-100.0, 0.0, 24.0]).abs();
+        assert!((behind - 180.0).abs() < 0.01, "behind reads as {behind}");
+        // Turning with the post keeps it dead ahead.
+        assert!(bearing(eye, 90.0, [0.0, 100.0, 24.0]).abs() < 0.01);
+        // And it wraps rather than jumping at north.
+        assert!(bearing(eye, 350.0, [100.0, 20.0, 24.0]) > 0.0);
+    }
+
+    #[test]
+    fn the_threat_arrow_points_at_the_post() {
+        let centre = [400.0, 300.0];
+        let ahead = threat_arrow(centre, 0.0, 34.0);
+        assert!(ahead[0][1] < centre[1] - 40.0, "straight ahead points up");
+        assert!((ahead[0][0] - centre[0]).abs() < 0.01, "and stays centred");
+        // Base of the head nearer the crosshair than the tip.
+        assert!(ahead[1][1] > ahead[0][1] && ahead[2][1] > ahead[0][1]);
+
+        let left = threat_arrow(centre, 90.0, 34.0);
+        assert!(left[0][0] < centre[0] - 40.0, "your left points left");
+        let right = threat_arrow(centre, -90.0, 34.0);
+        assert!(right[0][0] > centre[0] + 40.0, "your right points right");
+
+        // A post behind you stops at the side of the ring rather than wrapping
+        // under the crosshair, where it would point at your own feet.
+        let behind = threat_arrow(centre, 180.0, 34.0);
+        assert!(behind[0][0] < centre[0], "{behind:?}");
+        assert!((behind[0][1] - centre[1]).abs() < 0.01, "{behind:?}");
+        // Everything stays close to the ring, clear of the crosshair itself.
+        for corner in behind.iter().chain(left.iter()).chain(ahead.iter()) {
+            let dx = corner[0] - centre[0];
+            let dy = corner[1] - centre[1];
+            let distance = (dx * dx + dy * dy).sqrt();
+            assert!(distance > 28.0 && distance < 46.0, "{corner:?} at {distance}");
+        }
     }
 
     #[test]
