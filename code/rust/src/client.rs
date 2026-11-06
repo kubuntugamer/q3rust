@@ -402,20 +402,24 @@ struct Bolt {
 }
 
 /// A post that is lining up a shot: which post it is, where the bolt will leave
-/// from, and when it goes. While it waits the post glows, so the shot can be
-/// seen coming.
+/// from, and when it started and when it goes. While it waits the post glows,
+/// so the shot can be seen coming.
 struct WindUp {
     index: usize,
     from: [f32; 3],
+    started_at: u32,
     fires_at: u32,
 }
 
 impl WindUp {
     /// How far through the wind-up it is, from nothing at the start to one at
-    /// the moment the bolt leaves.
+    /// the moment the bolt leaves. It runs off the time this particular post
+    /// took to line up, so a close post's glow fills just as quickly as it
+    /// fires, however short its warning was.
     fn progress(&self, now: u32) -> f32 {
-        let left = self.fires_at.saturating_sub(now) as f32;
-        (1.0 - left / BOLT_TELEGRAPH as f32).clamp(0.0, 1.0)
+        let span = self.fires_at.saturating_sub(self.started_at).max(1) as f32;
+        let gone = now.saturating_sub(self.started_at) as f32;
+        (gone / span).clamp(0.0, 1.0)
     }
 }
 
@@ -435,8 +439,23 @@ const BOLT_GRAVITY: f32 = 320.0;
 const RECOVERY_GRACE_MS: u32 = 700;
 
 /// How long a post spends lining up before its bolt leaves, so a shot can be
-/// seen coming and stepped out of rather than appearing with no warning.
+/// seen coming and stepped out of rather than appearing with no warning. This
+/// is the warning you get from the far edge of its range.
 const BOLT_TELEGRAPH: u32 = 450;
+
+/// How long a post takes when you are right on top of it. Standing close enough
+/// to smell the gun means almost no warning, so closing in has to be a decision
+/// rather than a free way to bully a post that cannot aim fast enough.
+const BOLT_TELEGRAPH_NEAR: u32 = 220;
+
+/// How long a post `distance` away takes to line a shot up: the full warning at
+/// the edge of its range, cut down steadily as you close, so the closer you
+/// stay in its sight the less time you get to step out of it.
+fn telegraph_for(distance: f32) -> u32 {
+    let closed = (distance / BOLT_RANGE).clamp(0.0, 1.0);
+    let span = (BOLT_TELEGRAPH - BOLT_TELEGRAPH_NEAR) as f32;
+    BOLT_TELEGRAPH_NEAR + (span * closed) as u32
+}
 
 /// How much of your movement a post allows for when it fires. A post that
 /// aimed exactly where you are would never touch a moving target; one that
@@ -1832,14 +1851,15 @@ impl Client {
                         a.2.partial_cmp(&b.2)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     });
-                if let Some((index, from, _)) = nearest {
+                if let Some((index, from, distance)) = nearest {
                     // The wait for the next shot starts now, so a post whose
                     // shot is cancelled still keeps its rhythm.
                     self.next_bolt = now + BOLT_INTERVAL;
                     self.wind_up = Some(WindUp {
                         index,
                         from,
-                        fires_at: now + BOLT_TELEGRAPH,
+                        started_at: now,
+                        fires_at: now + telegraph_for(distance),
                     });
                 }
             }
@@ -2288,6 +2308,7 @@ mod bolt_arc_tests {
         let wind = WindUp {
             index: 0,
             from: [0.0, 0.0, 24.0],
+            started_at: 0,
             fires_at: 450,
         };
         assert_eq!(wind.progress(0), 0.0, "dark the moment it starts lining up");
@@ -2296,6 +2317,45 @@ mod bolt_arc_tests {
         assert_eq!(wind.progress(900), 1.0, "and no further");
         // Long enough to see and step out of, short enough to stay a threat.
         assert!(BOLT_TELEGRAPH >= 350 && BOLT_TELEGRAPH < BOLT_INTERVAL);
+    }
+
+    #[test]
+    fn a_post_with_you_close_lines_up_faster() {
+        assert_eq!(
+            telegraph_for(0.0),
+            BOLT_TELEGRAPH_NEAR,
+            "point blank gives the shortest warning"
+        );
+        assert_eq!(
+            telegraph_for(BOLT_RANGE * 3.0),
+            BOLT_TELEGRAPH,
+            "and nothing beyond the far edge gets any longer"
+        );
+        let mut last = telegraph_for(0.0);
+        for step in 1..=20 {
+            let far = telegraph_for(BOLT_RANGE * step as f32 / 20.0);
+            assert!(far >= last, "the further off you are, the more warning");
+            last = far;
+        }
+        assert!(
+            BOLT_TELEGRAPH_NEAR * 2 < BOLT_TELEGRAPH,
+            "close has to be noticeably faster than far to be worth the risk"
+        );
+        // Even point blank there is a glow, just a brief one.
+        assert!(BOLT_TELEGRAPH_NEAR >= 150);
+    }
+
+    #[test]
+    fn a_short_wind_up_still_fills_its_glow() {
+        let wind = WindUp {
+            index: 0,
+            from: [0.0, 0.0, 24.0],
+            started_at: 1_000,
+            fires_at: 1_000 + BOLT_TELEGRAPH_NEAR,
+        };
+        assert_eq!(wind.progress(1_000), 0.0);
+        assert!((wind.progress(1_000 + BOLT_TELEGRAPH_NEAR / 2) - 0.5).abs() < 0.02);
+        assert_eq!(wind.progress(1_000 + BOLT_TELEGRAPH_NEAR), 1.0);
     }
 
     #[test]
