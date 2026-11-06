@@ -989,6 +989,47 @@ impl Client {
         Ok(true)
     }
 
+    /// Fits a held weapon's mesh into a box low on the right of the screen.
+    ///
+    /// The longest axis of the model runs across the screen and the next
+    /// longest up it, so a mesh of any units and any orientation fills the same
+    /// box. Depth is flat and at the near end, so the weapon draws over the
+    /// map. The box is this client's own choice: the cgame that holds the real
+    /// view-model offsets is not in this tree.
+    fn view_model_matrix(model: &world::ViewModel) -> [f32; 16] {
+        let size = [
+            model.maxs[0] - model.mins[0],
+            model.maxs[1] - model.mins[1],
+            model.maxs[2] - model.mins[2],
+        ];
+        let centre = [
+            (model.mins[0] + model.maxs[0]) * 0.5,
+            (model.mins[1] + model.maxs[1]) * 0.5,
+            (model.mins[2] + model.maxs[2]) * 0.5,
+        ];
+
+        let mut axes = [0usize, 1, 2];
+        axes.sort_by(|a, b| {
+            size[*b]
+                .partial_cmp(&size[*a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let (across, up) = (axes[0], axes[1]);
+        let across_scale = 0.70 / size[across].max(0.01);
+        let up_scale = 0.70 / size[up].max(0.01);
+
+        // Column-major, mapping model axes to screen x (0.05..0.75) and y
+        // (-0.95..-0.25).
+        let mut fitted = [0.0f32; 16];
+        fitted[across * 4] = across_scale;
+        fitted[up * 4 + 1] = up_scale;
+        fitted[12] = 0.40 - across_scale * centre[across];
+        fitted[13] = -0.60 - up_scale * centre[up];
+        fitted[14] = 0.0;
+        fitted[15] = 1.0;
+        fitted
+    }
+
     /// Draws the map under the console, through the depth-tested world
     /// pipeline. The camera sits at the predicted origin at eye height.
     fn draw_world(&mut self) -> Result<(), String> {
@@ -1161,6 +1202,27 @@ impl Client {
                         )?;
                     }
                 }
+            }
+        }
+
+        // The weapon in hand. There are no view models in this installation, so
+        // the third-person mesh is fitted to a box low on the right instead.
+        if let Some(model) = world
+            .view_models
+            .iter()
+            .find(|model| model.weapon == prediction.weapon())
+        {
+            let fitted = Self::view_model_matrix(model);
+            for surface in &model.surfaces {
+                let (_, texture) = &world.textures()[surface.texture];
+                self.renderer.vk.draw_stage(
+                    texture,
+                    &surface.vertices,
+                    &fitted,
+                    [1.0, 1.0, 0.0, 0.0],
+                    BlendMode::Opaque,
+                    surface.lit,
+                )?;
             }
         }
         Ok(())
@@ -1503,5 +1565,41 @@ impl Client {
         }
         renderer.shutdown();
         QUIT_REQUESTED.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Where a model-space point lands on the screen through a fitted matrix.
+    fn on_screen(m: &[f32; 16], p: [f32; 3]) -> [f32; 3] {
+        [
+            m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12],
+            m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13],
+            m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14],
+        ]
+    }
+
+    #[test]
+    fn a_held_weapon_fits_the_screen_box() {
+        // A mesh long on x, as the weapon models are: the long axis runs across
+        // the screen and the next longest up it.
+        let model = world::ViewModel {
+            weapon: 2,
+            surfaces: Vec::new(),
+            mins: [-40.0, -10.0, -5.0],
+            maxs: [40.0, 10.0, 5.0],
+        };
+        let fitted = Client::view_model_matrix(&model);
+        let near_left = on_screen(&fitted, [-40.0, -10.0, 0.0]);
+        let far_right = on_screen(&fitted, [40.0, 10.0, 0.0]);
+        assert!((near_left[0] - 0.05).abs() < 1e-3, "{near_left:?}");
+        assert!((far_right[0] - 0.75).abs() < 1e-3, "{far_right:?}");
+        assert!((near_left[1] + 0.95).abs() < 1e-3, "{near_left:?}");
+        assert!((far_right[1] + 0.25).abs() < 1e-3, "{far_right:?}");
+        // Flat, and at the near end, so the map never hides it.
+        assert_eq!(near_left[2], 0.0);
+        assert_eq!(far_right[2], 0.0);
     }
 }

@@ -248,6 +248,16 @@ pub struct ItemModel {
     pub surfaces: Vec<ItemSurface>,
 }
 
+/// A weapon held in view, with its own bounds so the client can fit it to the
+/// screen without knowing each mesh's units.
+pub struct ViewModel {
+    /// The weapon number this mesh belongs to.
+    pub weapon: i32,
+    pub surfaces: Vec<ItemSurface>,
+    pub mins: [f32; 3],
+    pub maxs: [f32; 3],
+}
+
 /// The map's static geometry, uploaded once.
 pub struct World {
     /// Triangle-list vertexes; every batch indexes a range of this.
@@ -261,6 +271,9 @@ pub struct World {
     /// The grenade mesh a thrown grenade draws with, when the paks hold one.
     /// The other projectiles have no mesh of their own.
     pub grenade: Option<Vec<ItemSurface>>,
+    /// The weapon meshes a held weapon can draw with. These are the third-person
+    /// meshes: the paks here hold no `v_*.md3` view models.
+    pub view_models: Vec<ViewModel>,
     /// The map's skybox, when its sky shader names one.
     pub sky: Option<Sky>,
     textures: Vec<(String, Texture)>,
@@ -373,6 +386,7 @@ impl World {
             items: Vec::new(),
             item_models: Vec::new(),
             grenade: None,
+            view_models: Vec::new(),
             sky: None,
             textures: Vec::new(),
             faces: faces.len(),
@@ -454,6 +468,8 @@ impl World {
             &mut world.textures,
         );
         world.grenade = grenade;
+        let view_models = load_view_models(vk, assets, &mut world.textures);
+        world.view_models = view_models;
 
         world.sky = sky_name
             .as_deref()
@@ -520,6 +536,63 @@ fn load_item_models(
         });
     }
     Ok(models)
+}
+
+/// The weapon meshes to load for the held-weapon view: the third-person models,
+/// one per weapon, since this installation has no `v_*.md3` set.
+const WEAPON_MODELS: [(i32, &str); 9] = [
+    (crate::bg_pmove::WP_GAUNTLET, "models/weapons2/gauntlet/gauntlet.md3"),
+    (
+        crate::bg_pmove::WP_MACHINEGUN,
+        "models/weapons2/machinegun/machinegun.md3",
+    ),
+    (crate::bg_pmove::WP_SHOTGUN, "models/weapons2/shotgun/shotgun.md3"),
+    (
+        crate::bg_pmove::WP_GRENADE_LAUNCHER,
+        "models/weapons2/grenadel/grenadel.md3",
+    ),
+    (
+        crate::bg_pmove::WP_ROCKET_LAUNCHER,
+        "models/weapons2/rocketl/rocketl.md3",
+    ),
+    (
+        crate::bg_pmove::WP_LIGHTNING,
+        "models/weapons2/lightning/lightning.md3",
+    ),
+    (crate::bg_pmove::WP_RAILGUN, "models/weapons2/railgun/railgun.md3"),
+    (crate::bg_pmove::WP_PLASMAGUN, "models/weapons2/plasma/plasma.md3"),
+    (crate::bg_pmove::WP_BFG, "models/weapons2/bfg/bfg.md3"),
+];
+
+fn load_view_models(
+    vk: &mut Vulkan,
+    assets: &Assets,
+    textures: &mut Vec<(String, Texture)>,
+) -> Vec<ViewModel> {
+    let mut models = Vec::new();
+    for (weapon, path) in WEAPON_MODELS {
+        let Some(surfaces) = load_surfaces(vk, assets, path, [255, 255, 255, 255], textures)
+        else {
+            continue;
+        };
+        let mut mins = [f32::MAX; 3];
+        let mut maxs = [f32::MIN; 3];
+        for surface in &surfaces {
+            for vertex in &surface.vertices {
+                for axis in 0..3 {
+                    mins[axis] = mins[axis].min(vertex.pos[axis]);
+                    maxs[axis] = maxs[axis].max(vertex.pos[axis]);
+                }
+            }
+        }
+        models.push(ViewModel {
+            weapon,
+            surfaces,
+            mins,
+            maxs,
+        });
+    }
+    models
 }
 
 /// Loads one md3 into triangles in model space, or nothing when the file or its
