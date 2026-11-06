@@ -279,17 +279,9 @@ impl TargetField {
             }
             self.targets[index].health -= damage;
             if self.targets[index].health <= 0 {
-                let mut fall = [
-                    target.origin[0] - at[0],
-                    target.origin[1] - at[1],
-                    0.0,
-                ];
-                if fall[0] == 0.0 && fall[1] == 0.0 {
-                    fall = [1.0, 0.0, 0.0];
-                }
-                self.targets[index].health = 0;
-                self.targets[index].fell = Some(fall);
-                self.targets[index].fallen_at = now.max(1);
+                // A blast knocks a post down the same way a bullet does, so it
+                // counts towards the longer wait the next fall buys.
+                self.knock_down(index, at, now);
                 down += 1;
             }
         }
@@ -431,6 +423,32 @@ mod tests {
         let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
         assert_eq!(field.blast([0.0, 400.0, 32.0], 120.0, 100, 0), 0, "out of range");
         assert_eq!(field.alive(), 1);
+    }
+
+    #[test]
+    fn a_post_a_blast_puts_down_counts_towards_its_next_fall() {
+        let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
+        let beside = [0.0, 60.0, 32.0];
+        assert_eq!(field.blast(beside, 120.0, 100, 500), 1);
+        assert_eq!(field.wait_at(500), TARGET_RECOVERY_MS);
+        field.recover(500 + TARGET_RECOVERY_MS);
+
+        // The second fall takes it down longer, whether a bullet or a blast
+        // did it.
+        assert_eq!(field.blast(beside, 120.0, 100, 9_000), 1);
+        assert_eq!(
+            field.wait_at(9_000),
+            TARGET_RECOVERY_MS + TARGET_RECOVERY_STEP_MS
+        );
+        assert_eq!(
+            field.recover(9_000 + TARGET_RECOVERY_MS),
+            0,
+            "six seconds is not enough now"
+        );
+        assert_eq!(
+            field.recover(9_000 + TARGET_RECOVERY_MS + TARGET_RECOVERY_STEP_MS),
+            1
+        );
     }
 
     #[test]
