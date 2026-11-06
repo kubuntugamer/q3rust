@@ -401,6 +401,24 @@ struct Bolt {
     until: u32,
 }
 
+/// A post that is lining up a shot: which post it is, where the bolt will leave
+/// from, and when it goes. While it waits the post glows, so the shot can be
+/// seen coming.
+struct WindUp {
+    index: usize,
+    from: [f32; 3],
+    fires_at: u32,
+}
+
+impl WindUp {
+    /// How far through the wind-up it is, from nothing at the start to one at
+    /// the moment the bolt leaves.
+    fn progress(&self, now: u32) -> f32 {
+        let left = self.fires_at.saturating_sub(now) as f32;
+        (1.0 - left / BOLT_TELEGRAPH as f32).clamp(0.0, 1.0)
+    }
+}
+
 /// How long the red wash of a fresh hit lasts, in milliseconds.
 const HURT_FLASH_MS: u32 = 250;
 
@@ -415,6 +433,10 @@ const BOLT_DAMAGE: i32 = 7;
 const BOLT_GRAVITY: f32 = 320.0;
 /// How long a post that has just stood back up takes to aim again.
 const RECOVERY_GRACE_MS: u32 = 700;
+
+/// How long a post spends lining up before its bolt leaves, so a shot can be
+/// seen coming and stepped out of rather than appearing with no warning.
+const BOLT_TELEGRAPH: u32 = 450;
 
 /// How much of your movement a post allows for when it fires. A post that
 /// aimed exactly where you are would never touch a moving target; one that
@@ -510,6 +532,8 @@ pub struct Client {
     bolts: Vec<Bolt>,
     /// When the posts may fire again, so they do not all fire at once.
     next_bolt: u32,
+    /// The post that is lining one up right now, if any.
+    wind_up: Option<WindUp>,
     /// The last frame's clock, for the distance a bolt travels in one frame.
     bolts_moved_at: u32,
     /// The practice posts built from the map's own markers.
@@ -917,6 +941,7 @@ impl Client {
             beams: Vec::new(),
             bolts: Vec::new(),
             next_bolt: 0,
+            wind_up: None,
             bolts_moved_at: 0,
             sounds,
             shotgun_sound,
@@ -1278,6 +1303,28 @@ impl Client {
                 [1.0, 1.0, 0.0, 0.0],
                 BlendMode::Opaque,
                 true,
+            )?;
+        }
+
+        // A post that is lining up a shot glows at its gun, growing and
+        // brightening until the bolt leaves.
+        if let Some(wind) = self.wind_up.as_ref() {
+            let progress = wind.progress(self.millis());
+            let color = [
+                255,
+                (110.0 + 145.0 * progress) as u8,
+                (50.0 + 130.0 * progress) as u8,
+                255,
+            ];
+            let at = [wind.from[0], wind.from[1], wind.from[2] + 24.0];
+            let glow = items::cube(at, 2.0 + 4.0 * progress, color);
+            self.renderer.vk.draw_stage(
+                &self.renderer.white,
+                &glow,
+                &mvp,
+                [1.0, 1.0, 0.0, 0.0],
+                BlendMode::Add,
+                false,
             )?;
         }
 
@@ -1683,7 +1730,30 @@ impl Client {
         let step = ((now.wrapping_sub(self.bolts_moved_at)) as f32 / 1000.0).min(0.1);
         self.bolts_moved_at = now;
 
-        if now >= self.next_bolt && prediction.health() > 0 {
+        // A post that has finished lining up takes its shot.
+        if let Some(wind) = self.wind_up.take() {
+            if now >= wind.fires_at {
+                let alive = self
+                    .targets
+                    .as_ref()
+                    .map(|field| field.targets()[wind.index].alive())
+                    .unwrap_or(false);
+                if alive {
+                    let flight = away(wind.from, eye) / BOLT_SPEED;
+                    let aim = bolt_lead(eye, prediction.velocity(), flight);
+                    self.bolts.push(Bolt {
+                        at: wind.from,
+                        velocity: bolt_aim(wind.from, aim),
+                        until: now + 6_000,
+                    });
+                }
+            } else {
+                // Still lining up: keep the glow going.
+                self.wind_up = Some(wind);
+            }
+        }
+
+        if self.wind_up.is_none() && now >= self.next_bolt && prediction.health() > 0 {
             if let Some(field) = self.targets.as_ref() {
                 let nearest = field
                     .targets()
@@ -1698,20 +1768,21 @@ impl Client {
                         ];
                         prediction.sees(chest, eye)
                     })
-                    .map(|target| (target.origin, away(target.origin, eye)))
-                    .filter(|(_, distance)| *distance < BOLT_RANGE)
+                    .enumerate()
+                    .map(|(index, target)| (index, target.origin, away(target.origin, eye)))
+                    .filter(|(_, _, distance)| *distance < BOLT_RANGE)
                     .min_by(|a, b| {
-                        a.1.partial_cmp(&b.1)
+                        a.2.partial_cmp(&b.2)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     });
-                if let Some((from, _)) = nearest {
+                if let Some((index, from, _)) = nearest {
+                    // The wait for the next shot starts now, so a post whose
+                    // shot is cancelled still keeps its rhythm.
                     self.next_bolt = now + BOLT_INTERVAL;
-                    let flight = away(from, eye) / BOLT_SPEED;
-                    let aim = bolt_lead(eye, prediction.velocity(), flight);
-                    self.bolts.push(Bolt {
-                        at: from,
-                        velocity: bolt_aim(from, aim),
-                        until: now + 6_000,
+                    self.wind_up = Some(WindUp {
+                        index,
+                        from,
+                        fires_at: now + BOLT_TELEGRAPH,
                     });
                 }
             }
@@ -1796,6 +1867,7 @@ impl Client {
             if self.was_dead && !dead_now {
                 self.posts_down = 0;
                 self.bolts.clear();
+                self.wind_up = None;
                 self.next_bolt = now + 1_000;
             }
             self.was_dead = dead_now;
@@ -2152,6 +2224,21 @@ mod bolt_arc_tests {
             }
         }
         at
+    }
+
+    #[test]
+    fn a_post_glows_before_it_fires() {
+        let wind = WindUp {
+            index: 0,
+            from: [0.0, 0.0, 24.0],
+            fires_at: 450,
+        };
+        assert_eq!(wind.progress(0), 0.0, "dark the moment it starts lining up");
+        assert!((wind.progress(225) - 0.5).abs() < 0.01);
+        assert_eq!(wind.progress(450), 1.0, "full glow as the bolt leaves");
+        assert_eq!(wind.progress(900), 1.0, "and no further");
+        // Long enough to see and step out of, short enough to stay a threat.
+        assert!(BOLT_TELEGRAPH >= 350 && BOLT_TELEGRAPH < BOLT_INTERVAL);
     }
 
     #[test]
