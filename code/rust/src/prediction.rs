@@ -738,6 +738,14 @@ impl Prediction {
         self.respawn_at != 0
     }
 
+    /// How long until the player comes back, in milliseconds; zero when alive.
+    pub fn respawn_in(&self) -> u32 {
+        if self.respawn_at == 0 {
+            return 0;
+        }
+        self.respawn_at.saturating_sub(self.last_time.max(0) as u32)
+    }
+
     /// The events the move raised. Only landings hurt so far: nothing on the
     /// map can shoot back yet.
     pub fn apply_events(&mut self, events: &[i32]) {
@@ -1075,9 +1083,15 @@ mod tests {
         prediction.step(1_000, &Input::default());
         assert!(prediction.dead());
         assert_eq!(prediction.health(), 0, "a body stays down for a moment");
+        assert_eq!(prediction.respawn_in(), RESPAWN_DELAY);
+
+        // Halfway through the wait, half the delay is left to show.
+        prediction.step(1_000 + RESPAWN_DELAY / 2, &Input::default());
+        assert_eq!(prediction.respawn_in(), RESPAWN_DELAY / 2);
 
         prediction.step(1_000 + RESPAWN_DELAY, &Input::default());
         assert!(!prediction.dead());
+        assert_eq!(prediction.respawn_in(), 0, "nothing left to wait");
         assert_eq!(prediction.health(), 100);
         assert_eq!(prediction.ammo(), STARTING_AMMO);
         // The spot it chose, on the last frame's drop: the move still applies

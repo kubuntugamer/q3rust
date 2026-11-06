@@ -1624,6 +1624,28 @@ impl Client {
             )?;
         }
 
+        // Dead, the frame dims and a countdown says how long until you are back,
+        // so a respawn is not a surprise.
+        if prediction.dead() {
+            self.renderer.fill(
+                0.0,
+                0.0,
+                width as f32,
+                height as f32,
+                [0, 0, 0, 140],
+            )?;
+            let big = self.renderer.face().default_scale(height);
+            let text = format!("DOWN   {:.1}", prediction.respawn_in() as f32 / 1000.0);
+            let text_width = self.renderer.face().width(&text, big);
+            self.renderer.text(
+                &text,
+                (width as f32 - text_width) * 0.5,
+                height as f32 * 0.42,
+                big,
+                [235, 95, 85, 255],
+            )?;
+        }
+
         self.renderer
             .text(&status, 8.0, 8.0, scale, [235, 235, 235, 255])?;
         self.renderer.text(
