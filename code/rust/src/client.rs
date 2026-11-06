@@ -1499,6 +1499,28 @@ impl Client {
         let filled = bar_width * (health.clamp(0, 100) as f32 / 100.0);
         self.renderer.fill(left, top, filled, bar_height, colour)?;
 
+        // Armour is a second, thinner bar above health, so armour that is
+        // soaking hits can be seen going down.
+        let armour_height = 7.0;
+        let armour_top = top - 4.0 - armour_height;
+        self.renderer.fill(
+            left - 2.0,
+            armour_top - 2.0,
+            bar_width + 4.0,
+            armour_height + 4.0,
+            [0, 0, 0, 150],
+        )?;
+        let armour = armor.clamp(0, 100) as f32;
+        if armour > 0.0 {
+            self.renderer.fill(
+                left,
+                armour_top,
+                bar_width * armour / 100.0,
+                armour_height,
+                [95, 170, 235, 255],
+            )?;
+        }
+
         self.renderer
             .text(&status, 8.0, 8.0, scale, [235, 235, 235, 255])?;
         self.renderer.text(
