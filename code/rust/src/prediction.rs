@@ -18,7 +18,8 @@ use crate::assets::Assets;
 use crate::bg_misc::{self, ItemType};
 use crate::bg_pmove::{
     pmove, Pmove, UserCmd, ENTITYNUM_NONE, EV_FALL_FAR, EV_FALL_MEDIUM, STAT_ARMOR, STAT_HEALTH,
-    STAT_WEAPONS, WP_MACHINEGUN, WP_PLASMAGUN, WP_RAILGUN, WP_ROCKET_LAUNCHER, WP_SHOTGUN,
+    STAT_WEAPONS, WP_GRENADE_LAUNCHER, WP_LIGHTNING, WP_MACHINEGUN, WP_PLASMAGUN, WP_RAILGUN,
+    WP_ROCKET_LAUNCHER, WP_SHOTGUN,
 };
 use crate::bsp::Bsp;
 use crate::collision::Collision;
@@ -107,7 +108,7 @@ struct Pattern {
     plasma: bool,
 }
 
-const PATTERNS: [Pattern; 5] = [
+const PATTERNS: [Pattern; 7] = [
     Pattern {
         weapon: WP_MACHINEGUN,
         interval: 100,
@@ -165,6 +166,30 @@ const PATTERNS: [Pattern; 5] = [
         speed: PLASMA_SPEED,
         radius: PLASMA_RADIUS,
         plasma: true,
+    },
+    Pattern {
+        weapon: WP_GRENADE_LAUNCHER,
+        interval: 800,
+        pellets: 1,
+        spread: 0.0,
+        splash: 0.0,
+        // Slower than a rocket, and it bursts as wide as one.
+        damage: 100,
+        speed: 700.0,
+        radius: ROCKET_RADIUS,
+        plasma: false,
+    },
+    Pattern {
+        weapon: WP_LIGHTNING,
+        interval: 50,
+        pellets: 1,
+        spread: 0.0,
+        splash: 0.0,
+        // A thin, fast stream: small bites taken twenty times a second.
+        damage: 8,
+        speed: 0.0,
+        radius: 0.0,
+        plasma: false,
     },
 ];
 
@@ -951,6 +976,37 @@ mod tests {
             let turned = (off - prediction.yaw() + 180.0).rem_euclid(360.0) - 180.0;
             assert!(turned.abs() <= 3.5, "pellet {turned} degrees off centre");
         }
+    }
+
+    #[test]
+    fn the_lightning_gun_streams_and_the_grenade_lobs() {
+        let mut prediction = prediction_on_a_test_map();
+        prediction.pm.ps.stats[STAT_WEAPONS] |=
+            (1 << WP_LIGHTNING) | (1 << WP_GRENADE_LAUNCHER);
+        prediction.pm.ps.ammo[WP_LIGHTNING as usize] = 100;
+        prediction.pm.ps.ammo[WP_GRENADE_LAUNCHER as usize] = 10;
+
+        // The lightning gun is the fast one: two bites inside 100 ms.
+        assert!(prediction.select_weapon(WP_LIGHTNING));
+        for tick in 0..40 {
+            prediction.step(1_000 + tick * 50, &Input::default());
+        }
+        let now = 1_000 + 40 * 50;
+        assert_eq!(prediction.fire(now).len(), 1);
+        assert_eq!(prediction.fire(now + 50).len(), 1, "twenty bites a second");
+        assert_eq!(prediction.ammo(), 98, "a cell per bite");
+
+        // The grenade launcher lobs a round that bursts wide.
+        assert!(prediction.select_weapon(WP_GRENADE_LAUNCHER));
+        for tick in 0..40 {
+            prediction.step(now + 500 + tick * 50, &Input::default());
+        }
+        let later = now + 500 + 40 * 50;
+        assert_eq!(prediction.weapon(), WP_GRENADE_LAUNCHER);
+        assert_eq!(prediction.fire(later).len(), 1);
+        let round = prediction.projectiles()[0];
+        assert!(!round.plasma, "a grenade is not plasma");
+        assert_eq!(round.radius, ROCKET_RADIUS);
     }
 
     #[test]
