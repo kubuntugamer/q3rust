@@ -24,6 +24,21 @@ pub const TARGET_HEALTH: i32 = 100;
 pub const TARGET_HIT_DAMAGE: i32 = 34;
 /// How long a post lies down before it stands back up with full health.
 pub const TARGET_RECOVERY_MS: u32 = 6_000;
+/// How much longer it stays down each further time it is put down in one life,
+/// and the longest it will ever lie there.
+pub const TARGET_RECOVERY_STEP_MS: u32 = 2_000;
+pub const TARGET_RECOVERY_MAX_MS: u32 = 12_000;
+
+/// How long a post that has been put down `downs` times in one life stays on
+/// the floor: the first time is the plain recovery, each one after that adds a
+/// step, up to the cap.
+fn recovery_for(downs: u32) -> u32 {
+    let extra = downs
+        .saturating_sub(1)
+        .saturating_mul(TARGET_RECOVERY_STEP_MS)
+        .min(TARGET_RECOVERY_MAX_MS - TARGET_RECOVERY_MS);
+    TARGET_RECOVERY_MS + extra
+}
 
 /// One post on the map.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -36,6 +51,9 @@ pub struct Target {
     /// When it went down, so it can be known when to get back up. Zero while
     /// it is standing.
     pub fallen_at: u32,
+    /// How many times this post has been put down since the player last came
+    /// back from the dead, so a fight gets harder the longer it runs.
+    pub downs: u32,
 }
 
 impl Target {
@@ -104,6 +122,7 @@ impl TargetField {
                     health: TARGET_HEALTH,
                     fell: None,
                     fallen_at: 0,
+                    downs: 0,
                 })
                 .collect(),
         }
@@ -111,6 +130,15 @@ impl TargetField {
 
     pub fn targets(&self) -> &[Target] {
         &self.targets
+    }
+
+    /// Wipes how many times each post has been put down, for the player coming
+    /// back from the dead: a fresh life starts the fight over at the plain
+    /// recovery time.
+    pub fn forget_down_counts(&mut self) {
+        for target in &mut self.targets {
+            target.downs = 0;
+        }
     }
 
     pub fn alive(&self) -> usize {
@@ -137,6 +165,7 @@ impl TargetField {
         target.health = 0;
         target.fell = Some(fall);
         target.fallen_at = now.max(1);
+        target.downs = target.downs.saturating_add(1);
     }
 
     /// Stands every post back up whose time on the floor is done, at full
@@ -148,7 +177,7 @@ impl TargetField {
             if target.fallen_at == 0 {
                 continue;
             }
-            if now.wrapping_sub(target.fallen_at) < TARGET_RECOVERY_MS {
+            if now.wrapping_sub(target.fallen_at) < recovery_for(target.downs) {
                 continue;
             }
             target.health = TARGET_HEALTH;
@@ -415,6 +444,37 @@ mod tests {
         field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 34, 0);
         assert_ne!(hurt, field.targets()[0].color(), "a fallen post is bare");
         assert_eq!(field.vertices().len(), 36, "and still drawn");
+    }
+
+    #[test]
+    fn a_post_put_down_again_stays_down_longer_and_that_has_a_limit() {
+        assert_eq!(recovery_for(0), TARGET_RECOVERY_MS);
+        assert_eq!(recovery_for(1), TARGET_RECOVERY_MS);
+        assert_eq!(recovery_for(2), TARGET_RECOVERY_MS + TARGET_RECOVERY_STEP_MS);
+        assert_eq!(recovery_for(3), TARGET_RECOVERY_MS + 2 * TARGET_RECOVERY_STEP_MS);
+        assert_eq!(recovery_for(99), TARGET_RECOVERY_MAX_MS, "it never sleeps forever");
+
+        let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
+        let shot = ([0.0, 0.0, 40.0], [100.0, 0.0, 40.0]);
+        field.shoot(shot.0, shot.1, 200, 500);
+        // First time down is the plain six seconds.
+        assert_eq!(field.recover(500 + TARGET_RECOVERY_MS - 1), 0);
+        assert_eq!(field.recover(500 + TARGET_RECOVERY_MS), 1);
+
+        // Put down a second time it lies there longer.
+        field.shoot(shot.0, shot.1, 200, 10_000);
+        assert_eq!(field.recover(10_000 + TARGET_RECOVERY_MS), 0, "six seconds is not enough now");
+        assert_eq!(
+            field.recover(10_000 + TARGET_RECOVERY_MS + TARGET_RECOVERY_STEP_MS),
+            1
+        );
+
+        // A fresh life starts the count over.
+        field.shoot(shot.0, shot.1, 200, 20_000);
+        field.forget_down_counts();
+        field.recover(20_000 + TARGET_RECOVERY_MS);
+        field.shoot(shot.0, shot.1, 200, 30_000);
+        assert_eq!(field.recover(30_000 + TARGET_RECOVERY_MS), 1, "back to six seconds");
     }
 
     #[test]

@@ -2176,6 +2176,12 @@ impl Client {
                 self.wind_up = None;
                 self.bolt_call = None;
                 self.next_bolt = now + 1_000;
+                // The fight starts over: a post put down again in the new life
+                // lies there the plain six seconds, not the longer time it
+                // earned before.
+                if let Some(field) = self.targets.as_mut() {
+                    field.forget_down_counts();
+                }
             }
             self.was_dead = dead_now;
             // Say so when a change finishes, so the keys are not silent.
