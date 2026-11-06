@@ -463,11 +463,18 @@ const BOLT_TELEGRAPH: u32 = 450;
 const DODGE_FLASH_MS: u32 = 240;
 const DODGE_FLASH_WIDTH: f32 = 26.0;
 
-/// How wide the dodge bar is with `left_ms` still to run: full at the moment the
-/// bolt goes past, gone by the time the bar has run out.
-fn dodge_bar_width(left_ms: u32) -> f32 {
+/// How wide the dodge bar is with `left_ms` still to run and a dodge worth
+/// `strength` of a full push: widest for a bolt that nearly clipped you, and
+/// gone by the time the bar has run out.
+fn dodge_bar_width(left_ms: u32, strength: f32) -> f32 {
     let left = left_ms.min(DODGE_FLASH_MS) as f32 / DODGE_FLASH_MS as f32;
-    DODGE_FLASH_WIDTH * left
+    DODGE_FLASH_WIDTH * left * strength.clamp(0.0, 1.0)
+}
+
+/// How much of a full dodge push `push` is, for the bar that shows it.
+fn dodge_strength(push: f32) -> f32 {
+    let span = DODGE_PUSH_NEAR - DODGE_PUSH_FAR;
+    ((push - DODGE_PUSH_FAR) / span).clamp(0.0, 1.0)
 }
 
 /// How long a short line like "post down" stays on screen before it fades out.
@@ -759,8 +766,10 @@ pub struct Client {
     hurt_until: u32,
     /// When the hit marker on the crosshair should have faded out.
     hit_until: u32,
-    /// When the short bar saying "you stepped out of that" should have gone.
+    /// When the short bar saying "you stepped out of that" should have gone,
+    /// and how much of a full push the dodge was worth.
     dodge_until: u32,
+    dodge_strength: f32,
     /// How many practice posts have been put on the floor this life.
     posts_down: u32,
     /// Whether the player was dead last frame, so a respawn can be noticed.
@@ -1153,6 +1162,7 @@ impl Client {
             hurt_until: 0,
             hit_until: 0,
             dodge_until: 0,
+            dodge_strength: 1.0,
             posts_down: 0,
             was_dead: false,
             pickup_sounds,
@@ -1819,7 +1829,7 @@ impl Client {
         // A bar under the crosshair shrinks away as it shows the step of speed
         // a bolt that just missed paid for, so the reward is seen, not guessed.
         if now < self.dodge_until {
-            let bar = dodge_bar_width(self.dodge_until - now);
+            let bar = dodge_bar_width(self.dodge_until - now, self.dodge_strength);
             self.renderer.fill(
                 mid_x - bar * 0.5,
                 mid_y + 16.0,
@@ -2124,7 +2134,9 @@ impl Client {
         });
         if let Some(distance) = dodged {
             if prediction.health() > 0 {
-                prediction.dodge(dodge_push(distance));
+                let push = dodge_push(distance);
+                prediction.dodge(push);
+                self.dodge_strength = dodge_strength(push);
                 self.dodge_until = now + DODGE_FLASH_MS;
             }
         }
@@ -2657,14 +2669,27 @@ mod bolt_arc_tests {
 
     #[test]
     fn the_dodge_bar_shrinks_away() {
-        assert_eq!(dodge_bar_width(DODGE_FLASH_MS), DODGE_FLASH_WIDTH);
-        assert!((dodge_bar_width(DODGE_FLASH_MS / 2) - DODGE_FLASH_WIDTH * 0.5).abs() < 0.01);
-        assert_eq!(dodge_bar_width(0), 0.0, "gone when the time is up");
+        assert_eq!(dodge_bar_width(DODGE_FLASH_MS, 1.0), DODGE_FLASH_WIDTH);
+        assert!((dodge_bar_width(DODGE_FLASH_MS / 2, 1.0) - DODGE_FLASH_WIDTH * 0.5).abs() < 0.01);
+        assert_eq!(dodge_bar_width(0, 1.0), 0.0, "gone when the time is up");
         assert_eq!(
-            dodge_bar_width(DODGE_FLASH_MS * 2),
+            dodge_bar_width(DODGE_FLASH_MS * 2, 1.0),
             DODGE_FLASH_WIDTH,
             "a stale clock never makes it wider than it starts"
         );
+    }
+
+    #[test]
+    fn a_bigger_dodge_shows_a_wider_bar() {
+        assert_eq!(dodge_strength(DODGE_PUSH_NEAR), 1.0);
+        assert_eq!(dodge_strength(DODGE_PUSH_FAR), 0.0);
+        assert!((dodge_strength((DODGE_PUSH_NEAR + DODGE_PUSH_FAR) * 0.5) - 0.5).abs() < 0.01);
+
+        // The bar keeps that shape at every point of its shrink.
+        let close = dodge_bar_width(DODGE_FLASH_MS, dodge_strength(DODGE_PUSH_NEAR));
+        let far = dodge_bar_width(DODGE_FLASH_MS, dodge_strength(DODGE_PUSH_FAR + 0.01));
+        assert!(close > far, "{close} {far}");
+        assert!(far < 1.0, "a barely-paid dodge is a sliver, not a full bar");
     }
 
     #[test]
