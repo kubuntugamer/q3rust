@@ -375,6 +375,20 @@ impl Prediction {
         self.pm.ps.stats[STAT_ARMOR]
     }
 
+    /// Whether the map's walls leave a clear line between two places. Used by a
+    /// practice post to tell whether it has a shot instead of firing through
+    /// the level.
+    pub fn sees(&self, from: [f32; 3], to: [f32; 3]) -> bool {
+        let trace = self.pm.world.trace(
+            from,
+            to,
+            [0.0; 3],
+            [0.0; 3],
+            crate::collision::CONTENTS_SOLID,
+        );
+        trace.fraction == 1.0
+    }
+
     /// Rounds left in the weapon in hand.
     pub fn ammo(&self) -> i32 {
         usize::try_from(self.pm.ps.weapon)
@@ -974,6 +988,15 @@ mod tests {
         assert_eq!(prediction.health(), 100);
         assert_eq!(prediction.armor(), 0);
         assert_eq!(prediction.ammo(), STARTING_AMMO);
+    }
+
+    #[test]
+    fn the_open_air_is_in_plain_view() {
+        let prediction = prediction_on_a_test_map();
+        let origin = prediction.origin();
+        let above = [origin[0], origin[1], origin[2] + 64.0];
+        assert!(prediction.sees(origin, above));
+        assert!(prediction.sees(above, origin));
     }
 
     #[test]

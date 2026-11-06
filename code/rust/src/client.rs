@@ -1476,6 +1476,15 @@ impl Client {
                     .targets()
                     .iter()
                     .filter(|target| target.alive())
+                    // A post only fires when the map leaves it a clear line.
+                    .filter(|target| {
+                        let chest = [
+                            target.origin[0],
+                            target.origin[1],
+                            target.origin[2] + 24.0,
+                        ];
+                        prediction.sees(chest, eye)
+                    })
                     .map(|target| (target.origin, away(target.origin, eye)))
                     .filter(|(_, distance)| *distance < BOLT_RANGE)
                     .min_by(|a, b| {
