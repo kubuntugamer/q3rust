@@ -905,6 +905,35 @@ fn away_from_line(point: [f32; 3], from: [f32; 3], to: [f32; 3]) -> f32 {
     )
 }
 
+/// How finely a bolt's step is walked when it looks for a wall: fine enough
+/// that the thin brushes the maps are built from cannot be stepped clean over
+/// when a slow frame moves the bolt a long way.
+const BOLT_STEP: f32 = 4.0;
+
+/// The first point along a bolt's step that `solid` says is inside the map, or
+/// `None` when the whole step is clear. A bolt covering a long step in a slow
+/// frame is walked in pieces, so it stops at a thin wall instead of appearing
+/// on the far side of it.
+fn first_solid(
+    from: [f32; 3],
+    to: [f32; 3],
+    solid: impl Fn([f32; 3]) -> bool,
+) -> Option<[f32; 3]> {
+    let pieces = (away(from, to) / BOLT_STEP).ceil().max(1.0) as u32;
+    for piece in 1..=pieces {
+        let along = piece as f32 / pieces as f32;
+        let point = [
+            from[0] + (to[0] - from[0]) * along,
+            from[1] + (to[1] - from[1]) * along,
+            from[2] + (to[2] - from[2]) * along,
+        ];
+        if solid(point) {
+            return Some(point);
+        }
+    }
+    None
+}
+
 /// Engine state that survives a frame: SDL, the command buffer, the cvars, the
 /// renderer and the clock.
 pub struct Client {
@@ -2383,9 +2412,11 @@ impl Client {
             for axis in 0..3 {
                 bolt.at[axis] += bolt.velocity[axis] * step;
             }
-            // A bolt that reaches the floor or a wall stops there.
-            if prediction.solid(bolt.at) {
-                strikes.push(bolt.at);
+            // A bolt that reaches the floor or a wall stops there. The whole
+            // step is walked, so a frame long enough to move a bolt across a
+            // room cannot carry it through a wall on the way.
+            if let Some(at) = first_solid(before, bolt.at, |point| prediction.solid(point)) {
+                strikes.push(at);
                 return false;
             }
             if away_from_line(eye, before, bolt.at) < BOLT_HIT_RADIUS {
@@ -3035,6 +3066,33 @@ mod bolt_arc_tests {
         assert!(near_miss(70.0), "past your shoulder counts");
         assert!(!near_miss(BOLT_GRAZE_RADIUS), "a wide shot is no dodge");
         assert!(!near_miss(400.0));
+    }
+
+    #[test]
+    fn a_bolt_covering_a_long_step_still_stops_at_a_thin_wall() {
+        // A wall between the two positions of one slow frame: testing only
+        // where the bolt ended up would put it on the far side of it.
+        let wall = |point: [f32; 3]| (48.0..52.0).contains(&point[0]);
+        let at = first_solid([0.0, 0.0, 0.0], [70.0, 0.0, 0.0], wall)
+            .expect("the wall is between the two");
+        assert!((48.0..52.0).contains(&at[0]), "stopped at {at:?}");
+
+        assert!(
+            first_solid([0.0, 0.0, 0.0], [40.0, 0.0, 0.0], wall).is_none(),
+            "a step that stops short of it is clear"
+        );
+        assert!(
+            first_solid([60.0, 0.0, 0.0], [100.0, 0.0, 0.0], wall).is_none(),
+            "and so is one that starts past it"
+        );
+        assert!(
+            first_solid([10.0, 0.0, 0.0], [10.0, 0.0, 0.0], wall).is_none(),
+            "a bolt that did not move is in the open"
+        );
+        assert!(
+            first_solid([10.0, 0.0, 0.0], [10.0, 0.0, 0.0], |_| true).is_some(),
+            "though it still stops if it is already in a wall"
+        );
     }
 
     #[test]
