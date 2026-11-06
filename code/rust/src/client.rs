@@ -1222,12 +1222,18 @@ impl Client {
         let weapon = bg_misc::class_of_weapon(prediction.weapon())
             .map(|name| name.trim_start_matches("weapon_"))
             .unwrap_or("none");
-        let status = format!(
+        let mut status = format!(
             "HEALTH {}   ARMOR {}   {weapon} {}",
             prediction.health(),
             prediction.armor(),
             prediction.ammo()
         );
+        // A charged weapon shows how far the held charge has got, since
+        // nothing else on screen says when it is ready to let go.
+        let charging = prediction.charge(self.millis());
+        if charging > 0.0 {
+            status.push_str(&format!("   CHARGING {}%", (charging * 100.0) as u32));
+        }
         self.renderer
             .text(&status, 8.0, 8.0, scale, [235, 235, 235, 255])?;
 
