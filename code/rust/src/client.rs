@@ -609,6 +609,20 @@ fn telegraph_for(distance: f32) -> u32 {
     BOLT_TELEGRAPH_NEAR + (span * closed) as u32
 }
 
+/// How much longer the posts wait after firing a pair than after a lone shot,
+/// so a bracket is something they commit to rather than their default.
+const VOLLEY_INTERVAL_SHARE: f32 = 1.6;
+
+/// How long before the posts may line up another shot, once `posts` of them
+/// have just fired together.
+fn interval_after(posts: usize) -> u32 {
+    if posts > 1 {
+        (BOLT_INTERVAL as f32 * VOLLEY_INTERVAL_SHARE) as u32
+    } else {
+        BOLT_INTERVAL
+    }
+}
+
 /// How long the second post of a volley takes, as a share of a lone post's
 /// warning. Its bolt goes where you are rather than where you will be, so a
 /// step already beats it; giving it the full warning would make the pair feel
@@ -2286,17 +2300,22 @@ impl Client {
         {
             if let Some(field) = self.targets.as_ref() {
                 // A post only fires when the map leaves it a clear line.
-                let room = MAX_FIRING_POSTS - self.wind_ups.len();
+                // Posts already lining up are the nearer ones, so anything
+                // joining them takes the second place in the volley.
+                let already = self.wind_ups.len();
+                let room = MAX_FIRING_POSTS - already;
                 let chosen =
                     volley_candidates(field, eye, &self.wind_ups, room, |chest, eye| {
                         prediction.sees(chest, eye)
                     });
                 if !chosen.is_empty() {
                     // The wait for the next shot starts now, so a post whose
-                    // shot is cancelled still keeps its rhythm.
-                    self.next_bolt = now + BOLT_INTERVAL;
+                    // shot is cancelled still keeps its rhythm. A pair buys
+                    // you a longer breather than one bolt does.
+                    self.next_bolt = now + interval_after(already + chosen.len());
                 }
-                for (slot, (index, from, distance)) in chosen.into_iter().enumerate() {
+                for (position, (index, from, distance)) in chosen.into_iter().enumerate() {
+                    let slot = already + position;
                     // Say which post has you and which way to look, since a
                     // post off screen is easy to miss otherwise. A post that
                     // keeps firing only gets a line now and then, and a volley
@@ -3057,6 +3076,16 @@ mod bolt_arc_tests {
         assert_eq!(wind.progress(1_000), 0.0);
         assert!((wind.progress(1_000 + BOLT_TELEGRAPH_NEAR / 2) - 0.5).abs() < 0.02);
         assert_eq!(wind.progress(1_000 + BOLT_TELEGRAPH_NEAR), 1.0);
+    }
+
+    #[test]
+    fn a_pair_costs_the_posts_more_of_a_wait_than_one_bolt() {
+        assert_eq!(interval_after(0), BOLT_INTERVAL);
+        assert_eq!(interval_after(1), BOLT_INTERVAL, "a lone shot keeps its rhythm");
+        let pair = interval_after(2);
+        assert!(pair > BOLT_INTERVAL, "surviving the bracket buys a longer breather");
+        assert!(pair <= BOLT_INTERVAL * 2, "but not a ceasefire");
+        assert_eq!(pair, interval_after(3), "no further penalty past a pair");
     }
 
     #[test]
