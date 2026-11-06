@@ -27,8 +27,7 @@ use crate::assets::Assets;
 use crate::audio::Audio;
 use crate::bg_misc;
 use crate::bg_pmove::{
-    WP_BFG, WP_GAUNTLET, WP_GRENADE_LAUNCHER, WP_LIGHTNING, WP_MACHINEGUN, WP_PLASMAGUN, WP_RAILGUN,
-    WP_ROCKET_LAUNCHER, WP_SHOTGUN,
+    WP_BFG, WP_GAUNTLET, WP_GRENADE_LAUNCHER, WP_LIGHTNING,    WP_MACHINEGUN, WP_ROCKET_LAUNCHER, WP_SHOTGUN, WP_PLASMAGUN, WP_RAILGUN,
 };
 use crate::cmd::CmdSystem;
 use crate::console;
@@ -414,6 +413,10 @@ pub struct Client {
     targets: Option<TargetField>,
     /// The machinegun's shot sounds, decoded once and shared per shot.
     sounds: Vec<Arc<Vec<f32>>>,
+    /// The shotgun's break, the rocket's launch, and what it leaves behind.
+    shotgun_sound: Option<Arc<Vec<f32>>>,
+    rocket_sound: Option<Arc<Vec<f32>>>,
+    explosion_sound: Option<Arc<Vec<f32>>>,
     /// The pickup sounds, by the path the item table names.
     pickup_sounds: std::collections::HashMap<&'static str, Arc<Vec<f32>>>,
     /// Which of those the next shot uses, so repeated fire varies.
@@ -536,6 +539,9 @@ impl Client {
         // The machinegun's four shot sounds, decoded once into the mixer's
         // format; every shot reuses one of them.
         let mut sounds = Vec::new();
+        let mut shotgun_sound: Option<Arc<Vec<f32>>> = None;
+        let mut rocket_sound: Option<Arc<Vec<f32>>> = None;
+        let mut explosion_sound: Option<Arc<Vec<f32>>> = None;
         let mut pickup_sounds = std::collections::HashMap::new();
         if let Some(assets) = assets.as_ref() {
             let load = |path: &str| -> Option<Arc<Vec<f32>>> {
@@ -553,6 +559,11 @@ impl Client {
                     sounds.push(sound);
                 }
             }
+            // The other two weapons only ever need one sound each, plus the
+            // blast the rocket leaves.
+            shotgun_sound = load("sound/weapons/shotgun/sshotf1b.wav");
+            rocket_sound = load("sound/weapons/rocket/rocklf1a.wav");
+            explosion_sound = load("sound/weapons/rocket/rocklx1a.wav");
             // The pickup sounds: every path the item table can name, loaded
             // once and looked up when something is taken.
             for path in [
@@ -738,6 +749,9 @@ impl Client {
             targets,
             sparks: Vec::new(),
             sounds,
+            shotgun_sound,
+            rocket_sound,
+            explosion_sound,
             pickup_sounds,
             next_sound: 0,
             input: Input::default(),
@@ -1279,17 +1293,29 @@ impl Client {
                             color: [255, 190, 120, 255],
                             until: now + 200,
                         });
+                        if let (Some(sound), Some(audio)) =
+                            (self.explosion_sound.clone(), self.audio.as_ref())
+                        {
+                            audio.play_at(sound, shot.to);
+                        }
                     }
-                    // Only the machinegun has a sound so far.
-                    if prediction.weapon() == WP_MACHINEGUN {
-                        if let Some(audio) = self.audio.as_ref() {
-                            if !self.sounds.is_empty() {
+                    // Each weapon fires with its own sound.
+                    let fired = match prediction.weapon() {
+                        WP_SHOTGUN => self.shotgun_sound.clone(),
+                        WP_ROCKET_LAUNCHER => self.rocket_sound.clone(),
+                        _ => {
+                            if self.sounds.is_empty() {
+                                None
+                            } else {
                                 let sound =
                                     Arc::clone(&self.sounds[self.next_sound % self.sounds.len()]);
                                 self.next_sound += 1;
-                                audio.play_at(sound, shot.from);
+                                Some(sound)
                             }
                         }
+                    };
+                    if let (Some(sound), Some(audio)) = (fired, self.audio.as_ref()) {
+                        audio.play_at(sound, shot.from);
                     }
                     if let Some(field) = self.targets.as_mut() {
                         if let Some((at, destroyed)) = field.shoot(shot.from, shot.to) {
