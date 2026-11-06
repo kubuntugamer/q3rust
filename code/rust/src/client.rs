@@ -455,6 +455,20 @@ const RECOVERY_GRACE_MS: u32 = 700;
 /// is the warning you get from the far edge of its range.
 const BOLT_TELEGRAPH: u32 = 450;
 
+/// How long before a post that keeps shooting at you gets another line in the
+/// console. A post holds its rhythm whether or not the last line was read, so
+/// without this the log fills up during a fight.
+const BOLT_CALL_REPEAT_MS: u32 = 3_000;
+
+/// Whether a post that started a wind-up is worth a console line: yes for a
+/// post you have not heard from lately, no for one still on its rhythm.
+fn worth_saying(last: Option<(usize, u32)>, index: usize, now: u32) -> bool {
+    match last {
+        Some((who, at)) if who == index => now.saturating_sub(at) >= BOLT_CALL_REPEAT_MS,
+        _ => true,
+    }
+}
+
 /// How long a post takes when you are right on top of it. Standing close enough
 /// to smell the gun means almost no warning, so closing in has to be a decision
 /// rather than a free way to bully a post that cannot aim fast enough.
@@ -627,6 +641,9 @@ pub struct Client {
     next_bolt: u32,
     /// The post that is lining one up right now, if any.
     wind_up: Option<WindUp>,
+    /// The last post the console named a shot for, and when, so a post that
+    /// keeps firing does not fill the log.
+    bolt_call: Option<(usize, u32)>,
     /// The last frame's clock, for the distance a bolt travels in one frame.
     bolts_moved_at: u32,
     /// The practice posts built from the map's own markers.
@@ -1035,6 +1052,7 @@ impl Client {
             bolts: Vec::new(),
             next_bolt: 0,
             wind_up: None,
+            bolt_call: None,
             bolts_moved_at: 0,
             sounds,
             shotgun_sound,
@@ -1938,12 +1956,16 @@ impl Client {
                     });
                 if let Some((index, from, distance)) = nearest {
                     // Say which post has you and which way to look, since a
-                    // post off screen is easy to miss otherwise.
-                    let heading = bearing(prediction.origin(), prediction.yaw(), from);
-                    console::print(&format!(
-                        "post lining up a shot: {} ({distance:.0} away)",
-                        side_words(heading)
-                    ));
+                    // post off screen is easy to miss otherwise. A post that
+                    // keeps firing only gets a line now and then.
+                    if worth_saying(self.bolt_call, index, now) {
+                        self.bolt_call = Some((index, now));
+                        let heading = bearing(prediction.origin(), prediction.yaw(), from);
+                        console::print(&format!(
+                            "post lining up a shot: {} ({distance:.0} away)",
+                            side_words(heading)
+                        ));
+                    }
                     // The wait for the next shot starts now, so a post whose
                     // shot is cancelled still keeps its rhythm.
                     self.next_bolt = now + BOLT_INTERVAL;
@@ -2037,6 +2059,7 @@ impl Client {
                 self.posts_down = 0;
                 self.bolts.clear();
                 self.wind_up = None;
+                self.bolt_call = None;
                 self.next_bolt = now + 1_000;
             }
             self.was_dead = dead_now;
@@ -2450,6 +2473,19 @@ mod bolt_arc_tests {
         assert!(bearing(eye, 90.0, [0.0, 100.0, 24.0]).abs() < 0.01);
         // And it wraps rather than jumping at north.
         assert!(bearing(eye, 350.0, [100.0, 20.0, 24.0]) > 0.0);
+    }
+
+    #[test]
+    fn a_post_keeps_quiet_between_shots() {
+        // Nothing said yet: the first shot is always worth a line.
+        assert!(worth_saying(None, 2, 1_000));
+        // The same post again a moment later says nothing.
+        assert!(!worth_saying(Some((2, 1_000)), 2, 1_400));
+        assert!(!worth_saying(Some((2, 1_000)), 2, 1_000 + BOLT_CALL_REPEAT_MS - 1));
+        // Once it has been quiet long enough, it speaks up again.
+        assert!(worth_saying(Some((2, 1_000)), 2, 1_000 + BOLT_CALL_REPEAT_MS));
+        // A different post is news straight away.
+        assert!(worth_saying(Some((2, 1_000)), 5, 1_100));
     }
 
     #[test]
