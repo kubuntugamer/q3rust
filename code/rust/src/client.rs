@@ -609,6 +609,22 @@ fn telegraph_for(distance: f32) -> u32 {
     BOLT_TELEGRAPH_NEAR + (span * closed) as u32
 }
 
+/// How long the second post of a volley takes, as a share of a lone post's
+/// warning. Its bolt goes where you are rather than where you will be, so a
+/// step already beats it; giving it the full warning would make the pair feel
+/// like twice the threat when it is only worth more than one bolt.
+const VOLLEY_SECOND_TELEGRAPH: f32 = 0.75;
+
+/// How long the post filling `slot` of a shot takes to line it up. Shorter for
+/// the second of a volley, but never so short that the bolt is a surprise.
+fn telegraph_for_slot(distance: f32, slot: usize) -> u32 {
+    let warning = telegraph_for(distance);
+    if slot == 0 {
+        return warning;
+    }
+    ((warning as f32 * VOLLEY_SECOND_TELEGRAPH) as u32).max(BOLT_TELEGRAPH_NEAR / 2)
+}
+
 /// How much of your movement a post allows for when it fires. A post that
 /// aimed exactly where you are would never touch a moving target; one that
 /// aimed perfectly ahead would be unbeatable, so it takes half the lead.
@@ -2305,7 +2321,7 @@ impl Client {
                         index,
                         from,
                         started_at: now,
-                        fires_at: now + telegraph_for(distance),
+                        fires_at: now + telegraph_for_slot(distance, slot),
                         lead,
                     });
                 }
@@ -3041,6 +3057,30 @@ mod bolt_arc_tests {
         assert_eq!(wind.progress(1_000), 0.0);
         assert!((wind.progress(1_000 + BOLT_TELEGRAPH_NEAR / 2) - 0.5).abs() < 0.02);
         assert_eq!(wind.progress(1_000 + BOLT_TELEGRAPH_NEAR), 1.0);
+    }
+
+    #[test]
+    fn the_second_post_of_a_volley_warns_for_less_time() {
+        for distance in [0.0, BOLT_RANGE * 0.5, BOLT_RANGE * 4.0] {
+            assert_eq!(
+                telegraph_for_slot(distance, 0),
+                telegraph_for(distance),
+                "a lone post is unchanged"
+            );
+            let second = telegraph_for_slot(distance, 1);
+            assert!(
+                second < telegraph_for(distance),
+                "the pair is not twice the warning of one post"
+            );
+            assert!(
+                second >= BOLT_TELEGRAPH_NEAR / 2,
+                "still a warning, not a jump scare"
+            );
+        }
+        assert!(
+            telegraph_for_slot(BOLT_RANGE * 4.0, 1) > telegraph_for_slot(0.0, 1),
+            "the second post still takes longer from further off"
+        );
     }
 
     #[test]
