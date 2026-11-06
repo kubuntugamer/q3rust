@@ -12,10 +12,13 @@
 //! stable address without making the player self-referential. The game data
 //! layer keeps its pak mappings alive the same way.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use crate::assets::Assets;
 use crate::bg_pmove::{pmove, Pmove, UserCmd, ENTITYNUM_NONE};
 use crate::bsp::Bsp;
 use crate::collision::Collision;
+use crate::entities;
 use crate::game::MapError;
 
 /// The full deflection of a `usercmd_t` move axis: the C client's 127.
@@ -49,7 +52,8 @@ pub struct Prediction {
 
 impl Prediction {
     /// Loads `maps/<map>.bsp`, builds its collision model and puts the player
-    /// on the first `info_player_deathmatch`.
+    /// on one of the map's `info_player_deathmatch` spots, facing the way the
+    /// map points that spot.
     ///
     /// `G_SpawnPlayer` lifts the spawn spot one unit off the floor; the same
     /// nudge here keeps the first ground trace from starting inside it.
@@ -60,14 +64,13 @@ impl Prediction {
             .ok_or_else(|| MapError::Missing(path.clone()))?
             .into_owned();
         let bsp = Bsp::load(bytes)?;
-        let mut spawn = spawn_point(bsp.entities()).unwrap_or([0.0; 3]);
-        spawn[2] += 1.0;
+        let (spawn, yaw) = pick_spawn(&spawn_points(bsp.entities())).unwrap_or(([0.0; 3], 0.0));
 
         let world: &'static Collision = Box::leak(Box::new(Collision::load(&bsp)?));
         Ok(Prediction {
             map: map.to_string(),
             pm: Pmove::new(spawn, world),
-            yaw: 0.0,
+            yaw,
             pitch: 0.0,
             last_time: 0,
         })
@@ -133,94 +136,69 @@ impl Prediction {
     }
 }
 
-/// `G_FindSpawnPoint`: the origin of the first `info_player_deathmatch`.
-fn spawn_point(entities: &[u8]) -> Option<[f32; 3]> {
-    let text = String::from_utf8_lossy(entities);
-    let tokens = tokenize(&text);
-
-    let mut i = 0;
-    while i < tokens.len() {
-        if tokens[i] != "{" {
-            i += 1;
-            continue;
-        }
-        i += 1;
-
-        let mut classname = None;
-        let mut origin = None;
-        while i < tokens.len() && tokens[i] != "}" {
-            let key = tokens[i].as_str();
-            let value = tokens.get(i + 1).map(String::as_str).unwrap_or("");
-            match key {
-                "classname" => classname = Some(value),
-                "origin" => origin = parse_origin(value),
-                _ => {}
-            }
-            i += 2;
-        }
-        i += 1; // the closing brace
-
-        if classname == Some("info_player_deathmatch") {
-            if let Some(origin) = origin {
-                return Some(origin);
-            }
-        }
-    }
-    None
+/// One `info_player_deathmatch`: a spot the player may start on, and the
+/// direction the map author pointed it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpawnPoint {
+    pub origin: [f32; 3],
+    /// `angle` in degrees, growing to the left like the client's yaw. `None`
+    /// when the map leaves the direction open.
+    pub angle: Option<f32>,
 }
 
-fn parse_origin(value: &str) -> Option<[f32; 3]> {
-    let mut parts = value.split_whitespace().map(str::parse::<f32>);
-    Some([
-        parts.next()?.ok()?,
-        parts.next()?.ok()?,
-        parts.next()?.ok()?,
-    ])
+/// `G_FindSpawnPoint`: every deathmatch start the map places, in lump order.
+///
+/// A block with no `origin` is not a spot: there is nowhere to stand, and the
+/// game skips it the same way rather than dropping the player at the origin of
+/// the world.
+pub fn spawn_points(entities: &[u8]) -> Vec<SpawnPoint> {
+    entities::parse(entities)
+        .into_iter()
+        .filter(|entity| entity.classname.as_deref() == Some("info_player_deathmatch"))
+        .filter_map(|entity| {
+            Some(SpawnPoint {
+                origin: entity.origin()?,
+                angle: entity.get("angle").and_then(|value| value.parse().ok()),
+            })
+        })
+        .collect()
 }
 
-/// Splits an entity lump into braces and quoted strings, dropping `//`
-/// comments. The game's `G_ParseEntityList` reads the same text through the
-/// engine's tokenizer.
-fn tokenize(text: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut chars = text.chars().peekable();
-    while let Some(&ch) = chars.peek() {
-        if ch.is_whitespace() {
-            chars.next();
-        } else if ch == '{' || ch == '}' {
-            tokens.push(ch.to_string());
-            chars.next();
-        } else if ch == '"' {
-            chars.next();
-            let mut token = String::new();
-            for ch in chars.by_ref() {
-                if ch == '"' {
-                    break;
-                }
-                token.push(ch);
-            }
-            tokens.push(token);
-        } else {
-            let mut token = String::new();
-            while let Some(&ch) = chars.peek() {
-                if ch.is_whitespace() || ch == '"' || ch == '{' || ch == '}' {
-                    break;
-                }
-                token.push(ch);
-                chars.next();
-            }
-            if token.starts_with("//") {
-                for ch in chars.by_ref() {
-                    if ch == '\n' {
-                        break;
-                    }
-                }
-            } else {
-                tokens.push(token);
-            }
-        }
+/// `G_SelectRandomFurthestSpawnPoint` with one player on the map: there is
+/// nobody to be far from, so the choice is a random spot. A spot the map turned
+/// keeps that direction; a spot it left open gets a new one, so a respawn does
+/// not always face the same wall.
+///
+/// Returns the origin to stand on and the yaw to face.
+fn pick_spawn(spots: &[SpawnPoint]) -> Option<([f32; 3], f32)> {
+    let spot = spots.get(random_below(spots.len()))?;
+    let mut origin = spot.origin;
+    // `G_SpawnPlayer` lifts the spawn spot one unit off the floor, so the first
+    // ground trace does not start inside it.
+    origin[2] += 1.0;
+    let yaw = match spot.angle {
+        Some(angle) => angle.rem_euclid(360.0),
+        None => random_below(360) as f32,
+    };
+    Some((origin, yaw))
+}
+
+/// A number below `bound`, from a xorshift seeded with the clock. Spawning is
+/// the one place the client has to choose something, and a dependency for a
+/// single coin flip is not worth its build time.
+fn random_below(bound: usize) -> usize {
+    if bound <= 1 {
+        return 0;
     }
-    tokens
+    let clocks = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.subsec_nanos() ^ elapsed.as_secs() as u32)
+        .unwrap_or(0x9e37_79b9);
+    let mut x = clocks | 1;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    x as usize % bound
 }
 
 #[cfg(test)]
@@ -229,27 +207,65 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn the_spawn_is_the_deathmatch_point() {
-        let entities = br#"{
+    /// Two deathmatch spots with directions, plus a start with no origin and an
+    /// intermission spot the player must never appear on.
+    const MAP_ENTITIES: &[u8] = br#"{
 "classname" "worldspawn"
 "message" "test map"
+}
+{
+"classname" "info_player_deathmatch"
+"origin" "64 128 16"
+"angle" "270"
+}
+{
+"classname" "info_player_deathmatch"
+"origin" "512 -96 40"
+"angle" "45"
+}
+{
+"classname" "info_player_deathmatch"
+"angle" "180"
 }
 {
 "classname" "info_player_intermission"
 "origin" "0 0 0"
 }
-{
-"origin" "128 64 32"
-"classname" "info_player_deathmatch"
-}
 "#;
-        assert_eq!(spawn_point(entities), Some([128.0, 64.0, 32.0]));
+
+    #[test]
+    fn every_deathmatch_spot_is_a_spawn_point() {
+        let spots = spawn_points(MAP_ENTITIES);
+        assert_eq!(spots.len(), 2, "the spot with no origin is not one");
+        assert_eq!(
+            spots[0],
+            SpawnPoint {
+                origin: [64.0, 128.0, 16.0],
+                angle: Some(270.0),
+            }
+        );
+        assert_eq!(spots[1].origin, [512.0, -96.0, 40.0]);
+        assert_eq!(spots[1].angle, Some(45.0));
+    }
+
+    #[test]
+    fn a_spot_without_an_angle_leaves_the_direction_open() {
+        let spots =
+            spawn_points(b"{ \"classname\" \"info_player_deathmatch\" \"origin\" \"128 64 32\" }");
+        assert_eq!(spots.len(), 1);
+        assert_eq!(spots[0].angle, None);
     }
 
     #[test]
     fn a_map_without_a_spawn_point_has_none() {
-        assert_eq!(spawn_point(b"{ \"classname\" \"worldspawn\" }"), None);
+        assert!(spawn_points(b"{ \"classname\" \"worldspawn\" }").is_empty());
+    }
+
+    #[test]
+    fn comments_are_not_tokens() {
+        let entities =
+            b"{ // a note\n \"classname\" \"info_player_deathmatch\" \"origin\" \"1 2 3\" }";
+        assert_eq!(spawn_points(entities)[0].origin, [1.0, 2.0, 3.0]);
     }
 
     /// A one-pak mount holding a BSP with the given entity lump, removed from
@@ -275,18 +291,31 @@ mod tests {
     }
 
     fn prediction_on_a_test_map() -> Prediction {
-        let entities = b"{ \"classname\" \"worldspawn\" }\n\
-                         { \"classname\" \"info_player_deathmatch\" \"origin\" \"64 128 16\" }";
-        let assets = assets_with_map(entities);
+        let assets = assets_with_map(MAP_ENTITIES);
         Prediction::load(&assets, "q3dm1").unwrap()
     }
 
     #[test]
-    fn loading_a_map_starts_the_player_at_the_spawn() {
+    fn loading_a_map_starts_the_player_on_a_spot_it_places() {
         let prediction = prediction_on_a_test_map();
         assert_eq!(prediction.map(), "q3dm1");
-        // One unit up, the nudge `G_SpawnPlayer` gives the spot.
-        assert_eq!(prediction.origin(), [64.0, 128.0, 17.0]);
+
+        let origin = prediction.origin();
+        let spot = spawn_points(MAP_ENTITIES)
+            .into_iter()
+            .find(|spot| [spot.origin[0], spot.origin[1], spot.origin[2] + 1.0] == origin)
+            .unwrap_or_else(|| panic!("{origin:?} is not one of the map's spawns"));
+        // The map pointed this spot, so the player faces that way.
+        assert_eq!(prediction.yaw(), spot.angle.unwrap());
+    }
+
+    #[test]
+    fn a_spot_the_map_left_open_still_turns_the_player() {
+        let spot = b"{ \"classname\" \"info_player_deathmatch\" \"origin\" \"1 2 3\" }";
+        let yaws: Vec<f32> = (0..8)
+            .map(|_| pick_spawn(&spawn_points(spot)).unwrap().1)
+            .collect();
+        assert!(yaws.iter().all(|yaw| (0.0..360.0).contains(yaw)), "{yaws:?}");
     }
 
     #[test]
@@ -296,12 +325,5 @@ mod tests {
         prediction.step(100, &Input::default());
         assert!(prediction.origin()[2] < start[2], "{:?}", prediction.origin());
         assert!(!prediction.on_ground());
-    }
-
-    #[test]
-    fn comments_are_not_tokens() {
-        let entities =
-            b"{ // a note\n \"classname\" \"info_player_deathmatch\" \"origin\" \"1 2 3\" }";
-        assert_eq!(spawn_point(entities), Some([1.0, 2.0, 3.0]));
     }
 }
