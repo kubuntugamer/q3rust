@@ -294,6 +294,9 @@ pub struct Prediction {
     /// The weapon asked for, which `PM_Weapon` drops the old one and raises.
     /// It differs from the weapon in hand while a change is playing out.
     requested_weapon: i32,
+    /// The weapon held before the one in hand, so a single key can snap back
+    /// to it the way a last-weapon bind does.
+    last_weapon: i32,
     /// When the last round left, so the trigger cannot outrun the weapon.
     last_shot: i32,
     /// Every spot the map offers, kept so a respawn has one to choose.
@@ -338,6 +341,7 @@ impl Prediction {
             pitch: 0.0,
             last_time: 0,
             requested_weapon: WP_MACHINEGUN,
+            last_weapon: WP_MACHINEGUN,
             last_shot: -1000,
             spawns,
             respawn_at: 0,
@@ -425,6 +429,15 @@ impl Prediction {
         }
         self.requested_weapon = weapon;
         true
+    }
+
+    /// Snaps back to the weapon held before this one, which is what the last
+    /// weapon key is for. Does nothing when there is no such weapon.
+    pub fn switch_to_last(&mut self) -> bool {
+        if self.last_weapon == self.pm.ps.weapon {
+            return false;
+        }
+        self.select_weapon(self.last_weapon)
     }
 
     /// Steps to the next weapon the player carries, in the direction given and
@@ -664,7 +677,14 @@ impl Prediction {
             weapon: self.requested_weapon,
             ..UserCmd::default()
         };
+        let weapon_before = self.pm.ps.weapon;
         pmove(&mut self.pm);
+
+        // A change that finished this frame makes the old weapon the one a
+        // last-weapon key would bring back.
+        if self.pm.ps.weapon != weapon_before {
+            self.last_weapon = weapon_before;
+        }
 
         // The move reports what happened to the body; damage is applied where
         // the server would apply it.
@@ -757,6 +777,7 @@ impl Prediction {
         self.pm.ps.weapon = WP_MACHINEGUN;
         self.pm.ps.ground_entity_num = ENTITYNUM_NONE;
         self.requested_weapon = WP_MACHINEGUN;
+        self.last_weapon = WP_MACHINEGUN;
         self.last_shot = -1000;
         self.charge_started = None;
         self.yaw = yaw;
@@ -1020,6 +1041,31 @@ mod tests {
         }
         assert_eq!(prediction.weapon(), WP_ROCKET_LAUNCHER);
         assert_eq!(prediction.ammo(), 10);
+    }
+
+    #[test]
+    fn the_last_weapon_key_snaps_back_and_forth() {
+        let assets = assets_with_map(MAP_WITH_ROCKETS);
+        let mut prediction = Prediction::load(&assets, "q3dm1").unwrap();
+        let mut field = ItemField::new(&crate::items::item_marks(MAP_WITH_ROCKETS));
+        prediction.step(16, &Input::default());
+        prediction.collect(&mut field, 16);
+        for tick in 1..60 {
+            prediction.step(16 + tick * 20, &Input::default());
+        }
+        assert_eq!(prediction.weapon(), WP_ROCKET_LAUNCHER);
+
+        // Back to the machinegun, and then back to the launcher again.
+        assert!(prediction.switch_to_last());
+        for tick in 0..60 {
+            prediction.step(1_300 + tick * 20, &Input::default());
+        }
+        assert_eq!(prediction.weapon(), WP_MACHINEGUN);
+        assert!(prediction.switch_to_last());
+        for tick in 0..60 {
+            prediction.step(2_600 + tick * 20, &Input::default());
+        }
+        assert_eq!(prediction.weapon(), WP_ROCKET_LAUNCHER);
     }
 
     #[test]

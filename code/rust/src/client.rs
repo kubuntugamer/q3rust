@@ -1086,6 +1086,17 @@ impl Client {
                 return true;
             }
 
+            // Q snaps back to the weapon held before this one, the way a
+            // last-weapon bind does.
+            if key == Keycode::Q {
+                if !repeat {
+                    if let Some(prediction) = self.prediction.as_mut() {
+                        prediction.switch_to_last();
+                    }
+                }
+                return true;
+            }
+
             if key == Keycode::Escape && !repeat {
                 // Keys held when the console opens would otherwise stay down.
                 self.input = Input::default();
