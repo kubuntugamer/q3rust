@@ -410,6 +410,22 @@ const BOLT_RANGE: f32 = 900.0;
 const BOLT_INTERVAL: u32 = 1_400;
 const BOLT_SPEED: f32 = 700.0;
 const BOLT_DAMAGE: i32 = 7;
+/// How hard a bolt is pulled down on the way, so it lobs rather than flying
+/// flat and can drop onto someone behind a ledge.
+const BOLT_GRAVITY: f32 = 320.0;
+
+/// The velocity that sends a bolt from `from` to `to`, aimed high enough that
+/// gravity brings it down onto the point it was aimed at.
+fn bolt_aim(from: [f32; 3], to: [f32; 3]) -> [f32; 3] {
+    let distance = away(from, to).max(1.0);
+    let speed = BOLT_SPEED / distance;
+    let flight = distance / BOLT_SPEED;
+    [
+        (to[0] - from[0]) * speed,
+        (to[1] - from[1]) * speed,
+        (to[2] - from[2]) * speed + 0.5 * BOLT_GRAVITY * flight,
+    ]
+}
 
 fn away(a: [f32; 3], b: [f32; 3]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
@@ -1587,16 +1603,11 @@ impl Client {
                         a.1.partial_cmp(&b.1)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     });
-                if let Some((from, distance)) = nearest {
+                if let Some((from, _)) = nearest {
                     self.next_bolt = now + BOLT_INTERVAL;
-                    let speed = BOLT_SPEED / distance.max(1.0);
                     self.bolts.push(Bolt {
                         at: from,
-                        velocity: [
-                            (eye[0] - from[0]) * speed,
-                            (eye[1] - from[1]) * speed,
-                            (eye[2] - from[2]) * speed,
-                        ],
+                        velocity: bolt_aim(from, eye),
                         until: now + 6_000,
                     });
                 }
@@ -1607,8 +1618,14 @@ impl Client {
         let mut strikes = Vec::new();
         self.bolts.retain_mut(|bolt| {
             let before = bolt.at;
+            bolt.velocity[2] -= BOLT_GRAVITY * step;
             for axis in 0..3 {
                 bolt.at[axis] += bolt.velocity[axis] * step;
+            }
+            // A bolt that reaches the floor or a wall stops there.
+            if prediction.solid(bolt.at) {
+                strikes.push(bolt.at);
+                return false;
             }
             if away_from_line(eye, before, bolt.at) < 36.0 {
                 damage += BOLT_DAMAGE;
@@ -1982,5 +1999,50 @@ mod bolt_tests {
         let eye = [0.0, 0.0, 0.0];
         let distance = away_from_line(eye, [-50.0, 100.0, 0.0], [50.0, 100.0, 0.0]);
         assert!((distance - 100.0).abs() < 1.0e-4, "{distance}");
+    }
+}
+
+#[cfg(test)]
+mod bolt_arc_tests {
+    use super::*;
+
+    fn fly(from: [f32; 3], to: [f32; 3]) -> [f32; 3] {
+        let step = 1.0 / 60.0;
+        let mut at = from;
+        let mut velocity = bolt_aim(from, to);
+        for _ in 0..600 {
+            velocity[2] -= BOLT_GRAVITY * step;
+            for axis in 0..3 {
+                at[axis] += velocity[axis] * step;
+            }
+            if at[0] >= to[0] {
+                break;
+            }
+        }
+        at
+    }
+
+    #[test]
+    fn an_arcing_bolt_lands_where_it_was_aimed() {
+        let to = [500.0, 0.0, 40.0];
+        let landed = fly([0.0, 0.0, 24.0], to);
+        assert!(
+            (landed[2] - to[2]).abs() < 6.0,
+            "landed at {landed:?}, aimed at {to:?}"
+        );
+    }
+
+    #[test]
+    fn a_bolt_lobs_on_the_way() {
+        let from = [0.0, 0.0, 24.0];
+        let to = [500.0, 0.0, 40.0];
+        let velocity = bolt_aim(from, to);
+        // It starts going up, because gravity will bring it back down.
+        assert!(velocity[2] > 0.0, "{velocity:?}");
+        // And it is in the air for about the time the distance takes.
+        let flight = away(from, to) / BOLT_SPEED;
+        let peak = velocity[2] * velocity[2] / (2.0 * BOLT_GRAVITY);
+        assert!(peak > 4.0, "peak rise {peak}");
+        assert!(flight > 0.5 && flight < 1.0, "{flight}");
     }
 }

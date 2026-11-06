@@ -26,7 +26,7 @@ use crate::collision::Collision;
 use crate::entities;
 use crate::game::MapError;
 use crate::items::ItemField;
-use crate::pmove::MASK_PLAYERSOLID;
+use crate::pmove::{World, MASK_PLAYERSOLID};
 use crate::world::DEFAULT_VIEW_HEIGHT;
 
 /// The full deflection of a `usercmd_t` move axis: the C client's 127.
@@ -387,6 +387,12 @@ impl Prediction {
             crate::collision::CONTENTS_SOLID,
         );
         trace.fraction == 1.0
+    }
+
+    /// Whether a point is inside the map's solid geometry. A bolt asks this so
+    /// it can stop on the floor or a wall instead of passing through it.
+    pub fn solid(&self, point: [f32; 3]) -> bool {
+        self.pm.world.point_contents(point, 0) & crate::collision::CONTENTS_SOLID != 0
     }
 
     /// Rounds left in the weapon in hand.
