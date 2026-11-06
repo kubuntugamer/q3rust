@@ -18,7 +18,7 @@ use crate::assets::Assets;
 use crate::bg_misc::{self, ItemType};
 use crate::bg_pmove::{
     pmove, Pmove, UserCmd, ENTITYNUM_NONE, EV_FALL_FAR, EV_FALL_MEDIUM, STAT_ARMOR, STAT_HEALTH,
-    STAT_WEAPONS, WP_GAUNTLET, WP_GRENADE_LAUNCHER, WP_LIGHTNING, WP_MACHINEGUN, WP_PLASMAGUN, WP_RAILGUN,
+    STAT_WEAPONS, WP_BFG, WP_GAUNTLET, WP_GRENADE_LAUNCHER, WP_LIGHTNING, WP_MACHINEGUN, WP_PLASMAGUN, WP_RAILGUN,
     WP_ROCKET_LAUNCHER, WP_SHOTGUN,
 };
 use crate::bsp::Bsp;
@@ -129,7 +129,7 @@ struct Pattern {
     gravity: bool,
 }
 
-const PATTERNS: [Pattern; 8] = [
+const PATTERNS: [Pattern; 9] = [
     Pattern {
         weapon: WP_MACHINEGUN,
         interval: 100,
@@ -206,6 +206,19 @@ const PATTERNS: [Pattern; 8] = [
         radius: ROCKET_RADIUS,
         plasma: false,
         gravity: true,
+    },
+    Pattern {
+        weapon: WP_BFG,
+        interval: 2_000,
+        pellets: 1,
+        spread: 0.0,
+        splash: 0.0,
+        // Slow to fire, slow in the air, and it clears a room.
+        damage: 200,
+        speed: 400.0,
+        radius: 300.0,
+        plasma: true,
+        gravity: false,
     },
     Pattern {
         weapon: WP_GAUNTLET,
@@ -1067,6 +1080,26 @@ mod tests {
         assert!(reach <= GAUNTLET_RANGE + 0.001, "it reaches {reach}");
         assert!(prediction.fire(now + 100).is_empty(), "and swings slowly");
         assert_eq!(prediction.fire(now + 400).len(), 1);
+    }
+
+    #[test]
+    fn the_bfg_is_slow_and_wipes_a_room() {
+        let mut prediction = prediction_on_a_test_map();
+        prediction.pm.ps.stats[STAT_WEAPONS] |= 1 << WP_BFG;
+        prediction.pm.ps.ammo[WP_BFG as usize] = 2;
+        assert!(prediction.select_weapon(WP_BFG));
+        for tick in 0..40 {
+            prediction.step(1_000 + tick * 50, &Input::default());
+        }
+        assert_eq!(prediction.weapon(), WP_BFG);
+
+        let now = 1_000 + 40 * 50;
+        assert_eq!(prediction.fire(now).len(), 1);
+        assert_eq!(prediction.ammo(), 1);
+        let ball = prediction.projectiles()[0];
+        assert_eq!(ball.damage, 200);
+        assert_eq!(ball.radius, 300.0, "a blast wider than a rocket's");
+        assert!(prediction.fire(now + 500).is_empty(), "it charges slowly");
     }
 
     #[test]
