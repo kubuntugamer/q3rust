@@ -361,6 +361,10 @@ impl Prediction {
         (velocity[0] * velocity[0] + velocity[1] * velocity[1]).sqrt()
     }
 
+    pub fn velocity(&self) -> [f32; 3] {
+        self.pm.mv.velocity
+    }
+
     pub fn on_ground(&self) -> bool {
         self.pm.ps.ground_entity_num != ENTITYNUM_NONE
     }

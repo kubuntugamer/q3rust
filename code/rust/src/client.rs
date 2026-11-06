@@ -414,6 +414,21 @@ const BOLT_DAMAGE: i32 = 7;
 /// flat and can drop onto someone behind a ledge.
 const BOLT_GRAVITY: f32 = 320.0;
 
+/// How much of your movement a post allows for when it fires. A post that
+/// aimed exactly where you are would never touch a moving target; one that
+/// aimed perfectly ahead would be unbeatable, so it takes half the lead.
+const BOLT_LEAD: f32 = 0.5;
+
+/// Where a post aims to catch you: ahead of where you are, by the time the
+/// bolt takes to arrive.
+fn bolt_lead(eye: [f32; 3], velocity: [f32; 3], flight: f32) -> [f32; 3] {
+    [
+        eye[0] + velocity[0] * flight * BOLT_LEAD,
+        eye[1] + velocity[1] * flight * BOLT_LEAD,
+        eye[2] + velocity[2] * flight * BOLT_LEAD,
+    ]
+}
+
 /// How far the crosshair's arms sit from the middle: tight when you stand
 /// still, opening up as you move and wider still in the air.
 fn crosshair_gap(speed: f32, on_ground: bool) -> f32 {
@@ -1645,9 +1660,11 @@ impl Client {
                     });
                 if let Some((from, _)) = nearest {
                     self.next_bolt = now + BOLT_INTERVAL;
+                    let flight = away(from, eye) / BOLT_SPEED;
+                    let aim = bolt_lead(eye, prediction.velocity(), flight);
                     self.bolts.push(Bolt {
                         at: from,
-                        velocity: bolt_aim(from, eye),
+                        velocity: bolt_aim(from, aim),
                         until: now + 6_000,
                     });
                 }
@@ -2081,6 +2098,20 @@ mod bolt_arc_tests {
             (landed[2] - to[2]).abs() < 6.0,
             "landed at {landed:?}, aimed at {to:?}"
         );
+    }
+
+    #[test]
+    fn a_post_leads_a_moving_target_but_only_half_way() {
+        let eye = [100.0, 0.0, 24.0];
+        let running = [400.0, 0.0, 0.0];
+        let aimed = bolt_lead(eye, running, 0.5);
+        // Half a second at 400 a second is 200 units, so half is 100.
+        assert!((aimed[0] - 200.0).abs() < 0.01, "{aimed:?}");
+        // Standing still, the aim is exactly where you are.
+        assert_eq!(bolt_lead(eye, [0.0; 3], 0.5), eye);
+        // It never leads further than you could have moved.
+        let full = [eye[0] + running[0] * 0.5, eye[1], eye[2]];
+        assert!(aimed[0] < full[0]);
     }
 
     #[test]
