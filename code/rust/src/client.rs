@@ -1602,7 +1602,7 @@ impl Client {
                     audio.play_at(sound, at);
                 }
                 if let Some(field) = self.targets.as_mut() {
-                    field.blast(at, blast.radius, blast.damage);
+                    field.blast(at, blast.radius, blast.damage, now);
                 }
                 // A rocket fired into the floor hurts the one who fired it, less
                 // the further away the blast is.
@@ -1752,7 +1752,7 @@ impl Client {
                         audio.play_at(sound, shot.from);
                     }
                     if let Some(field) = self.targets.as_mut() {
-                        if let Some((at, destroyed)) = field.shoot(shot.from, shot.to, shot.damage) {
+                        if let Some((at, destroyed)) = field.shoot(shot.from, shot.to, shot.damage, now) {
                             self.sparks.push(Spark {
                                 at,
                                 half: 3.0,
@@ -1764,7 +1764,7 @@ impl Client {
                             }
                         }
                         if shot.splash > 0.0 {
-                            let down = field.blast(shot.to, shot.splash, 100);
+                            let down = field.blast(shot.to, shot.splash, 100, now);
                             if down > 0 {
                                 console::print("target down");
                             }
@@ -1775,6 +1775,10 @@ impl Client {
         }
         self.sparks.retain(|spark| spark.until > now);
         self.beams.retain(|beam| beam.until > now);
+        // A post that has been down long enough stands back up.
+        if let Some(field) = self.targets.as_mut() {
+            field.recover(now);
+        }
         self.update_bolts(now);
 
         self.renderer.vk.begin_frame([0.0, 0.0, 0.0, 1.0])?;

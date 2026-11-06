@@ -22,6 +22,8 @@ pub const TARGET_BASE: f32 = 24.0;
 pub const TARGET_HEALTH: i32 = 100;
 /// What one round takes off, so three rounds put it down.
 pub const TARGET_HIT_DAMAGE: i32 = 34;
+/// How long a post lies down before it stands back up with full health.
+pub const TARGET_RECOVERY_MS: u32 = 6_000;
 
 /// One post on the map.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -31,6 +33,9 @@ pub struct Target {
     /// Where it fell, once it has: the horizontal direction it was knocked
     /// towards. A post that has fallen is still drawn, lying on the floor.
     pub fell: Option<[f32; 3]>,
+    /// When it went down, so it can be known when to get back up. Zero while
+    /// it is standing.
+    pub fallen_at: u32,
 }
 
 impl Target {
@@ -98,6 +103,7 @@ impl TargetField {
                     origin: *origin,
                     health: TARGET_HEALTH,
                     fell: None,
+                    fallen_at: 0,
                 })
                 .collect(),
         }
@@ -122,7 +128,7 @@ impl TargetField {
     }
 
     /// Knocks a post over towards `at`, which is where it was shot from.
-    fn knock_down(&mut self, index: usize, at: [f32; 3]) {
+    fn knock_down(&mut self, index: usize, at: [f32; 3], now: u32) {
         let target = &mut self.targets[index];
         let mut fall = [target.origin[0] - at[0], target.origin[1] - at[1], 0.0];
         if fall[0] == 0.0 && fall[1] == 0.0 {
@@ -130,6 +136,27 @@ impl TargetField {
         }
         target.health = 0;
         target.fell = Some(fall);
+        target.fallen_at = now.max(1);
+    }
+
+    /// Stands every post back up whose time on the floor is done, at full
+    /// health, so a map never runs out of things to shoot. Returns how many
+    /// got up.
+    pub fn recover(&mut self, now: u32) -> usize {
+        let mut up = 0;
+        for target in &mut self.targets {
+            if target.fallen_at == 0 {
+                continue;
+            }
+            if now.wrapping_sub(target.fallen_at) < TARGET_RECOVERY_MS {
+                continue;
+            }
+            target.health = TARGET_HEALTH;
+            target.fell = None;
+            target.fallen_at = 0;
+            up += 1;
+        }
+        up
     }
 
     /// Fires a shot segment at the posts. Returns the nearest hit's point and
@@ -139,6 +166,7 @@ impl TargetField {
         from: [f32; 3],
         to: [f32; 3],
         damage: i32,
+        now: u32,
     ) -> Option<([f32; 3], bool)> {
         let mut best: Option<(f32, usize, [f32; 3])> = None;
         for (index, target) in self.targets.iter().enumerate() {
@@ -167,7 +195,7 @@ impl TargetField {
                 from[1] + (to[1] - from[1]) * fraction,
                 from[2] + (to[2] - from[2]) * fraction,
             ];
-            self.knock_down(index, from);
+            self.knock_down(index, from, now);
         }
         Some((at, down))
     }
@@ -175,7 +203,7 @@ impl TargetField {
     /// A rocket's blast: every standing post within `radius` of `at` loses
     /// `damage`, which is what makes a rocket worth aiming at the floor near
     /// a post. Returns how many posts went down.
-    pub fn blast(&mut self, at: [f32; 3], radius: f32, damage: i32) -> usize {
+    pub fn blast(&mut self, at: [f32; 3], radius: f32, damage: i32, now: u32) -> usize {
         let mut down = 0;
         for index in 0..self.targets.len() {
             let target = self.targets[index];
@@ -209,6 +237,7 @@ impl TargetField {
                 }
                 self.targets[index].health = 0;
                 self.targets[index].fell = Some(fall);
+                self.targets[index].fallen_at = now.max(1);
                 down += 1;
             }
         }
@@ -287,20 +316,20 @@ mod tests {
 
         let from = [0.0, 0.0, 40.0];
         let to = [600.0, 0.0, 40.0];
-        let (at, destroyed) = field.shoot(from, to, TARGET_HIT_DAMAGE).expect("the post is in the way");
+        let (at, destroyed) = field.shoot(from, to, TARGET_HIT_DAMAGE, 0).expect("the post is in the way");
         assert!(destroyed == false);
         assert!((at[0] - 240.0).abs() < 0.001, "{at:?}");
         assert_eq!(field.alive(), 2, "one hit does not kill it");
 
-        field.shoot(from, to, TARGET_HIT_DAMAGE);
-        let (_, destroyed) = field.shoot(from, to, TARGET_HIT_DAMAGE).expect("still standing");
+        field.shoot(from, to, TARGET_HIT_DAMAGE, 0);
+        let (_, destroyed) = field.shoot(from, to, TARGET_HIT_DAMAGE, 0).expect("still standing");
         assert!(destroyed, "the third hit puts it down");
         assert_eq!(field.alive(), 1);
 
         // A downed post is no longer a target, but it is still there, lying
         // on the floor along the line it was shot from.
         assert!(
-            field.shoot(from, to, TARGET_HIT_DAMAGE).is_none(),
+            field.shoot(from, to, TARGET_HIT_DAMAGE, 0).is_none(),
             "the far post is behind this one"
         );
         assert!(field.targets()[0].fallen());
@@ -324,9 +353,9 @@ mod tests {
     #[test]
     fn one_rail_slug_is_enough_and_a_pellet_is_not() {
         let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
-        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 12);
+        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 12, 0);
         assert_eq!(field.alive(), 1, "a pellet does not put a post down");
-        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 100);
+        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 100, 0);
         assert_eq!(field.alive(), 0, "a slug does");
     }
 
@@ -334,11 +363,11 @@ mod tests {
     fn a_rocket_near_a_post_takes_it_down() {
         let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
         // Just outside its box, so the blast is what does the work.
-        assert_eq!(field.blast([0.0, 60.0, 32.0], 120.0, 100), 1);
+        assert_eq!(field.blast([0.0, 60.0, 32.0], 120.0, 100, 0), 1);
         assert_eq!(field.alive(), 0);
 
         let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
-        assert_eq!(field.blast([0.0, 400.0, 32.0], 120.0, 100), 0, "out of range");
+        assert_eq!(field.blast([0.0, 400.0, 32.0], 120.0, 100, 0), 0, "out of range");
         assert_eq!(field.alive(), 1);
     }
 
@@ -348,12 +377,12 @@ mod tests {
         // Upwards past the side of the post, and across in front of it.
         assert!(
             field
-                .shoot([0.0, 100.0, 40.0], [0.0, 100.0, 800.0], 34)
+                .shoot([0.0, 100.0, 40.0], [0.0, 100.0, 800.0], 34, 0)
                 .is_none()
         );
         assert!(
             field
-                .shoot([0.0, -100.0, 40.0], [600.0, -100.0, 40.0], 34)
+                .shoot([0.0, -100.0, 40.0], [600.0, -100.0, 40.0], 34, 0)
                 .is_none()
         );
         assert_eq!(field.alive(), 1);
@@ -363,12 +392,32 @@ mod tests {
     fn a_post_dims_as_it_is_shot() {
         let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
         let fresh = field.targets()[0].color();
-        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 34);
-        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 34);
+        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 34, 0);
+        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 34, 0);
         let hurt = field.targets()[0].color();
         assert_ne!(fresh, hurt, "a hurt post reads differently");
-        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 34);
+        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 34, 0);
         assert_ne!(hurt, field.targets()[0].color(), "a fallen post is bare");
         assert_eq!(field.vertices().len(), 36, "and still drawn");
+    }
+
+    #[test]
+    fn a_post_gets_back_up_after_its_time_on_the_floor() {
+        let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
+        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 200, 500);
+        assert_eq!(field.alive(), 0, "one slug is enough");
+
+        // A moment before its time is up it is still down.
+        assert_eq!(field.recover(500 + TARGET_RECOVERY_MS - 1), 0);
+        assert_eq!(field.alive(), 0);
+
+        assert_eq!(field.recover(500 + TARGET_RECOVERY_MS), 1);
+        assert_eq!(field.alive(), 1);
+        assert_eq!(field.targets()[0].health, TARGET_HEALTH);
+        assert!(!field.targets()[0].fallen());
+        // Back on its feet, it can be shot again.
+        assert!(field
+            .shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 34, 20_000)
+            .is_some());
     }
 }
