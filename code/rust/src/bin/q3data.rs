@@ -6,7 +6,9 @@
 use std::process::ExitCode;
 
 use q3rust::assets::Assets;
+use q3rust::bg_misc::{self, BG_NUM_ITEMS};
 use q3rust::bsp::Bsp;
+use q3rust::model::Md3Model;
 use q3rust::world::{self, MapAudit};
 
 fn main() -> ExitCode {
@@ -103,11 +105,66 @@ fn main() -> ExitCode {
         totals.nodraw, totals.patch_failed, totals.empty, totals.out_of_range, failed
     );
 
+    // The pickups' own models: the client draws these in place of the marker
+    // boxes, so each one has to parse and every surface has to find its art.
+    let mut parsed = 0usize;
+    let mut without_texture = 0usize;
+    let mut broken = 0usize;
+    for index in 1..BG_NUM_ITEMS {
+        let Some(path) = bg_misc::world_model(index) else {
+            continue;
+        };
+        let Some(bytes) = assets.read(path) else {
+            eprintln!("{path}: not in any pak");
+            broken += 1;
+            continue;
+        };
+        match Md3Model::load(&bytes) {
+            Ok(model) => {
+                parsed += 1;
+                for surface in &model.surfaces {
+                    for shader in &surface.shaders {
+                        if !texture_present(&assets, &shader.name) {
+                            eprintln!("{path}: texture {} is missing", shader.name);
+                            without_texture += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("{path}: {e:?}");
+                broken += 1;
+            }
+        }
+    }
+    println!(
+        "item models: {parser} of {count} models parse, {without_texture} surfaces without a texture, {broken} broken",
+        parser = parsed,
+        count = BG_NUM_ITEMS - 1,
+    );
+
     if failed == 0 {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Whether a shader name resolves to an image, with the `.tga`→`.jpg` fallback
+/// the renderer uses: this installation ships some of those as JPEGs.
+fn texture_present(assets: &Assets, name: &str) -> bool {
+    if assets.read(name).is_some() {
+        return true;
+    }
+    if name.to_ascii_lowercase().ends_with(".tga") {
+        let mut jpeg = name.to_string();
+        jpeg.replace_range(name.len() - 3.., "jpg");
+        if assets.read(&jpeg).is_some() {
+            return true;
+        }
+    }
+    assets.read(&format!("{name}.tga")).is_some() || assets.read(&format!("{name}.jpg")).is_some()
 }
 
 /// The skip counts behind a map's numbers, as one parenthesised tail.

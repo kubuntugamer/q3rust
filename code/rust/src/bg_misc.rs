@@ -139,6 +139,63 @@ pub static BG_ITEMLIST: [Item; 36] = [
 /// `bg_numItems`, including the empty row at index 0.
 pub const BG_NUM_ITEMS: usize = BG_ITEMLIST.len();
 
+/// The `world_model` column of `bg_itemlist`, in the same order. The table in
+/// `bg_misc.c` writes the models as a per-lod array; the first entry is the one
+/// `G_SpawnItem` uses, so the rest are not ported.
+pub static WORLD_MODELS: [&str; 36] = [
+    "",
+    // ARMOR
+    "models/powerups/armor/shard.md3",
+    "models/powerups/armor/armor_yel.md3",
+    "models/powerups/armor/armor_red.md3",
+    // HEALTH
+    "models/powerups/health/small_cross.md3",
+    "models/powerups/health/medium_cross.md3",
+    "models/powerups/health/large_cross.md3",
+    "models/powerups/health/mega_cross.md3",
+    // WEAPONS
+    "models/weapons2/gauntlet/gauntlet.md3",
+    "models/weapons2/shotgun/shotgun.md3",
+    "models/weapons2/machinegun/machinegun.md3",
+    "models/weapons2/grenadel/grenadel.md3",
+    "models/weapons2/rocketl/rocketl.md3",
+    "models/weapons2/lightning/lightning.md3",
+    "models/weapons2/railgun/railgun.md3",
+    "models/weapons2/plasma/plasma.md3",
+    "models/weapons2/bfg/bfg.md3",
+    "models/weapons2/grapple/grapple.md3",
+    // AMMO
+    "models/powerups/ammo/shotgunam.md3",
+    "models/powerups/ammo/machinegunam.md3",
+    "models/powerups/ammo/grenadeam.md3",
+    "models/powerups/ammo/plasmaam.md3",
+    "models/powerups/ammo/lightningam.md3",
+    "models/powerups/ammo/rocketam.md3",
+    "models/powerups/ammo/railgunam.md3",
+    "models/powerups/ammo/bfgam.md3",
+    // HOLDABLES
+    "models/powerups/holdable/teleporter.md3",
+    "models/powerups/holdable/medkit.md3",
+    // POWERUPS
+    "models/powerups/instant/quad.md3",
+    "models/powerups/instant/enviro.md3",
+    "models/powerups/instant/haste.md3",
+    "models/powerups/instant/invis.md3",
+    "models/powerups/instant/regen.md3",
+    "models/powerups/instant/flight.md3",
+    // TEAM
+    "models/flags/r_flag.md3",
+    "models/flags/b_flag.md3",
+];
+
+/// The model a pickup puts on the map, by its `bg_itemlist` row.
+pub fn world_model(index: usize) -> Option<&'static str> {
+    WORLD_MODELS
+        .get(index)
+        .copied()
+        .filter(|path| !path.is_empty())
+}
+
 /// `bg_itemlist[i]`, or `None` for an index past the table. The C would read
 /// past the array here; a bad stat from the network should not do that.
 pub fn item(index: i32) -> Option<&'static Item> {
@@ -195,5 +252,17 @@ mod tests {
     fn an_index_past_the_table_has_no_tag() {
         assert_eq!(tag_of(-1), HI_NONE);
         assert_eq!(tag_of(BG_NUM_ITEMS as i32), HI_NONE);
+    }
+
+    #[test]
+    fn every_real_item_has_a_model_and_the_empty_row_does_not() {
+        assert_eq!(WORLD_MODELS.len(), BG_NUM_ITEMS);
+        assert_eq!(world_model(0), None);
+        for index in 1..BG_NUM_ITEMS {
+            let path = world_model(index).unwrap_or_else(|| panic!("{index} has no model"));
+            assert!(path.ends_with(".md3"), "{path} is not a model");
+        }
+        assert_eq!(world_model(12), Some("models/weapons2/rocketl/rocketl.md3"));
+        assert_eq!(world_model(BG_NUM_ITEMS), None);
     }
 }

@@ -15,8 +15,10 @@
 use std::collections::HashMap;
 
 use crate::assets::Assets;
+use crate::bg_misc;
 use crate::bsp::{Bsp, BspFace, DrawVert, LIGHTMAP_SIZE, SURFACE_PATCH};
 use crate::items::{self, ItemMark};
+use crate::model::Md3Model;
 use crate::shader::{
     Parser, ShaderScript, ShaderStage, ShaderTextIndex, TexMod, TextureMap, GLS_DSTBLEND_ONE,
     GLS_SRCBLEND_ONE,
@@ -228,6 +230,24 @@ pub struct Batch {
     pub stages: Vec<Stage>,
 }
 
+/// One surface of a pickup's model: the texture it names and its triangles in
+/// model space, so an item only needs its origin moved to be drawn.
+pub struct ItemSurface {
+    /// Index into [`World::textures`].
+    pub texture: usize,
+    pub vertices: Vec<Vertex3D>,
+    /// True when the surface has no art and its vertex colour is the item's
+    /// own colour instead: the lit path takes the colour as the tint.
+    pub lit: bool,
+}
+
+/// A pickup's own md3 model, as the paks hold it.
+pub struct ItemModel {
+    /// The `bg_itemlist` row this model is for.
+    pub item_index: usize,
+    pub surfaces: Vec<ItemSurface>,
+}
+
 /// The map's static geometry, uploaded once.
 pub struct World {
     /// Triangle-list vertexes; every batch indexes a range of this.
@@ -236,6 +256,8 @@ pub struct World {
     /// The pickups the map places, at the origins it gave them. The client
     /// keeps the live copy in an [`crate::items::ItemField`].
     pub items: Vec<ItemMark>,
+    /// The model each kind of pickup on this map draws with.
+    pub item_models: Vec<ItemModel>,
     /// The map's skybox, when its sky shader names one.
     pub sky: Option<Sky>,
     textures: Vec<(String, Texture)>,
@@ -346,6 +368,7 @@ impl World {
             vertices: Vec::new(),
             batches: Vec::new(),
             items: Vec::new(),
+            item_models: Vec::new(),
             sky: None,
             textures: Vec::new(),
             faces: faces.len(),
@@ -413,8 +436,10 @@ impl World {
             });
         }
 
-        // The pickups, read from the same entity lump `audit_bsp` counts.
+        // The pickups, read from the same entity lump `audit_bsp` counts, and
+        // the models they draw with.
         world.items = items::item_marks(bsp.entities());
+        world.item_models = load_item_models(vk, assets, &world.items, &mut world.textures)?;
 
         world.sky = sky_name
             .as_deref()
@@ -441,6 +466,123 @@ impl World {
             sky.shutdown(vk);
         }
     }
+}
+
+/// Loads the model for every kind of pickup this map places, once per kind.
+///
+/// The triangles go in model space, so drawing an item is only a matter of
+/// moving the matrix: a map with a hundred pickups still shares thirty-odd
+/// models. A model whose file or texture is missing is left out rather than
+/// guessed at.
+fn load_item_models(
+    vk: &mut Vulkan,
+    assets: &Assets,
+    marks: &[ItemMark],
+    textures: &mut Vec<(String, Texture)>,
+) -> Result<Vec<ItemModel>, String> {
+    let mut indexes: Vec<usize> = marks.iter().map(|mark| mark.item_index).collect();
+    indexes.sort_unstable();
+    indexes.dedup();
+
+    let mut models = Vec::new();
+    for item_index in indexes {
+        let Some(path) = bg_misc::world_model(item_index) else {
+            continue;
+        };
+        let Some(bytes) = assets.read(path) else {
+            continue;
+        };
+        let Ok(model) = Md3Model::load(&bytes) else {
+            continue;
+        };
+
+        // The item's own colour, used for any surface whose art is missing, so
+        // a pickup is never invisible.
+        let color = marks
+            .iter()
+            .find(|mark| mark.item_index == item_index)
+            .map(|mark| mark.color)
+            .unwrap_or([255, 255, 255, 255]);
+
+        let mut surfaces = Vec::new();
+        for surface in &model.surfaces {
+            let Some(shader) = surface.shaders.first() else {
+                continue;
+            };
+            let loaded = match textures.iter().position(|(name, _)| name == &shader.name) {
+                Some(at) => Some(at),
+                None => match load_texture(vk, assets, &shader.name) {
+                    Ok(texture) => {
+                        textures.push((shader.name.clone(), texture));
+                        Some(textures.len() - 1)
+                    }
+                    Err(_) => None,
+                },
+            };
+            let (texture, lit) = match loaded {
+                Some(at) => (at, false),
+                None => (flat_texture(vk, textures)?, true),
+            };
+
+            // Frame 0 is the pose a pickup is drawn in; the stock item models
+            // are single-frame, so there is nothing to animate yet.
+            let mesh = surface.lerp_vertices(0, 0, 0.0);
+            let mut vertices = Vec::with_capacity(surface.triangles.len() * 3);
+            for triangle in &surface.triangles {
+                for &index in triangle {
+                    let Some(vertex) = mesh.get(index as usize) else {
+                        continue;
+                    };
+                    vertices.push(Vertex3D {
+                        pos: vertex.position,
+                        uv: vertex.tex_coords,
+                        color: if lit { color } else { [255, 255, 255, 255] },
+                    });
+                }
+            }
+            if !vertices.is_empty() {
+                surfaces.push(ItemSurface {
+                    texture,
+                    vertices,
+                    lit,
+                });
+            }
+        }
+
+        if !surfaces.is_empty() {
+            models.push(ItemModel {
+                item_index,
+                surfaces,
+            });
+        }
+    }
+    Ok(models)
+}
+
+/// A 1×1 white image, shared by every surface whose art is missing.
+fn flat_texture(vk: &mut Vulkan, textures: &mut Vec<(String, Texture)>) -> Result<usize, String> {
+    const NAME: &str = "items:flat";
+    if let Some(at) = textures.iter().position(|(name, _)| name == NAME) {
+        return Ok(at);
+    }
+    let texture = vk.create_texture(1, 1, &[255, 255, 255, 255])?;
+    textures.push((NAME.to_string(), texture));
+    Ok(textures.len() - 1)
+}
+
+/// The camera matrix with a model's world origin folded in, so one static set
+/// of triangles can be drawn anywhere without copying it.
+///
+/// The matrix is column-major: the translation column picks up the model's
+/// origin through the rotation part, exactly as multiplying the matrices would.
+pub fn translate(mvp: &[f32; 16], origin: [f32; 3]) -> [f32; 16] {
+    let mut moved = *mvp;
+    for row in 0..4 {
+        moved[12 + row] += mvp[row] * origin[0]
+            + mvp[4 + row] * origin[1]
+            + mvp[8 + row] * origin[2];
+    }
+    moved
 }
 
 /// How far the skybox sits from the camera. It has to stay inside
@@ -746,9 +888,17 @@ fn load_texture(vk: &mut Vulkan, assets: &Assets, name: &str) -> Result<Texture,
     if name.is_empty() {
         return Err("shader has no name".into());
     }
-    let mut candidates = Vec::with_capacity(3);
+    let mut candidates = Vec::with_capacity(4);
     if name.contains('.') {
         candidates.push(name.to_string());
+        // Some installations ship a shader's `.tga` as a `.jpg` beside it, and
+        // the model files name the `.tga`: `R_LoadImage` falls back the same
+        // way for the console's art.
+        if name.to_ascii_lowercase().ends_with(".tga") {
+            let mut jpeg = name.to_string();
+            jpeg.replace_range(name.len() - 3.., "jpg");
+            candidates.push(jpeg);
+        }
     }
     for extension in ["tga", "jpg"] {
         candidates.push(format!("{name}.{extension}"));

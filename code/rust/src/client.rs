@@ -535,12 +535,13 @@ impl Client {
             match World::build(&mut renderer.vk, assets, bytes) {
                 Ok(built) => {
                     println!(
-                        "world: {} surfaces, {} triangles, {} textures, {} shaders without art, {} items",
+                        "world: {} surfaces, {} triangles, {} textures, {} shaders without art, {} items, {} item models",
                         built.drawn,
                         built.vertices.len() / 3,
                         built.textures().len(),
                         built.missing.len(),
-                        built.items.len()
+                        built.items.len(),
+                        built.item_models.len()
                     );
                     world = Some(built);
                 }
@@ -898,20 +899,48 @@ impl Client {
             }
         }
 
-        // The pickups still on the map: a box each, coloured by kind. The
-        // colour rides in the vertex colour, which is the lit path's tint, and
-        // the white texture leaves it alone.
+        // The pickups still on the map, as the models the paks hold. Each one
+        // reuses its kind's triangles, moved to the origin the map gave it.
+        // If a map's models all failed to load, the coloured marker boxes
+        // stand in rather than the items vanishing.
+        let now = self.millis();
         if let Some(field) = self.items.as_ref() {
-            let vertices = field.vertices();
-            if !vertices.is_empty() {
-                self.renderer.vk.draw_stage(
-                    &self.renderer.white,
-                    vertices,
-                    &mvp,
-                    [1.0, 1.0, 0.0, 0.0],
-                    BlendMode::Opaque,
-                    true,
-                )?;
+            if world.item_models.is_empty() {
+                if !field.vertices().is_empty() {
+                    self.renderer.vk.draw_stage(
+                        &self.renderer.white,
+                        field.vertices(),
+                        &mvp,
+                        [1.0, 1.0, 0.0, 0.0],
+                        BlendMode::Opaque,
+                        true,
+                    )?;
+                }
+            } else {
+                for item in field.items() {
+                    if !item.available(now) {
+                        continue;
+                    }
+                    let Some(model) = world
+                        .item_models
+                        .iter()
+                        .find(|model| model.item_index == item.item_index)
+                    else {
+                        continue;
+                    };
+                    let placed = world::translate(&mvp, item.origin);
+                    for surface in &model.surfaces {
+                        let (_, texture) = &world.textures()[surface.texture];
+                        self.renderer.vk.draw_stage(
+                            texture,
+                            &surface.vertices,
+                            &placed,
+                            [1.0, 1.0, 0.0, 0.0],
+                            BlendMode::Opaque,
+                            surface.lit,
+                        )?;
+                    }
+                }
             }
         }
         Ok(())
