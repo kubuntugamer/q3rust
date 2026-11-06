@@ -445,8 +445,9 @@ impl WindUp {
 /// How long the red wash of a fresh hit lasts, in milliseconds.
 const HURT_FLASH_MS: u32 = 250;
 
-/// How many posts may have a shot lined up at once. Two is enough to catch you
-/// whichever way you step; more than that is a wall of bolts, not a fight.
+/// How many posts may have a shot lined up at once, and only from different
+/// sides of you. Two is enough to catch you whichever way you step; more than
+/// that is a wall of bolts, not a fight.
 const MAX_FIRING_POSTS: usize = 2;
 
 /// How close a post has to be to shoot, how often it fires, how fast its bolt
@@ -657,10 +658,31 @@ fn lead_for(slot: usize) -> f32 {
     }
 }
 
+/// Whether two posts, seen from `eye`, stand far enough apart to catch you
+/// between them: a cos of the angle between them below this is roughly fifty
+/// degrees or more. Two posts nearly in line are just two bolts from the same
+/// side, which one step still escapes.
+const VOLLEY_SPREAD_COS: f32 = 0.64;
+
+/// Whether the posts at `a` and `b` bracket `eye`, so that stepping away from
+/// one walks towards the other.
+fn brackets(eye: [f32; 3], a: [f32; 3], b: [f32; 3]) -> bool {
+    let to_a = [a[0] - eye[0], a[1] - eye[1]];
+    let to_b = [b[0] - eye[0], b[1] - eye[1]];
+    let len_a = (to_a[0] * to_a[0] + to_a[1] * to_a[1]).sqrt();
+    let len_b = (to_b[0] * to_b[0] + to_b[1] * to_b[1]).sqrt();
+    if len_a < 1.0 || len_b < 1.0 {
+        return false;
+    }
+    let cos = (to_a[0] * to_b[0] + to_a[1] * to_b[1]) / (len_a * len_b);
+    cos <= VOLLEY_SPREAD_COS
+}
+
 /// Which posts should line up a shot right now, nearest first: those still
-/// standing, with a clear line to `eye`, in range, and not already lining one
-/// up. Up to `limit` of them may fire together, so two posts with you in the
-/// open between them can catch you whichever way you step.
+/// standing, with a clear line to `eye`, in range, on a side of you nothing
+/// already lined up is on, and not already lining one up. Up to `limit` of them
+/// may fire together, so two posts with you in the open between them can catch
+/// you whichever way you step.
 fn volley_candidates(
     field: &TargetField,
     eye: [f32; 3],
@@ -686,13 +708,29 @@ fn volley_candidates(
         })
         .map(|(index, target)| (index, target.origin, away(target.origin, eye)))
         .filter(|(_, _, distance)| *distance < BOLT_RANGE)
-        .collect();
-    found.sort_by(|a, b| {
+        .collect();    found.sort_by(|a, b| {
         a.2.partial_cmp(&b.2)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    found.truncate(limit);
-    found
+
+    // Take them nearest first, but only while each new post stands on a
+    // different side of you from everything already lined up, so a volley is a
+    // bracket and not two bolts from the same direction.
+    let mut chosen: Vec<(usize, [f32; 3], f32)> = Vec::new();
+    for candidate in found {
+        if chosen.len() >= limit {
+            break;
+        }
+        let spread = chosen
+            .iter()
+            .map(|(_, from, _)| *from)
+            .chain(already.iter().map(|wind| wind.from))
+            .all(|from| brackets(eye, from, candidate.1));
+        if spread {
+            chosen.push(candidate);
+        }
+    }
+    chosen
 }
 
 /// Where a post lies relative to where you face, in degrees: zero dead ahead,
@@ -2997,11 +3035,12 @@ mod bolt_arc_tests {
     #[test]
     fn posts_in_the_open_on_both_sides_line_up_together() {
         assert_eq!(MAX_FIRING_POSTS, 2, "a fight, not a wall of bolts");
-        let field = TargetField::new(&[[100.0, 0.0, 0.0], [300.0, 0.0, 0.0], [900.0, 0.0, 0.0]]);
+        // One ahead and one to the side, plus a third on the first post's side.
+        let field = TargetField::new(&[[100.0, 0.0, 0.0], [0.0, 150.0, 0.0], [900.0, 0.0, 0.0]]);
         let chosen = volley_candidates(&field, [0.0; 3], &[], MAX_FIRING_POSTS, |_, _| true);
-        assert_eq!(chosen.len(), 2, "the two nearest, and no more");
+        assert_eq!(chosen.len(), 2, "the two nearest that bracket you");
         assert_eq!(chosen[0].0, 0, "nearest first, so it fires first");
-        assert_eq!(chosen[1].0, 1);
+        assert_eq!(chosen[1].0, 1, "from a different side");
         assert!((chosen[0].2 - 100.0).abs() < 0.01);
         assert_eq!(lead_for(0), BOLT_LEAD, "the first post leads the shot");
         assert_eq!(lead_for(1), 0.0, "the second aims where you stand");
@@ -3009,10 +3048,10 @@ mod bolt_arc_tests {
 
     #[test]
     fn a_post_behind_a_wall_or_already_firing_is_left_out() {
-        let field = TargetField::new(&[[100.0, 0.0, 0.0], [150.0, 0.0, 0.0]]);
+        let field = TargetField::new(&[[100.0, 0.0, 0.0], [0.0, 150.0, 0.0]]);
         // The second post is behind something as far as this test is concerned.
         let blocked = volley_candidates(&field, [0.0; 3], &[], MAX_FIRING_POSTS, |chest, _| {
-            chest[0] < 120.0
+            chest[0] > 50.0
         });
         assert_eq!(blocked.len(), 1);
         assert_eq!(blocked[0].0, 0);
@@ -3032,6 +3071,26 @@ mod bolt_arc_tests {
             volley_candidates(&field, [0.0; 3], &busy, 0, |_, _| true).is_empty(),
             "no room means no volley"
         );
+    }
+
+    #[test]
+    fn two_posts_in_a_line_only_get_one_shot_between_them() {
+        // Both straight ahead: one step sideways still leaves both bolts behind,
+        // so there is nothing to bracket and only the near post fires.
+        let field = TargetField::new(&[[100.0, 0.0, 0.0], [300.0, 0.0, 0.0], [900.0, 0.0, 0.0]]);
+        let chosen = volley_candidates(&field, [0.0; 3], &[], MAX_FIRING_POSTS, |_, _| true);
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].0, 0);
+
+        let eye = [0.0, 0.0, 0.0];
+        assert!(!brackets(eye, [100.0, 0.0, 0.0], [300.0, 0.0, 0.0]), "in line");
+        assert!(brackets(eye, [100.0, 0.0, 0.0], [0.0, 150.0, 0.0]), "at right angles");
+        assert!(brackets(eye, [100.0, 0.0, 0.0], [-100.0, 0.0, 0.0]), "opposite sides");
+        assert!(
+            !brackets(eye, [100.0, 0.0, 0.0], [200.0, 90.0, 0.0]),
+            "barely twenty degrees apart"
+        );
+        assert!(!brackets(eye, eye, [100.0, 0.0, 0.0]), "a post on top of you brackets nothing");
     }
 
     #[test]
