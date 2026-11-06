@@ -1199,6 +1199,11 @@ impl Client {
                 }
             }
         }
+        // The ear is where the camera is, so sounds can fall off with distance.
+        if let (Some(audio), Some(prediction)) = (self.audio.as_ref(), self.prediction.as_ref()) {
+            audio.set_listener(prediction.origin());
+        }
+
         // Bring back what has waited long enough, then take what the player is
         // standing in.
         if let (Some(prediction), Some(field)) = (self.prediction.as_mut(), self.items.as_mut()) {
@@ -1209,7 +1214,7 @@ impl Client {
                     if let Some(sound) = items::pickup_sound(class_name)
                         .and_then(|path| self.pickup_sounds.get(path))
                     {
-                        audio.play(Arc::clone(sound));
+                        audio.play_at(Arc::clone(sound), prediction.origin());
                     }
                 }
             }
@@ -1242,7 +1247,7 @@ impl Client {
                         if !self.sounds.is_empty() {
                             let sound = Arc::clone(&self.sounds[self.next_sound % self.sounds.len()]);
                             self.next_sound += 1;
-                            audio.play(sound);
+                            audio.play_at(sound, shot.from);
                         }
                     }
                 }
