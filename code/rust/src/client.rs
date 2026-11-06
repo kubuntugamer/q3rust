@@ -420,6 +420,8 @@ pub struct Client {
     shotgun_sound: Option<Arc<Vec<f32>>>,
     rocket_sound: Option<Arc<Vec<f32>>>,
     explosion_sound: Option<Arc<Vec<f32>>>,
+    /// The BFG's hum, played once when a charge starts.
+    charge_sound: Option<Arc<Vec<f32>>>,
     /// The pickup sounds, by the path the item table names.
     pickup_sounds: std::collections::HashMap<&'static str, Arc<Vec<f32>>>,
     /// Which of those the next shot uses, so repeated fire varies.
@@ -545,6 +547,7 @@ impl Client {
         let mut shotgun_sound: Option<Arc<Vec<f32>>> = None;
         let mut rocket_sound: Option<Arc<Vec<f32>>> = None;
         let mut explosion_sound: Option<Arc<Vec<f32>>> = None;
+        let mut charge_sound: Option<Arc<Vec<f32>>> = None;
         let mut pickup_sounds = std::collections::HashMap::new();
         if let Some(assets) = assets.as_ref() {
             let load = |path: &str| -> Option<Arc<Vec<f32>>> {
@@ -567,6 +570,7 @@ impl Client {
             shotgun_sound = load("sound/weapons/shotgun/sshotf1b.wav");
             rocket_sound = load("sound/weapons/rocket/rocklf1a.wav");
             explosion_sound = load("sound/weapons/rocket/rocklx1a.wav");
+            charge_sound = load("sound/weapons/bfg/bfg_hum.wav");
             // The pickup sounds: every path the item table can name, loaded
             // once and looked up when something is taken.
             for path in [
@@ -756,6 +760,7 @@ impl Client {
             shotgun_sound,
             rocket_sound,
             explosion_sound,
+            charge_sound,
             pickup_sounds,
             next_sound: 0,
             input: Input::default(),
@@ -1372,7 +1377,18 @@ impl Client {
         // The trigger. A hit leaves a brief mark where the bullet stopped.
         if self.input.attack {
             if let Some(prediction) = self.prediction.as_mut() {
-                for shot in prediction.fire(now) {
+                // A charge starting is the only warning the BFG gives before
+                // it lets go, so the hum marks the moment the trigger holds.
+                let charging_before = prediction.charge(now);
+                let shots = prediction.fire(now);
+                if charging_before == 0.0 && prediction.charge(now) > 0.0 {
+                    if let (Some(sound), Some(audio)) =
+                        (self.charge_sound.clone(), self.audio.as_ref())
+                    {
+                        audio.play_at(sound, prediction.origin());
+                    }
+                }
+                for shot in shots {
                     // The flash sits just past the muzzle, along the shot.
                     let forward = shot.forward();
                     self.sparks.push(Spark {
