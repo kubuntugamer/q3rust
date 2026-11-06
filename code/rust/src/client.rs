@@ -709,6 +709,17 @@ fn lead_for(slot: usize) -> f32 {
     }
 }
 
+/// Hands the leader's place to the post that was firing second once the leader
+/// has been shot down: the shorter warning it was given was paid for by a
+/// second bolt that is no longer coming, so it now warns for the time a lone
+/// post would and leads your run. Counted from when it started lining up, so
+/// its glow keeps filling instead of starting over.
+fn take_the_lead(wind: &mut WindUp, eye: [f32; 3]) {
+    let distance = away(wind.from, eye);
+    wind.lead = BOLT_LEAD;
+    wind.fires_at = wind.started_at + telegraph_for(distance);
+}
+
 /// Whether two posts, seen from `eye`, stand far enough apart to catch you
 /// between them: a cos of the angle between them below this is roughly fifty
 /// degrees or more. Two posts nearly in line are just two bolts from the same
@@ -2270,7 +2281,10 @@ impl Client {
         // Any post that has finished lining up takes its shot.
         let lining_up = std::mem::take(&mut self.wind_ups);
         let mut still_lining_up = Vec::with_capacity(lining_up.len());
-        for wind in lining_up {
+        // Set when the post leading a volley goes down before it fires, so the
+        // post that was firing with it is left shooting alone.
+        let mut leader_fell = false;
+        for (slot, wind) in lining_up.into_iter().enumerate() {
             let alive = self
                 .targets
                 .as_ref()
@@ -2279,7 +2293,11 @@ impl Client {
             match shot_state(&wind, alive, now) {
                 // Still lining up: keep the glow going.
                 Shot::Wait => still_lining_up.push(wind),
-                Shot::Drop => {}
+                Shot::Drop => {
+                    if slot == 0 {
+                        leader_fell = true;
+                    }
+                }
                 Shot::Fire => {
                     let flight = away(wind.from, eye) / BOLT_SPEED;
                     let aim = bolt_lead(eye, prediction.velocity(), flight, wind.lead);
@@ -2290,6 +2308,14 @@ impl Client {
                         grazed: false,
                     });
                 }
+            }
+        }
+        // With the leader gone, whatever was firing second is the whole shot
+        // now, so it stops aiming where you stand and takes a lone post's
+        // warning rather than a pair's.
+        if leader_fell {
+            for wind in still_lining_up.iter_mut().filter(|wind| wind.lead == 0.0) {
+                take_the_lead(wind, eye);
             }
         }
         self.wind_ups = still_lining_up;
@@ -3132,6 +3158,37 @@ mod bolt_arc_tests {
         };
         let half = chirp.len() / 2;
         assert!(crossings(&chirp[half..]) > crossings(&chirp[..half]));
+    }
+
+    #[test]
+    fn the_post_left_alone_by_a_fallen_leader_takes_the_full_warning() {
+        let eye = [0.0, 0.0, 24.0];
+        let from = [300.0, 0.0, 24.0];
+        let short = telegraph_for_slot(away(from, eye), 1);
+        let mut wind = WindUp {
+            index: 1,
+            from,
+            started_at: 1_000,
+            fires_at: 1_000 + short,
+            lead: 0.0,
+        };
+        assert_eq!(wind.progress(1_000 + short), 1.0, "it was about to fire");
+
+        take_the_lead(&mut wind, eye);
+        assert_eq!(wind.lead, BOLT_LEAD, "the lone shot now leads the run");
+        assert_eq!(
+            wind.fires_at,
+            1_000 + telegraph_for(away(from, eye)),
+            "and warns for the time a lone post would"
+        );
+        assert!(
+            wind.fires_at > 1_000 + short,
+            "the pair's short warning is given back"
+        );
+        assert!(
+            wind.progress(1_000 + short) < 1.0,
+            "the glow keeps filling instead of starting over"
+        );
     }
 
     #[test]
