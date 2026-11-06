@@ -542,8 +542,10 @@ pub struct Client {
     hurt_until: u32,
     /// When the hit marker on the crosshair should have faded out.
     hit_until: u32,
-    /// How many practice posts have been put on the floor this session.
+    /// How many practice posts have been put on the floor this life.
     posts_down: u32,
+    /// Whether the player was dead last frame, so a respawn can be noticed.
+    was_dead: bool,
     /// The pickup sounds, by the path the item table names.
     pickup_sounds: std::collections::HashMap<&'static str, Arc<Vec<f32>>>,
     /// Which of those the next shot uses, so repeated fire varies.
@@ -929,6 +931,7 @@ impl Client {
             hurt_until: 0,
             hit_until: 0,
             posts_down: 0,
+            was_dead: false,
             pickup_sounds,
             next_sound: 0,
             input: Input::default(),
@@ -1750,6 +1753,15 @@ impl Client {
             if prediction.health() < health_before {
                 self.hurt_until = now + HURT_FLASH_MS;
             }
+            // A new life starts clean: the tally goes back to zero, bolts fired
+            // at where you fell are gone, and the posts give you a moment.
+            let dead_now = prediction.dead();
+            if self.was_dead && !dead_now {
+                self.posts_down = 0;
+                self.bolts.clear();
+                self.next_bolt = now + 1_000;
+            }
+            self.was_dead = dead_now;
             // Say so when a change finishes, so the keys are not silent.
             if prediction.weapon() != before {
                 if let Some(name) = bg_misc::class_of_weapon(prediction.weapon()) {
