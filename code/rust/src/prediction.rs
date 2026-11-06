@@ -17,7 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::assets::Assets;
 use crate::bg_misc::{self, ItemType};
 use crate::bg_pmove::{
-    pmove, Pmove, UserCmd, ENTITYNUM_NONE, STAT_ARMOR, STAT_HEALTH, STAT_WEAPONS, WP_MACHINEGUN,
+    pmove, Pmove, UserCmd, ENTITYNUM_NONE, EV_FALL_FAR, EV_FALL_MEDIUM, STAT_ARMOR, STAT_HEALTH,
+    STAT_WEAPONS, WP_MACHINEGUN,
 };
 use crate::bsp::Bsp;
 use crate::collision::Collision;
@@ -38,6 +39,9 @@ const STARTING_AMMO: i32 = 50;
 const FIRE_TIME: i32 = 100;
 /// `MAX_SHOT_RANGE`: a shot that hits nothing travels this far.
 const SHOT_RANGE: f32 = 8192.0;
+/// What `ClientEvents` takes off for a hard landing, and for a medium one.
+const FALL_DAMAGE_FAR: i32 = 10;
+const FALL_DAMAGE_MEDIUM: i32 = 5;
 
 /// One round leaving the weapon: where it started, where it stopped, and
 /// whether it stopped on something.
@@ -299,6 +303,35 @@ impl Prediction {
             ..UserCmd::default()
         };
         pmove(&mut self.pm);
+
+        // The move reports what happened to the body; damage is applied where
+        // the server would apply it.
+        let events = std::mem::take(&mut self.pm.ps.events);
+        self.apply_events(&events);
+    }
+
+    /// The events the move raised. Only landings hurt so far: nothing on the
+    /// map can shoot back yet.
+    pub fn apply_events(&mut self, events: &[i32]) {
+        for event in events {
+            match *event {
+                EV_FALL_FAR => {
+                    self.hurt(FALL_DAMAGE_FAR);
+                }
+                EV_FALL_MEDIUM => {
+                    self.hurt(FALL_DAMAGE_MEDIUM);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Takes `amount` off the health, never below zero, and returns what is
+    /// left. A dead player is reported, not yet respawned.
+    pub fn hurt(&mut self, amount: i32) -> i32 {
+        let health = (self.pm.ps.stats[STAT_HEALTH] - amount).max(0);
+        self.pm.ps.stats[STAT_HEALTH] = health;
+        health
     }
 }
 
@@ -593,6 +626,33 @@ mod tests {
         }
         assert_eq!(prediction.ammo(), 0);
         assert!(prediction.fire((now + 500) as u32).is_none());
+    }
+
+    #[test]
+    fn a_hard_landing_hurts_and_health_stops_at_zero() {
+        let mut prediction = prediction_on_a_test_map();
+        assert_eq!(prediction.health(), 100);
+
+        prediction.apply_events(&[EV_FALL_MEDIUM]);
+        assert_eq!(prediction.health(), 100 - FALL_DAMAGE_MEDIUM);
+
+        prediction.apply_events(&[EV_FALL_FAR]);
+        assert_eq!(
+            prediction.health(),
+            100 - FALL_DAMAGE_MEDIUM - FALL_DAMAGE_FAR
+        );
+
+        // A small fall raises `EV_FALL_SHORT`, which costs nothing.
+        prediction.apply_events(&[crate::bg_pmove::EV_FALL_SHORT]);
+        assert_eq!(
+            prediction.health(),
+            100 - FALL_DAMAGE_MEDIUM - FALL_DAMAGE_FAR
+        );
+
+        for _ in 0..20 {
+            prediction.hurt(FALL_DAMAGE_FAR);
+        }
+        assert_eq!(prediction.health(), 0, "health never falls below zero");
     }
 
     #[test]
