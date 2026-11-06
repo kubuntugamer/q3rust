@@ -452,6 +452,18 @@ const BOLT_DAMAGE: i32 = 7;
 const BOLT_GRAVITY: f32 = 320.0;
 /// How long a post that has just stood back up takes to aim again.
 const RECOVERY_GRACE_MS: u32 = 700;
+/// The quiet a respawn buys: for this long no post can even line a shot up, so
+/// coming back never means being hit before you can move.
+const SPAWN_GRACE_MS: u32 = 1_000;
+
+/// The shield note in the status line with `left_ms` of grace to run, or none
+/// once it has run out.
+fn shield_note(left_ms: u32) -> Option<String> {
+    (left_ms > 0).then(|| {
+        let seconds = left_ms.min(SPAWN_GRACE_MS) as f32 / SPAWN_GRACE_MS as f32;
+        format!("   SHIELD {seconds:.1}")
+    })
+}
 
 /// How long a post spends lining up before its bolt leaves, so a shot can be
 /// seen coming and stepped out of rather than appearing with no warning. This
@@ -766,6 +778,9 @@ pub struct Client {
     hurt_until: u32,
     /// When the hit marker on the crosshair should have faded out.
     hit_until: u32,
+    /// When the quiet a respawn buys runs out, so the status line can say it is
+    /// on.
+    spawn_grace_until: u32,
     /// When the short bar saying "you stepped out of that" should have gone,
     /// and how much of a full push the dodge was worth.
     dodge_until: u32,
@@ -1161,6 +1176,7 @@ impl Client {
             kick_until: 0,
             hurt_until: 0,
             hit_until: 0,
+            spawn_grace_until: 0,
             dodge_until: 0,
             dodge_strength: 1.0,
             posts_down: 0,
@@ -1797,11 +1813,16 @@ impl Client {
         let weapon = bg_misc::class_of_weapon(prediction.weapon())
             .map(|name| name.trim_start_matches("weapon_"))
             .unwrap_or("none");
-        let status = format!(
+        let mut status = format!(
             "HEALTH {health}   ARMOR {armor}   DOWN {}",
             self.posts_down
         );
         let now = self.millis();
+        // The shield a respawn buys says so while it lasts, so the quiet is
+        // explained rather than looking like the posts missed their chance.
+        if let Some(note) = shield_note(self.spawn_grace_until.saturating_sub(now)) {
+            status.push_str(&note);
+        }
         let [x, y, z] = prediction.origin();
         let line = format!(
             "{x:.0} {y:.0} {z:.0}   {:.0} u/s   {}",
@@ -2201,7 +2222,8 @@ impl Client {
                 self.bolts.clear();
                 self.wind_up = None;
                 self.bolt_call = None;
-                self.next_bolt = now + 1_000;
+                self.next_bolt = now + SPAWN_GRACE_MS;
+                self.spawn_grace_until = now + SPAWN_GRACE_MS;
                 // The fight starts over: a post put down again in the new life
                 // lies there the plain six seconds, not the longer time it
                 // earned before.
@@ -2676,6 +2698,18 @@ mod bolt_arc_tests {
             dodge_bar_width(DODGE_FLASH_MS * 2, 1.0),
             DODGE_FLASH_WIDTH,
             "a stale clock never makes it wider than it starts"
+        );
+    }
+
+    #[test]
+    fn the_status_line_shows_the_shield_a_respawn_buys() {
+        assert_eq!(shield_note(0), None, "no shield once it has run out");
+        assert_eq!(shield_note(SPAWN_GRACE_MS).as_deref(), Some("   SHIELD 1.0"));
+        assert_eq!(shield_note(SPAWN_GRACE_MS / 2).as_deref(), Some("   SHIELD 0.5"));
+        assert_eq!(
+            shield_note(SPAWN_GRACE_MS * 3).as_deref(),
+            Some("   SHIELD 1.0"),
+            "it never reads past the grace it gives"
         );
     }
 
