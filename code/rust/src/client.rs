@@ -34,7 +34,7 @@ use crate::console;
 use crate::cvar::{Cvars, CVAR_ARCHIVE};
 use crate::font::Face;
 use crate::items::{self, ItemField};
-use crate::prediction::{Input, Prediction};
+use crate::prediction::{Input, Prediction, DODGE_PUSH_FAR, DODGE_PUSH_NEAR};
 use crate::targets::TargetField;
 use crate::texture;
 use crate::vk::{BlendMode, Texture, Vertex2D, Vulkan};
@@ -537,6 +537,14 @@ const BOLT_GRAZE_RADIUS: f32 = 90.0;
 /// than into you: near enough to be a dodge, not close enough to hurt.
 fn near_miss(distance: f32) -> bool {
     distance > BOLT_HIT_RADIUS && distance < BOLT_GRAZE_RADIUS
+}
+
+/// What a dodge at `distance` is worth: full pay for a bolt that nearly
+/// clipped you, tapering to the least for one that went past with room.
+fn dodge_push(distance: f32) -> f32 {
+    let span = BOLT_GRAZE_RADIUS - BOLT_HIT_RADIUS;
+    let closeness = ((BOLT_GRAZE_RADIUS - distance) / span).clamp(0.0, 1.0);
+    DODGE_PUSH_FAR + (DODGE_PUSH_NEAR - DODGE_PUSH_FAR) * closeness
 }
 
 /// How long a post takes when you are right on top of it. Standing close enough
@@ -2087,7 +2095,8 @@ impl Client {
 
         let mut damage = 0;
         let mut strikes = Vec::new();
-        let mut dodged = false;
+        // How close the nearest bolt of this frame came as it went past.
+        let mut dodged: Option<f32> = None;
         self.bolts.retain_mut(|bolt| {
             let before = bolt.at;
             bolt.velocity[2] -= BOLT_GRAVITY * step;
@@ -2106,15 +2115,18 @@ impl Client {
             }
             // A shot that goes past close enough to feel is worth a little
             // speed, so stepping out of one is paid back.
-            if !bolt.grazed && near_miss(away(bolt.at, eye)) {
+            let distance = away(bolt.at, eye);
+            if !bolt.grazed && near_miss(distance) {
                 bolt.grazed = true;
-                dodged = true;
+                dodged = Some(dodged.map_or(distance, |best: f32| best.min(distance)));
             }
             bolt.until > now
         });
-        if dodged && prediction.health() > 0 {
-            prediction.dodge();
-            self.dodge_until = now + DODGE_FLASH_MS;
+        if let Some(distance) = dodged {
+            if prediction.health() > 0 {
+                prediction.dodge(dodge_push(distance));
+                self.dodge_until = now + DODGE_FLASH_MS;
+            }
         }
         // A fading trail behind each bolt, so an incoming shot can be tracked
         // and stepped out of.
@@ -2662,6 +2674,20 @@ mod bolt_arc_tests {
         let fading = notice_alpha(NOTICE_MS / 6);
         assert!(fading < 255 && fading > 0, "{fading}");
         assert_eq!(notice_alpha(0), 0, "gone by the time it runs out");
+    }
+
+    #[test]
+    fn a_closer_bolt_pays_more_for_the_dodge() {
+        let near = dodge_push(BOLT_HIT_RADIUS + 0.01);
+        let middle = dodge_push((BOLT_HIT_RADIUS + BOLT_GRAZE_RADIUS) * 0.5);
+        let far = dodge_push(BOLT_GRAZE_RADIUS - 0.01);
+        assert!((near - DODGE_PUSH_NEAR).abs() < 0.1, "{near}");
+        assert!((far - DODGE_PUSH_FAR).abs() < 0.1, "{far}");
+        assert!(near > middle && middle > far, "{near} {middle} {far}");
+
+        // Whatever happens with the clock, the pay stays inside the range.
+        assert_eq!(dodge_push(0.0), DODGE_PUSH_NEAR);
+        assert_eq!(dodge_push(1_000.0), DODGE_PUSH_FAR);
     }
 
     #[test]
