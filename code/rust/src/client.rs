@@ -414,6 +414,14 @@ const BOLT_DAMAGE: i32 = 7;
 /// flat and can drop onto someone behind a ledge.
 const BOLT_GRAVITY: f32 = 320.0;
 
+/// How far the crosshair's arms sit from the middle: tight when you stand
+/// still, opening up as you move and wider still in the air.
+fn crosshair_gap(speed: f32, on_ground: bool) -> f32 {
+    let moving = (speed / 40.0).min(8.0);
+    let air = if on_ground { 0.0 } else { 5.0 };
+    3.0 + moving + air
+}
+
 /// The velocity that sends a bolt from `from` to `to`, aimed high enough that
 /// gravity brings it down onto the point it was aimed at.
 fn bolt_aim(from: [f32; 3], to: [f32; 3]) -> [f32; 3] {
@@ -1508,7 +1516,11 @@ impl Client {
         // because the cgame that would draw one is not in this tree.
         let mid_x = width as f32 * 0.5;
         let mid_y = height as f32 * 0.5;
-        let (gap, length) = (3.0, 7.0);
+        let gap = match self.prediction.as_ref() {
+            Some(prediction) => crosshair_gap(prediction.speed(), prediction.on_ground()),
+            None => crosshair_gap(0.0, true),
+        };
+        let length = 7.0;
         for (x, y, w, h) in [
             (mid_x - gap - length, mid_y - 1.0, length, 2.0),
             (mid_x + gap, mid_y - 1.0, length, 2.0),
@@ -2069,6 +2081,19 @@ mod bolt_arc_tests {
             (landed[2] - to[2]).abs() < 6.0,
             "landed at {landed:?}, aimed at {to:?}"
         );
+    }
+
+    #[test]
+    fn the_crosshair_opens_up_as_you_move_and_widens_in_the_air() {
+        let still = crosshair_gap(0.0, true);
+        let walking = crosshair_gap(200.0, true);
+        let running = crosshair_gap(400.0, true);
+        let jumping = crosshair_gap(400.0, false);
+        assert_eq!(still, 3.0);
+        assert!(walking > still && running > walking, "{walking} {running}");
+        assert!(jumping > running, "{jumping} {running}");
+        // Even at full sprint it stays small enough to aim with.
+        assert!(running < 12.0, "{running}");
     }
 
     #[test]
