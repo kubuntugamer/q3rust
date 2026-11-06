@@ -249,6 +249,9 @@ impl TargetField {
         self.targets.iter().filter(|target| !target.alive()).count()
     }
 
+    /// Splashes damage over every post within `radius` of `at`, by distance
+    /// only: like the player's own splash this ignores walls, so a rocket that
+    /// bursts on the far side of one still catches whoever is hugging it.
     pub fn blast(&mut self, at: [f32; 3], radius: f32, damage: i32, now: u32) -> usize {
         let mut down = 0;
         for index in 0..self.targets.len() {
