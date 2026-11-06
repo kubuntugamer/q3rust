@@ -86,7 +86,7 @@ pub struct Projectile {
     /// Blue for plasma, warm for a rocket.
     pub plasma: bool,
     /// Whether the round falls as it flies, the way a grenade does.
-    gravity: bool,
+    pub gravity: bool,
 }
 
 /// Where a projectile went off, and what it does there.

@@ -258,6 +258,9 @@ pub struct World {
     pub items: Vec<ItemMark>,
     /// The model each kind of pickup on this map draws with.
     pub item_models: Vec<ItemModel>,
+    /// The grenade mesh a thrown grenade draws with, when the paks hold one.
+    /// The other projectiles have no mesh of their own.
+    pub grenade: Option<Vec<ItemSurface>>,
     /// The map's skybox, when its sky shader names one.
     pub sky: Option<Sky>,
     textures: Vec<(String, Texture)>,
@@ -369,6 +372,7 @@ impl World {
             batches: Vec::new(),
             items: Vec::new(),
             item_models: Vec::new(),
+            grenade: None,
             sky: None,
             textures: Vec::new(),
             faces: faces.len(),
@@ -440,6 +444,16 @@ impl World {
         // the models they draw with.
         world.items = items::item_marks(bsp.entities());
         world.item_models = load_item_models(vk, assets, &world.items, &mut world.textures)?;
+        // A thrown grenade has a mesh in the paks: the ammo pickup is the
+        // grenade itself, so a lobbed one can be drawn as the same thing.
+        let grenade = load_surfaces(
+            vk,
+            assets,
+            "models/ammo/grenade1.md3",
+            [255, 255, 255, 255],
+            &mut world.textures,
+        );
+        world.grenade = grenade;
 
         world.sky = sky_name
             .as_deref()
@@ -489,13 +503,6 @@ fn load_item_models(
         let Some(path) = bg_misc::world_model(item_index) else {
             continue;
         };
-        let Some(bytes) = assets.read(path) else {
-            continue;
-        };
-        let Ok(model) = Md3Model::load(&bytes) else {
-            continue;
-        };
-
         // The item's own colour, used for any surface whose art is missing, so
         // a pickup is never invisible.
         let color = marks
@@ -504,8 +511,31 @@ fn load_item_models(
             .map(|mark| mark.color)
             .unwrap_or([255, 255, 255, 255]);
 
-        let mut surfaces = Vec::new();
-        for surface in &model.surfaces {
+        let Some(surfaces) = load_surfaces(vk, assets, path, color, textures) else {
+            continue;
+        };
+        models.push(ItemModel {
+            item_index,
+            surfaces,
+        });
+    }
+    Ok(models)
+}
+
+/// Loads one md3 into triangles in model space, or nothing when the file or its
+/// art is missing.
+fn load_surfaces(
+    vk: &mut Vulkan,
+    assets: &Assets,
+    path: &str,
+    color: [u8; 4],
+    textures: &mut Vec<(String, Texture)>,
+) -> Option<Vec<ItemSurface>> {
+    let bytes = assets.read(path)?;
+    let model = Md3Model::load(&bytes).ok()?;
+
+    let mut surfaces = Vec::new();
+    for surface in &model.surfaces {
             let Some(shader) = surface.shaders.first() else {
                 continue;
             };
@@ -521,7 +551,7 @@ fn load_item_models(
             };
             let (texture, lit) = match loaded {
                 Some(at) => (at, false),
-                None => (flat_texture(vk, textures)?, true),
+                None => (flat_texture(vk, textures).ok()?, true),
             };
 
             // Frame 0 is the pose a pickup is drawn in; the stock item models
@@ -549,14 +579,11 @@ fn load_item_models(
             }
         }
 
-        if !surfaces.is_empty() {
-            models.push(ItemModel {
-                item_index,
-                surfaces,
-            });
-        }
+    if surfaces.is_empty() {
+        None
+    } else {
+        Some(surfaces)
     }
-    Ok(models)
 }
 
 /// A 1×1 white image, shared by every surface whose art is missing.

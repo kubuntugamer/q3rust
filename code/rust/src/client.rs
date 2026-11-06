@@ -411,9 +411,9 @@ pub struct Client {
     sparks: Vec<Spark>,
     /// The practice posts built from the map's own markers.
     targets: Option<TargetField>,
-    /// Where the rounds in the air are and whether they are plasma, copied
-    /// from the move each frame.
-    rockets: Vec<([f32; 3], bool)>,
+    /// Where the rounds in the air are, whether they are plasma, and whether
+    /// they arc, copied from the move each frame.
+    rockets: Vec<([f32; 3], bool, bool)>,
     /// The machinegun's shot sounds, decoded once and shared per shot.
     sounds: Vec<Arc<Vec<f32>>>,
     /// The shotgun's break, the rocket's launch, and what it leaves behind.
@@ -1064,10 +1064,30 @@ impl Client {
             }
         }
 
-        // The rockets in the air, small bright boxes on their way.
+        // The rounds in the air. A lobbed grenade has a mesh in the paks, so it
+        // is drawn as the grenade it is and tumbles as it flies; the rest have
+        // no mesh and stay small bright boxes on their way.
         if !self.rockets.is_empty() {
             let mut flying = Vec::new();
-            for (at, plasma) in &self.rockets {
+            let spin = self.millis() as f32 * 0.4;
+            for (at, plasma, arcs) in &self.rockets {
+                if *arcs {
+                    if let Some(mesh) = world.grenade.as_ref() {
+                        let placed = world::place(&mvp, *at, spin);
+                        for surface in mesh {
+                            let (_, texture) = &world.textures()[surface.texture];
+                            self.renderer.vk.draw_stage(
+                                texture,
+                                &surface.vertices,
+                                &placed,
+                                [1.0, 1.0, 0.0, 0.0],
+                                BlendMode::Opaque,
+                                surface.lit,
+                            )?;
+                        }
+                        continue;
+                    }
+                }
                 let color = if *plasma {
                     [150, 200, 255, 255]
                 } else {
@@ -1277,7 +1297,7 @@ impl Client {
             self.rockets = prediction
                 .projectiles()
                 .iter()
-                .map(|shot| (shot.origin, shot.plasma))
+                .map(|shot| (shot.origin, shot.plasma, shot.gravity))
                 .collect();
             for blast in prediction.take_blasts() {
                 let at = blast.at;
@@ -1316,7 +1336,7 @@ impl Client {
                 }
             }
             // A short-lived spark at each rocket leaves a trail behind it.
-            for (at, plasma) in self.rockets.clone() {
+            for (at, plasma, _) in self.rockets.clone() {
                 self.sparks.push(Spark {
                     at,
                     half: 2.5,
