@@ -51,6 +51,8 @@ const ROCKET_SPEED: f32 = 900.0;
 const GRAVITY: f32 = 800.0;
 /// How much of its speed a bouncing grenade keeps.
 const BOUNCE: f32 = 0.6;
+/// How long the BFG has to be held before it lets go.
+const BFG_CHARGE_MS: i32 = 1_200;
 /// A plasma ball is quicker and shorter-lived than a rocket.
 const PLASMA_SPEED: f32 = 2_000.0;
 /// How long a projectile lives before it goes off in the air.
@@ -298,6 +300,8 @@ pub struct Prediction {
     spawns: Vec<SpawnPoint>,
     /// When the body comes back, or 0 while the player is alive.
     respawn_at: u32,
+    /// When the BFG's trigger went down, while it is charging.
+    charge_started: Option<i32>,
     /// Projectiles in the air, and where the ones that went off did so.
     projectiles: Vec<Projectile>,
     blasts: Vec<Blast>,
@@ -337,6 +341,7 @@ impl Prediction {
             last_shot: -1000,
             spawns,
             respawn_at: 0,
+            charge_started: None,
             projectiles: Vec::new(),
             blasts: Vec::new(),
         })
@@ -413,6 +418,22 @@ impl Prediction {
         let now = now as i32;
         if now - self.last_shot < pattern.interval {
             return Vec::new();
+        }
+
+        // The BFG has to be held down: the first press starts the charge and
+        // only a full one lets the ball go.
+        if pattern.weapon == WP_BFG {
+            match self.charge_started {
+                None => {
+                    self.charge_started = Some(now);
+                    return Vec::new();
+                }
+                Some(start) if now - start < BFG_CHARGE_MS => return Vec::new(),
+                Some(_) => self.charge_started = None,
+            }
+        } else if self.charge_started.is_some() {
+            // Letting go of the charge by changing weapon drops it.
+            self.charge_started = None;
         }
         let slot = pattern.weapon as usize;
         // The gauntlet is free to swing: it has no cells or shells to spend.
@@ -649,6 +670,14 @@ impl Prediction {
         self.projectiles = in_flight;
     }
 
+    /// How far a held charge has got, from nothing to ready.
+    pub fn charge(&self, now: u32) -> f32 {
+        match self.charge_started {
+            Some(start) => ((now as i32 - start) as f32 / BFG_CHARGE_MS as f32).clamp(0.0, 1.0),
+            None => 0.0,
+        }
+    }
+
     /// The projectiles still in the air, for drawing.
     pub fn projectiles(&self) -> &[Projectile] {
         &self.projectiles
@@ -674,6 +703,7 @@ impl Prediction {
         self.pm.ps.ground_entity_num = ENTITYNUM_NONE;
         self.requested_weapon = WP_MACHINEGUN;
         self.last_shot = -1000;
+        self.charge_started = None;
         self.yaw = yaw;
         self.pitch = 0.0;
         self.respawn_at = 0;
@@ -1083,6 +1113,32 @@ mod tests {
     }
 
     #[test]
+    fn the_bfg_has_to_be_held_before_it_fires() {
+        let mut prediction = prediction_on_a_test_map();
+        prediction.pm.ps.stats[STAT_WEAPONS] |= 1 << WP_BFG;
+        prediction.pm.ps.ammo[WP_BFG as usize] = 2;
+        assert!(prediction.select_weapon(WP_BFG));
+        for tick in 0..40 {
+            prediction.step(1_000 + tick * 50, &Input::default());
+        }
+        let now = 1_000 + 40 * 50;
+
+        // The first press starts a charge and nothing leaves.
+        assert!(prediction.fire(now).is_empty());
+        assert!(prediction.charge(now) < 0.05);
+        assert_eq!(prediction.ammo(), 2, "nothing spent yet");
+
+        // Half a charge is still not a shot.
+        assert!(prediction.fire(now + 600).is_empty());
+        assert!(prediction.charge(now + 600) > 0.4);
+
+        // Held for the full time, it lets go.
+        assert_eq!(prediction.fire(now + BFG_CHARGE_MS as u32).len(), 1);
+        assert_eq!(prediction.ammo(), 1);
+        assert_eq!(prediction.charge(now + 1_200), 0.0, "the charge is spent");
+    }
+
+    #[test]
     fn the_bfg_is_slow_and_wipes_a_room() {
         let mut prediction = prediction_on_a_test_map();
         prediction.pm.ps.stats[STAT_WEAPONS] |= 1 << WP_BFG;
@@ -1094,12 +1150,17 @@ mod tests {
         assert_eq!(prediction.weapon(), WP_BFG);
 
         let now = 1_000 + 40 * 50;
-        assert_eq!(prediction.fire(now).len(), 1);
+        // Two presses: one starts the charge, the next lets it go once full.
+        assert!(prediction.fire(now).is_empty());
+        assert_eq!(prediction.fire(now + BFG_CHARGE_MS as u32).len(), 1);
         assert_eq!(prediction.ammo(), 1);
         let ball = prediction.projectiles()[0];
         assert_eq!(ball.damage, 200);
         assert_eq!(ball.radius, 300.0, "a blast wider than a rocket's");
-        assert!(prediction.fire(now + 500).is_empty(), "it charges slowly");
+        assert!(
+            prediction.fire(now + 1_400).is_empty(),
+            "the next shot has to charge too"
+        );
     }
 
     #[test]
