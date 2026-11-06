@@ -411,6 +411,9 @@ struct Bolt {
     at: [f32; 3],
     velocity: [f32; 3],
     until: u32,
+    /// Set once the bolt has come near enough to be stepped out of, so one
+    /// graze is rewarded once and not once a frame on the way past.
+    grazed: bool,
 }
 
 /// A post that is lining up a shot: which post it is, where the bolt will leave
@@ -467,6 +470,17 @@ fn worth_saying(last: Option<(usize, u32)>, index: usize, now: u32) -> bool {
         Some((who, at)) if who == index => now.saturating_sub(at) >= BOLT_CALL_REPEAT_MS,
         _ => true,
     }
+}
+
+/// How close a bolt has to pass to count as a hit, and how close it has to
+/// pass to count as a shot stepped out of.
+const BOLT_HIT_RADIUS: f32 = 36.0;
+const BOLT_GRAZE_RADIUS: f32 = 90.0;
+
+/// Whether a bolt that came within `distance` of your head went past rather
+/// than into you: near enough to be a dodge, not close enough to hurt.
+fn near_miss(distance: f32) -> bool {
+    distance > BOLT_HIT_RADIUS && distance < BOLT_GRAZE_RADIUS
 }
 
 /// How long a post takes when you are right on top of it. Standing close enough
@@ -1924,6 +1938,7 @@ impl Client {
                         at: wind.from,
                         velocity: bolt_aim(wind.from, aim),
                         until: now + 6_000,
+                        grazed: false,
                     });
                 }
             } else {
@@ -1981,6 +1996,7 @@ impl Client {
 
         let mut damage = 0;
         let mut strikes = Vec::new();
+        let mut dodged = false;
         self.bolts.retain_mut(|bolt| {
             let before = bolt.at;
             bolt.velocity[2] -= BOLT_GRAVITY * step;
@@ -1992,13 +2008,22 @@ impl Client {
                 strikes.push(bolt.at);
                 return false;
             }
-            if away_from_line(eye, before, bolt.at) < 36.0 {
+            if away_from_line(eye, before, bolt.at) < BOLT_HIT_RADIUS {
                 damage += BOLT_DAMAGE;
                 strikes.push(bolt.at);
                 return false;
             }
+            // A shot that goes past close enough to feel is worth a little
+            // speed, so stepping out of one is paid back.
+            if !bolt.grazed && near_miss(away(bolt.at, eye)) {
+                bolt.grazed = true;
+                dodged = true;
+            }
             bolt.until > now
         });
+        if dodged && prediction.health() > 0 {
+            prediction.dodge();
+        }
         // A fading trail behind each bolt, so an incoming shot can be tracked
         // and stepped out of.
         for at in self.bolts.iter().map(|bolt| bolt.at) {
@@ -2473,6 +2498,15 @@ mod bolt_arc_tests {
         assert!(bearing(eye, 90.0, [0.0, 100.0, 24.0]).abs() < 0.01);
         // And it wraps rather than jumping at north.
         assert!(bearing(eye, 350.0, [100.0, 20.0, 24.0]) > 0.0);
+    }
+
+    #[test]
+    fn a_bolt_that_just_misses_counts_as_a_dodge() {
+        assert!(!near_miss(0.0), "inside you is a hit, not a dodge");
+        assert!(!near_miss(BOLT_HIT_RADIUS), "a graze on the hit edge");
+        assert!(near_miss(70.0), "past your shoulder counts");
+        assert!(!near_miss(BOLT_GRAZE_RADIUS), "a wide shot is no dodge");
+        assert!(!near_miss(400.0));
     }
 
     #[test]

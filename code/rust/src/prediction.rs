@@ -62,6 +62,11 @@ pub const ROCKET_RADIUS: f32 = 120.0;
 /// A plasma ball bursts in a smaller radius.
 pub const PLASMA_RADIUS: f32 = 60.0;
 
+/// How much speed a bolt stepped out of adds to the way you are already moving.
+/// Ground friction pulls the body back to its normal running speed before long,
+/// so this is a step rather than a free sprint.
+const DODGE_PUSH: f32 = 200.0;
+
 /// Reflects a velocity off a surface and keeps `keep` of its speed, which is
 /// how a grenade skips along a wall or the floor.
 pub fn bounce_off(velocity: [f32; 3], normal: [f32; 3], keep: f32) -> [f32; 3] {
@@ -367,6 +372,19 @@ impl Prediction {
 
     pub fn velocity(&self) -> [f32; 3] {
         self.pm.mv.velocity
+    }
+
+    /// Adds a step of speed for a bolt that just went past, in the direction
+    /// the body is already running. Standing still there is nothing to reward,
+    /// so a dodge has to be a move and not a flick of the mouse.
+    pub fn dodge(&mut self) {
+        let speed = self.speed();
+        if speed < 1.0 {
+            return;
+        }
+        let velocity = self.pm.mv.velocity;
+        self.pm.mv.velocity[0] += velocity[0] / speed * DODGE_PUSH;
+        self.pm.mv.velocity[1] += velocity[1] / speed * DODGE_PUSH;
     }
 
     pub fn on_ground(&self) -> bool {
@@ -995,6 +1013,31 @@ mod tests {
             .unwrap_or_else(|| panic!("{origin:?} is not one of the map's spawns"));
         // The map pointed this spot, so the player faces that way.
         assert_eq!(prediction.yaw(), spot.angle.unwrap());
+    }
+
+    #[test]
+    fn a_bolt_stepped_out_of_is_worth_a_step_of_speed() {
+        let mut prediction = prediction_on_a_test_map();
+        // Standing still, there is nothing to pay back.
+        prediction.dodge();
+        assert_eq!(prediction.speed(), 0.0);
+
+        prediction.pm.mv.velocity = [200.0, 0.0, 0.0];
+        prediction.dodge();
+        let velocity = prediction.velocity();
+        assert!(
+            (velocity[0] - (200.0 + DODGE_PUSH)).abs() < 0.01,
+            "{velocity:?}"
+        );
+        assert_eq!(velocity[1], 0.0, "and no shove sideways");
+
+        // On a diagonal it keeps the line you picked, and stays on the floor.
+        prediction.pm.mv.velocity = [100.0, 100.0, 0.0];
+        prediction.dodge();
+        let velocity = prediction.velocity();
+        assert!((velocity[0] - velocity[1]).abs() < 0.01, "{velocity:?}");
+        assert!(velocity[0] > 100.0, "{velocity:?}");
+        assert_eq!(velocity[2], 0.0, "a dodge is not a jump");
     }
 
     #[test]
