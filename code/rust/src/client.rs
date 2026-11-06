@@ -393,6 +393,48 @@ struct Beam {
     until: u32,
 }
 
+/// A practice post's shot: a slow bolt that flies where you were when it was
+/// fired. Nothing about it follows you.
+struct Bolt {
+    at: [f32; 3],
+    velocity: [f32; 3],
+    until: u32,
+}
+
+/// How close a post has to be to shoot, how often it fires, how fast its bolt
+/// flies, and what it takes off you when it lands.
+const BOLT_RANGE: f32 = 900.0;
+const BOLT_INTERVAL: u32 = 1_400;
+const BOLT_SPEED: f32 = 700.0;
+const BOLT_DAMAGE: i32 = 7;
+
+fn away(a: [f32; 3], b: [f32; 3]) -> f32 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+}
+
+/// How far a point is from the line between `from` and `to`, so a fast bolt
+/// cannot step clean over the player between frames.
+fn away_from_line(point: [f32; 3], from: [f32; 3], to: [f32; 3]) -> f32 {
+    let line = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+    let length = line[0] * line[0] + line[1] * line[1] + line[2] * line[2];
+    if length < 1.0e-6 {
+        return away(point, from);
+    }
+    let along = ((point[0] - from[0]) * line[0]
+        + (point[1] - from[1]) * line[1]
+        + (point[2] - from[2]) * line[2])
+        / length;
+    let along = along.clamp(0.0, 1.0);
+    away(
+        point,
+        [
+            from[0] + line[0] * along,
+            from[1] + line[1] * along,
+            from[2] + line[2] * along,
+        ],
+    )
+}
+
 /// Engine state that survives a frame: SDL, the command buffer, the cvars, the
 /// renderer and the clock.
 pub struct Client {
@@ -420,6 +462,12 @@ pub struct Client {
     sparks: Vec<Spark>,
     /// The lines the railgun and lightning gun left in the air.
     beams: Vec<Beam>,
+    /// Bolts the practice posts have in the air.
+    bolts: Vec<Bolt>,
+    /// When the posts may fire again, so they do not all fire at once.
+    next_bolt: u32,
+    /// The last frame's clock, for the distance a bolt travels in one frame.
+    bolts_moved_at: u32,
     /// The practice posts built from the map's own markers.
     targets: Option<TargetField>,
     /// Where the rounds in the air are, whether they are plasma, and whether
@@ -786,6 +834,9 @@ impl Client {
             rockets: Vec::new(),
             sparks: Vec::new(),
             beams: Vec::new(),
+            bolts: Vec::new(),
+            next_bolt: 0,
+            bolts_moved_at: 0,
             sounds,
             shotgun_sound,
             rocket_sound,
@@ -1143,6 +1194,19 @@ impl Client {
             }
         }
 
+        // The bolts the posts have in the air.
+        for bolt in &self.bolts {
+            let shot = items::cube(bolt.at, 3.0, [235, 130, 255, 255]);
+            self.renderer.vk.draw_stage(
+                &self.renderer.white,
+                &shot,
+                &mvp,
+                [1.0, 1.0, 0.0, 0.0],
+                BlendMode::Opaque,
+                true,
+            )?;
+        }
+
         // The practice posts still standing.
         if let Some(field) = self.targets.as_ref() {
             let posts = field.vertices();
@@ -1393,6 +1457,74 @@ impl Client {
         )
     }
 
+    /// Lets the practice posts fight back: the nearest standing post within
+    /// range fires a slow bolt at where the player is, and a bolt that arrives
+    /// hurts. A post shoots at a place, not at a target, so you can walk out of
+    /// a bolt's way.
+    fn update_bolts(&mut self, now: u32) {
+        let Some(prediction) = self.prediction.as_mut() else {
+            return;
+        };
+        let origin = prediction.origin();
+        let eye = [origin[0], origin[1], origin[2] + 22.0];
+        let step = ((now.wrapping_sub(self.bolts_moved_at)) as f32 / 1000.0).min(0.1);
+        self.bolts_moved_at = now;
+
+        if now >= self.next_bolt && prediction.health() > 0 {
+            if let Some(field) = self.targets.as_ref() {
+                let nearest = field
+                    .targets()
+                    .iter()
+                    .filter(|target| target.alive())
+                    .map(|target| (target.origin, away(target.origin, eye)))
+                    .filter(|(_, distance)| *distance < BOLT_RANGE)
+                    .min_by(|a, b| {
+                        a.1.partial_cmp(&b.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                if let Some((from, distance)) = nearest {
+                    self.next_bolt = now + BOLT_INTERVAL;
+                    let speed = BOLT_SPEED / distance.max(1.0);
+                    self.bolts.push(Bolt {
+                        at: from,
+                        velocity: [
+                            (eye[0] - from[0]) * speed,
+                            (eye[1] - from[1]) * speed,
+                            (eye[2] - from[2]) * speed,
+                        ],
+                        until: now + 6_000,
+                    });
+                }
+            }
+        }
+
+        let mut damage = 0;
+        let mut strikes = Vec::new();
+        self.bolts.retain_mut(|bolt| {
+            let before = bolt.at;
+            for axis in 0..3 {
+                bolt.at[axis] += bolt.velocity[axis] * step;
+            }
+            if away_from_line(eye, before, bolt.at) < 36.0 {
+                damage += BOLT_DAMAGE;
+                strikes.push(bolt.at);
+                return false;
+            }
+            bolt.until > now
+        });
+        for at in strikes {
+            self.sparks.push(Spark {
+                at,
+                half: 5.0,
+                color: [235, 130, 255, 255],
+                until: now + 120,
+            });
+        }
+        if damage > 0 {
+            prediction.hurt(damage);
+        }
+    }
+
     /// Handles the pending SDL events and draws one frame. Returns `false`
     /// when the client should exit.
     pub fn frame(&mut self) -> Result<bool, String> {
@@ -1611,6 +1743,7 @@ impl Client {
         }
         self.sparks.retain(|spark| spark.until > now);
         self.beams.retain(|beam| beam.until > now);
+        self.update_bolts(now);
 
         self.renderer.vk.begin_frame([0.0, 0.0, 0.0, 1.0])?;
         self.draw_world()?;
@@ -1687,5 +1820,29 @@ mod tests {
         // Flat, and at the near end, so the map never hides it.
         assert_eq!(near_left[2], 0.0);
         assert_eq!(far_right[2], 0.0);
+    }
+}
+
+#[cfg(test)]
+mod bolt_tests {
+    use super::*;
+
+    #[test]
+    fn a_fast_bolt_cannot_step_over_the_player() {
+        // A bolt crossing right through the eye in one long step.
+        let eye = [0.0, 0.0, 0.0];
+        let before = [-50.0, 10.0, 0.0];
+        let after = [50.0, 10.0, 0.0];
+        // Neither end is close, but the path passes ten units away.
+        assert!(away(before, eye) > 36.0);
+        assert!(away(after, eye) > 36.0);
+        assert!((away_from_line(eye, before, after) - 10.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn a_bolt_that_misses_stays_away() {
+        let eye = [0.0, 0.0, 0.0];
+        let distance = away_from_line(eye, [-50.0, 100.0, 0.0], [50.0, 100.0, 0.0]);
+        assert!((distance - 100.0).abs() < 1.0e-4, "{distance}");
     }
 }
