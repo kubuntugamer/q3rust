@@ -473,11 +473,43 @@ fn dodge_bar_width(left_ms: u32) -> f32 {
 /// How long a short line like "post down" stays on screen before it fades out.
 const NOTICE_MS: u32 = 1_600;
 
+/// How many notice lines can sit on screen at once, so a burst of things
+/// happening does not cover the view.
+const NOTICE_LINES: usize = 3;
+
 /// How solid a notice line is: full for most of its life and fading out at the
 /// end, so it leaves without a flicker.
 fn notice_alpha(left_ms: u32) -> u8 {
     let left = left_ms.min(NOTICE_MS) as f32 / NOTICE_MS as f32;
     (255.0 * (left * 3.0).min(1.0)) as u8
+}
+
+/// Adds a line to the stack on screen, dropping the oldest when the stack is
+/// full so each new thing says its own line instead of replacing the last.
+fn push_notice(notices: &mut Vec<(String, u32)>, text: &str, now: u32) {
+    notices.retain(|(_, until)| *until > now);
+    notices.push((text.to_string(), now + NOTICE_MS));
+    if notices.len() > NOTICE_LINES {
+        notices.remove(0);
+    }
+}
+
+/// The on-screen line for posts going down: one, or how many at once.
+fn down_line(count: u32) -> String {
+    if count > 1 {
+        format!("{count} posts down")
+    } else {
+        "post down".to_string()
+    }
+}
+
+/// The on-screen line for posts standing back up.
+fn up_line(count: u32) -> String {
+    if count > 1 {
+        format!("{count} posts back up")
+    } else {
+        "post back up".to_string()
+    }
 }
 
 /// How long before a post that keeps shooting at you gets another line in the
@@ -680,9 +712,9 @@ pub struct Client {
     /// The last post the console named a shot for, and when, so a post that
     /// keeps firing does not fill the log.
     bolt_call: Option<(usize, u32)>,
-    /// A short line of text and when it should have gone: what just happened to
-    /// a post, said on screen as well as in the console.
-    notice: Option<(String, u32)>,
+    /// Short lines and when each should have gone: what just happened to a
+    /// post, said on screen as well as in the console.
+    notices: Vec<(String, u32)>,
     /// The last frame's clock, for the distance a bolt travels in one frame.
     bolts_moved_at: u32,
     /// The practice posts built from the map's own markers.
@@ -1094,7 +1126,7 @@ impl Client {
             next_bolt: 0,
             wind_up: None,
             bolt_call: None,
-            notice: None,
+            notices: Vec::new(),
             bolts_moved_at: 0,
             sounds,
             shotgun_sound,
@@ -1941,17 +1973,16 @@ impl Client {
             )?;
         }
 
-        // A short line in the middle of the frame says when a post goes down or
-        // comes back up, so a fight reads without opening the console.
-        if matches!(self.notice.as_ref(), Some((_, until)) if now >= *until) {
-            self.notice = None;
-        }
-        if let Some((text, until)) = self.notice.clone() {
-            let text_width = self.renderer.face().width(&text, scale);
+        // Short lines in the middle of the frame say when posts go down or come
+        // back up, so a fight reads without opening the console. Each new line
+        // joins the stack instead of replacing the one before it.
+        self.notices.retain(|(_, until)| *until > now);
+        for (row, (text, until)) in self.notices.iter().enumerate() {
+            let text_width = self.renderer.face().width(text, scale);
             self.renderer.text(
-                &text,
+                text,
                 (width as f32 - text_width) * 0.5,
-                height as f32 * 0.32,
+                height as f32 * 0.32 + row as f32 * line_height,
                 scale,
                 [235, 200, 110, notice_alpha(until.saturating_sub(now))],
             )?;
@@ -2354,7 +2385,7 @@ impl Client {
                             if destroyed {
                                 self.posts_down += 1;
                                 console::print("target down");
-                                self.notice = Some(("post down".to_string(), now + NOTICE_MS));
+                                push_notice(&mut self.notices, &down_line(1), now);
                             }
                         }
                         if shot.splash > 0.0 {
@@ -2363,7 +2394,7 @@ impl Client {
                             self.posts_down += (field.downed() - before) as u32;
                             if down > 0 {
                                 console::print("target down");
-                                self.notice = Some(("post down".to_string(), now + NOTICE_MS));
+                                push_notice(&mut self.notices, &down_line(down as u32), now);
                             }
                         }
                     }
@@ -2376,9 +2407,10 @@ impl Client {
         // moment to bring its gun up, so a post that just got back up does not
         // shoot at you the instant it is standing.
         if let Some(field) = self.targets.as_mut() {
-            if field.recover(now) > 0 {
+            let back = field.recover(now);
+            if back > 0 {
                 self.next_bolt = self.next_bolt.max(now + RECOVERY_GRACE_MS);
-                self.notice = Some(("post back up".to_string(), now + NOTICE_MS));
+                push_notice(&mut self.notices, &up_line(back as u32), now);
             }
         }
         self.update_bolts(now);
@@ -2560,6 +2592,33 @@ mod bolt_arc_tests {
         assert!(bearing(eye, 90.0, [0.0, 100.0, 24.0]).abs() < 0.01);
         // And it wraps rather than jumping at north.
         assert!(bearing(eye, 350.0, [100.0, 20.0, 24.0]) > 0.0);
+    }
+
+    #[test]
+    fn each_notice_gets_its_own_line_and_the_oldest_falls_off() {
+        let mut notices = Vec::new();
+        push_notice(&mut notices, "post down", 1_000);
+        push_notice(&mut notices, "post back up", 1_000);
+        assert_eq!(notices.len(), 2, "a second thing does not replace the first");
+        assert_eq!((notices[0].0.as_str(), notices[0].1), ("post down", 1_000 + NOTICE_MS));
+
+        for n in 0..5 {
+            push_notice(&mut notices, &down_line(1), 1_000 + n);
+        }
+        assert_eq!(notices.len(), NOTICE_LINES, "the stack stays small");
+        assert_eq!(notices.last().unwrap(), &("post down".to_string(), 1_004 + NOTICE_MS));
+
+        // Lines that have run out are cleared before the new one joins.
+        push_notice(&mut notices, "post down", 1_004 + NOTICE_MS + 1);
+        assert_eq!(notices.len(), 1, "{notices:?}");
+    }
+
+    #[test]
+    fn a_burst_of_posts_says_how_many() {
+        assert_eq!(down_line(1), "post down");
+        assert_eq!(down_line(2), "2 posts down");
+        assert_eq!(up_line(1), "post back up");
+        assert_eq!(up_line(3), "3 posts back up");
     }
 
     #[test]
