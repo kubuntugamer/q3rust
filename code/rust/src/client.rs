@@ -384,6 +384,15 @@ struct Spark {
     until: u32,
 }
 
+/// A shot that is a line in the air: where it starts, where it stops, its
+/// colour, and how long it stays. The railgun and lightning gun leave these.
+struct Beam {
+    from: [f32; 3],
+    to: [f32; 3],
+    color: [u8; 4],
+    until: u32,
+}
+
 /// Engine state that survives a frame: SDL, the command buffer, the cvars, the
 /// renderer and the clock.
 pub struct Client {
@@ -409,6 +418,8 @@ pub struct Client {
     items: Option<ItemField>,
     /// Where recent shots landed, and when the mark should go away.
     sparks: Vec<Spark>,
+    /// The lines the railgun and lightning gun left in the air.
+    beams: Vec<Beam>,
     /// The practice posts built from the map's own markers.
     targets: Option<TargetField>,
     /// Where the rounds in the air are, whether they are plasma, and whether
@@ -774,6 +785,7 @@ impl Client {
             targets,
             rockets: Vec::new(),
             sparks: Vec::new(),
+            beams: Vec::new(),
             sounds,
             shotgun_sound,
             rocket_sound,
@@ -1113,6 +1125,22 @@ impl Client {
                 BlendMode::Opaque,
                 true,
             )?;
+        }
+
+        // The lines the last railgun and lightning shots left. They add to the
+        // frame so they glow rather than sit flat.
+        for beam in &self.beams {
+            let line = items::beam(beam.from, beam.to, 2.0, beam.color);
+            if !line.is_empty() {
+                self.renderer.vk.draw_stage(
+                    &self.renderer.white,
+                    &line,
+                    &mvp,
+                    [1.0, 1.0, 0.0, 0.0],
+                    BlendMode::Add,
+                    false,
+                )?;
+            }
         }
 
         // The practice posts still standing.
@@ -1524,6 +1552,18 @@ impl Client {
                     }
                     // Each weapon fires with its own sound.
                     let weapon = prediction.weapon();
+                    if weapon == WP_RAILGUN || weapon == WP_LIGHTNING {
+                        self.beams.push(Beam {
+                            from: shot.from,
+                            to: shot.to,
+                            color: if weapon == WP_RAILGUN {
+                                [120, 210, 255, 255]
+                            } else {
+                                [190, 180, 255, 255]
+                            },
+                            until: now + if weapon == WP_RAILGUN { 110 } else { 70 },
+                        });
+                    }
                     let fired = match weapon {
                         WP_SHOTGUN => self.shotgun_sound.clone(),
                         WP_ROCKET_LAUNCHER => self.rocket_sound.clone(),
@@ -1570,6 +1610,7 @@ impl Client {
             }
         }
         self.sparks.retain(|spark| spark.until > now);
+        self.beams.retain(|beam| beam.until > now);
 
         self.renderer.vk.begin_frame([0.0, 0.0, 0.0, 1.0])?;
         self.draw_world()?;

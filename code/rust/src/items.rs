@@ -284,6 +284,68 @@ pub fn cuboid(origin: [f32; 3], mins: [f32; 3], maxs: [f32; 3], color: [u8; 4]) 
     vertices
 }
 
+/// A straight bar from `from` to `to`, as two crossed quads, for a shot that
+/// is a line in the air rather than a mark at one point.
+///
+/// The quads are crossed so the bar is seen from any side without the caller
+/// having to know where the camera is.
+pub fn beam(from: [f32; 3], to: [f32; 3], width: f32, color: [u8; 4]) -> Vec<Vertex3D> {
+    let axis = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+    let length = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+    if length < 1.0e-3 {
+        return Vec::new();
+    }
+    let dir = [axis[0] / length, axis[1] / length, axis[2] / length];
+    // Any seed that is not nearly parallel to the bar gives a usable side.
+    let seed = if dir[0].abs() < 0.9 {
+        [1.0, 0.0, 0.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let side = unit(cross(dir, seed));
+    let up = cross(side, dir);
+
+    let mut vertices = Vec::with_capacity(12);
+    for normal in [side, up] {
+        let a = [
+            normal[0] * width * 0.5,
+            normal[1] * width * 0.5,
+            normal[2] * width * 0.5,
+        ];
+        let corners = [
+            [from[0] - a[0], from[1] - a[1], from[2] - a[2]],
+            [from[0] + a[0], from[1] + a[1], from[2] + a[2]],
+            [to[0] + a[0], to[1] + a[1], to[2] + a[2]],
+            [to[0] - a[0], to[1] - a[1], to[2] - a[2]],
+        ];
+        for index in [0, 1, 2, 0, 2, 3] {
+            vertices.push(Vertex3D {
+                pos: corners[index],
+                uv: [0.5, 0.5],
+                color,
+            });
+        }
+    }
+    vertices
+}
+
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn unit(v: [f32; 3]) -> [f32; 3] {
+    let length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if length < 1.0e-6 {
+        [0.0, 0.0, 0.0]
+    } else {
+        [v[0] / length, v[1] / length, v[2] / length]
+    }
+}
+
 fn push_corners(vertices: &mut Vec<Vertex3D>, min: [f32; 3], max: [f32; 3], color: [u8; 4]) {
     // Bit 0 picks x, bit 1 y, bit 2 z: the corners in cube order.
     let corner = |index: usize| -> [f32; 3] {
@@ -476,5 +538,21 @@ mod tests {
         assert!(field.touch(&mut ps, [300.0, 300.0, 24.0], 0).is_empty());
         assert_eq!(ps.ammo[WP_ROCKET_LAUNCHER as usize], 0);
         assert_eq!(field.vertices().len(), 3 * 36);
+    }
+
+    #[test]
+    fn a_beam_runs_from_end_to_end() {
+        let from = [10.0, 20.0, 30.0];
+        let to = [110.0, 20.0, 30.0];
+        let vertices = beam(from, to, 4.0, [255, 255, 255, 255]);
+        assert_eq!(vertices.len(), 12);
+        let xs: Vec<f32> = vertices.iter().map(|vertex| vertex.pos[0]).collect();
+        assert!(xs.iter().all(|x| (10.0..=110.0).contains(x)), "{xs:?}");
+        // The bar is half a width either side of the line, on both axes.
+        let width = vertices
+            .iter()
+            .map(|vertex| (vertex.pos[1] - 20.0).abs() + (vertex.pos[2] - 30.0).abs())
+            .fold(0.0f32, f32::max);
+        assert!((width - 2.0).abs() < 1.0e-4, "{width}");
     }
 }
