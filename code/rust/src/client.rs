@@ -36,6 +36,7 @@ use crate::cvar::{Cvars, CVAR_ARCHIVE};
 use crate::font::Face;
 use crate::items::{self, ItemField};
 use crate::prediction::{Input, Prediction};
+use crate::targets::TargetField;
 use crate::texture;
 use crate::vk::{BlendMode, Texture, Vertex2D, Vulkan};
 use crate::wav;
@@ -409,6 +410,8 @@ pub struct Client {
     items: Option<ItemField>,
     /// Where recent shots landed, and when the mark should go away.
     sparks: Vec<Spark>,
+    /// The practice posts built from the map's own markers.
+    targets: Option<TargetField>,
     /// The machinegun's shot sounds, decoded once and shared per shot.
     sounds: Vec<Arc<Vec<f32>>>,
     /// The pickup sounds, by the path the item table names.
@@ -621,6 +624,11 @@ impl Client {
 
         // The live pickups, from the same marks the world drew its boxes for.
         let items = world.as_ref().map(|world| ItemField::new(&world.items));
+        // Practice posts on the map's `target_position` markers, so there is
+        // something to shoot before the game has enemies.
+        let targets = map_bytes
+            .as_deref()
+            .map(|bytes| TargetField::new(&crate::targets::positions(bytes)));
 
         let mut cmd = CmdSystem::new();
         cmd.add_command("quit", Some(quit_command));
@@ -727,6 +735,7 @@ impl Client {
             prediction,
             world,
             items,
+            targets,
             sparks: Vec::new(),
             sounds,
             pickup_sounds,
@@ -1022,6 +1031,21 @@ impl Client {
             )?;
         }
 
+        // The practice posts still standing.
+        if let Some(field) = self.targets.as_ref() {
+            let posts = field.vertices();
+            if !posts.is_empty() {
+                self.renderer.vk.draw_stage(
+                    &self.renderer.white,
+                    &posts,
+                    &mvp,
+                    [1.0, 1.0, 0.0, 0.0],
+                    BlendMode::Opaque,
+                    true,
+                )?;
+            }
+        }
+
         // The pickups still on the map, as the models the paks hold. Each one
         // reuses its kind's triangles, moved to the origin the map gave it.
         // If a map's models all failed to load, the coloured marker boxes
@@ -1248,6 +1272,19 @@ impl Client {
                             let sound = Arc::clone(&self.sounds[self.next_sound % self.sounds.len()]);
                             self.next_sound += 1;
                             audio.play_at(sound, shot.from);
+                        }
+                    }
+                    if let Some(field) = self.targets.as_mut() {
+                        if let Some((at, destroyed)) = field.shoot(shot.from, shot.to) {
+                            self.sparks.push(Spark {
+                                at,
+                                half: 3.0,
+                                color: [255, 170, 90, 255],
+                                until: now + 150,
+                            });
+                            if destroyed {
+                                console::print("target down");
+                            }
                         }
                     }
                 }

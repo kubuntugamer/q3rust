@@ -34,6 +34,7 @@ pub mod refexport;
 pub mod refimport;
 pub mod shader;
 pub mod shared_entity;
+pub mod targets;
 pub mod texture;
 pub mod vk;
 pub mod vm;
