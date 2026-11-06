@@ -18,7 +18,7 @@ use crate::assets::Assets;
 use crate::bg_misc::{self, ItemType};
 use crate::bg_pmove::{
     pmove, Pmove, UserCmd, ENTITYNUM_NONE, EV_FALL_FAR, EV_FALL_MEDIUM, STAT_ARMOR, STAT_HEALTH,
-    STAT_WEAPONS, WP_GRENADE_LAUNCHER, WP_LIGHTNING, WP_MACHINEGUN, WP_PLASMAGUN, WP_RAILGUN,
+    STAT_WEAPONS, WP_GAUNTLET, WP_GRENADE_LAUNCHER, WP_LIGHTNING, WP_MACHINEGUN, WP_PLASMAGUN, WP_RAILGUN,
     WP_ROCKET_LAUNCHER, WP_SHOTGUN,
 };
 use crate::bsp::Bsp;
@@ -38,6 +38,8 @@ const TURN_SPEED: f32 = 180.0;
 const STARTING_AMMO: i32 = 50;
 /// `MAX_SHOT_RANGE`: a shot that hits nothing travels this far.
 const SHOT_RANGE: f32 = 8192.0;
+/// How far a gauntlet swipe reaches.
+const GAUNTLET_RANGE: f32 = 32.0;
 /// What `ClientEvents` takes off for a hard landing, and for a medium one.
 const FALL_DAMAGE_FAR: i32 = 10;
 const FALL_DAMAGE_MEDIUM: i32 = 5;
@@ -114,7 +116,7 @@ struct Pattern {
     gravity: bool,
 }
 
-const PATTERNS: [Pattern; 7] = [
+const PATTERNS: [Pattern; 8] = [
     Pattern {
         weapon: WP_MACHINEGUN,
         interval: 100,
@@ -191,6 +193,19 @@ const PATTERNS: [Pattern; 7] = [
         radius: ROCKET_RADIUS,
         plasma: false,
         gravity: true,
+    },
+    Pattern {
+        weapon: WP_GAUNTLET,
+        interval: 400,
+        pellets: 1,
+        spread: 0.0,
+        splash: 0.0,
+        // Barely past arm's length, and it hurts.
+        damage: 50,
+        speed: 0.0,
+        radius: 0.0,
+        plasma: false,
+        gravity: false,
     },
     Pattern {
         weapon: WP_LIGHTNING,
@@ -374,13 +389,17 @@ impl Prediction {
             return Vec::new();
         }
         let slot = pattern.weapon as usize;
+        // The gauntlet is free to swing: it has no cells or shells to spend.
+        let free = pattern.weapon == WP_GAUNTLET;
         let ammo = self.pm.ps.ammo.get(slot).copied().unwrap_or(0);
-        if ammo <= 0 {
+        if !free && ammo <= 0 {
             return Vec::new();
         }
         self.last_shot = now;
-        if let Some(clip) = self.pm.ps.ammo.get_mut(slot) {
-            *clip = ammo - 1;
+        if !free {
+            if let Some(clip) = self.pm.ps.ammo.get_mut(slot) {
+                *clip = ammo - 1;
+            }
         }
 
         let from = [
@@ -447,10 +466,17 @@ impl Prediction {
                 pitch.cos() * yaw.sin(),
                 -pitch.sin(),
             ];
+            // The gauntlet is a swipe, not a shot: it only reaches where an arm
+            // would.
+            let range = if pattern.weapon == WP_GAUNTLET {
+                GAUNTLET_RANGE
+            } else {
+                SHOT_RANGE
+            };
             let to = [
-                from[0] + forward[0] * SHOT_RANGE,
-                from[1] + forward[1] * SHOT_RANGE,
-                from[2] + forward[2] * SHOT_RANGE,
+                from[0] + forward[0] * range,
+                from[1] + forward[1] * range,
+                from[2] + forward[2] * range,
             ];
 
             // Shots stop on the same surfaces the player's body does; bodies
@@ -995,6 +1021,27 @@ mod tests {
             let turned = (off - prediction.yaw() + 180.0).rem_euclid(360.0) - 180.0;
             assert!(turned.abs() <= 3.5, "pellet {turned} degrees off centre");
         }
+    }
+
+    #[test]
+    fn the_gauntlet_only_reaches_an_arms_length() {
+        let mut prediction = prediction_on_a_test_map();
+        prediction.pm.ps.stats[STAT_WEAPONS] |= 1 << WP_GAUNTLET;
+        assert!(prediction.select_weapon(WP_GAUNTLET));
+        for tick in 0..40 {
+            prediction.step(1_000 + tick * 50, &Input::default());
+        }
+        assert_eq!(prediction.weapon(), WP_GAUNTLET);
+
+        let now = 1_000 + 40 * 50;
+        let swipe = prediction.fire(now).pop().expect("the gauntlet swings");
+        let reach = ((swipe.to[0] - swipe.from[0]).powi(2)
+            + (swipe.to[1] - swipe.from[1]).powi(2)
+            + (swipe.to[2] - swipe.from[2]).powi(2))
+        .sqrt();
+        assert!(reach <= GAUNTLET_RANGE + 0.001, "it reaches {reach}");
+        assert!(prediction.fire(now + 100).is_empty(), "and swings slowly");
+        assert_eq!(prediction.fire(now + 400).len(), 1);
     }
 
     #[test]
