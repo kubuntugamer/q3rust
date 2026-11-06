@@ -422,6 +422,8 @@ pub struct Client {
     explosion_sound: Option<Arc<Vec<f32>>>,
     /// The BFG's hum, played once when a charge starts.
     charge_sound: Option<Arc<Vec<f32>>>,
+    /// When the weapon in hand stops kicking after the last shot.
+    kick_until: u32,
     /// The pickup sounds, by the path the item table names.
     pickup_sounds: std::collections::HashMap<&'static str, Arc<Vec<f32>>>,
     /// Which of those the next shot uses, so repeated fire varies.
@@ -761,6 +763,7 @@ impl Client {
             rocket_sound,
             explosion_sound,
             charge_sound,
+            kick_until: 0,
             pickup_sounds,
             next_sound: 0,
             input: Input::default(),
@@ -996,7 +999,7 @@ impl Client {
     /// box. Depth is flat and at the near end, so the weapon draws over the
     /// map. The box is this client's own choice: the cgame that holds the real
     /// view-model offsets is not in this tree.
-    fn view_model_matrix(model: &world::ViewModel) -> [f32; 16] {
+    fn view_model_matrix(model: &world::ViewModel, kick: f32) -> [f32; 16] {
         let size = [
             model.maxs[0] - model.mins[0],
             model.maxs[1] - model.mins[1],
@@ -1024,7 +1027,7 @@ impl Client {
         fitted[across * 4] = across_scale;
         fitted[up * 4 + 1] = up_scale;
         fitted[12] = 0.40 - across_scale * centre[across];
-        fitted[13] = -0.60 - up_scale * centre[up];
+        fitted[13] = -0.60 - up_scale * centre[up] + kick;
         fitted[14] = 0.0;
         fitted[15] = 1.0;
         fitted
@@ -1212,7 +1215,13 @@ impl Client {
             .iter()
             .find(|model| model.weapon == prediction.weapon())
         {
-            let fitted = Self::view_model_matrix(model);
+            // The weapon dips for a moment after each shot.
+            let kick = if self.millis() < self.kick_until {
+                -0.05
+            } else {
+                0.0
+            };
+            let fitted = Self::view_model_matrix(model, kick);
             for surface in &model.surfaces {
                 let (_, texture) = &world.textures()[surface.texture];
                 self.renderer.vk.draw_stage(
@@ -1451,17 +1460,29 @@ impl Client {
                     }
                 }
                 for shot in shots {
-                    // The flash sits just past the muzzle, along the shot.
+                    // The flash sits just past the muzzle, along the shot, and
+                    // the weapon kicks for a moment so firing has some weight.
                     let forward = shot.forward();
+                    self.kick_until = now + 120;
                     self.sparks.push(Spark {
                         at: [
                             shot.from[0] + forward[0] * 24.0,
                             shot.from[1] + forward[1] * 24.0,
                             shot.from[2] + forward[2] * 24.0,
                         ],
-                        half: 4.0,
+                        half: 7.0,
                         color: [255, 250, 210, 255],
                         until: now + 45,
+                    });
+                    self.sparks.push(Spark {
+                        at: [
+                            shot.from[0] + forward[0] * 16.0,
+                            shot.from[1] + forward[1] * 16.0,
+                            shot.from[2] + forward[2] * 16.0,
+                        ],
+                        half: 3.0,
+                        color: [255, 235, 180, 255],
+                        until: now + 30,
                     });
                     if shot.hit {
                         self.sparks.push(Spark {
@@ -1591,7 +1612,7 @@ mod tests {
             mins: [-40.0, -10.0, -5.0],
             maxs: [40.0, 10.0, 5.0],
         };
-        let fitted = Client::view_model_matrix(&model);
+        let fitted = Client::view_model_matrix(&model, 0.0);
         let near_left = on_screen(&fitted, [-40.0, -10.0, 0.0]);
         let far_right = on_screen(&fitted, [40.0, 10.0, 0.0]);
         assert!((near_left[0] - 0.05).abs() < 1e-3, "{near_left:?}");
