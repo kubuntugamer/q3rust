@@ -14,6 +14,10 @@ use crate::vk::Vertex3D;
 pub const TARGET_MINS: [f32; 3] = [-16.0, -16.0, 0.0];
 pub const TARGET_MAXS: [f32; 3] = [16.0, 16.0, 64.0];
 
+/// How far a marker sits above the floor: player-origin height, so the post's
+/// base lands on the ground under it.
+pub const TARGET_BASE: f32 = 24.0;
+
 /// Health of a fresh target.
 pub const TARGET_HEALTH: i32 = 100;
 /// What one round takes off, so three rounds put it down.
@@ -24,24 +28,59 @@ pub const TARGET_HIT_DAMAGE: i32 = 34;
 pub struct Target {
     pub origin: [f32; 3],
     pub health: i32,
+    /// Where it fell, once it has: the horizontal direction it was knocked
+    /// towards. A post that has fallen is still drawn, lying on the floor.
+    pub fell: Option<[f32; 3]>,
 }
 
 impl Target {
     pub fn alive(&self) -> bool {
-        self.health > 0
+        self.health > 0 && self.fell.is_none()
+    }
+
+    pub fn fallen(&self) -> bool {
+        self.fell.is_some()
     }
 
     /// The colour the post is drawn in: bright while healthy, duller as it is
-    /// shot up, and absent once it is down.
-    pub fn color(&self) -> Option<[u8; 4]> {
-        if !self.alive() {
-            return None;
+    /// shot up, and bare wood once it is down.
+    pub fn color(&self) -> [u8; 4] {
+        if self.fallen() {
+            return [110, 92, 78, 255];
         }
-        Some(if self.health > TARGET_HEALTH / 2 {
+        if self.health > TARGET_HEALTH / 2 {
             [235, 120, 55, 255]
         } else {
             [150, 70, 40, 255]
-        })
+        }
+    }
+
+    /// The box it is drawn as. Upright it is a body; down it lies along the
+    /// direction it was knocked, which keeps it visible on the floor.
+    fn box_at(&self) -> ([f32; 3], [f32; 3], [f32; 3]) {
+        // The markers sit at player height, so the post stands on the floor
+        // below them rather than floating where the marker is.
+        let mut foot = self.origin;
+        foot[2] -= TARGET_BASE;
+        match self.fell {
+            None => (foot, TARGET_MINS, TARGET_MAXS),
+            Some(fall) => {
+                // Snap the fall to the nearest axis: the post lies along the
+                // line of fire, so it reads from whichever side you shot it.
+                let axis = if fall[0].abs() >= fall[1].abs() { 0 } else { 1 };
+                let sign = if fall[axis] >= 0.0 { 1.0 } else { -1.0 };
+                let mut centre = foot;
+                centre[axis] += sign * TARGET_MAXS[2] / 2.0;
+                centre[2] += TARGET_MAXS[0].abs();
+                let mut mins = [TARGET_MINS[0].abs(), TARGET_MINS[1].abs(), 0.0];
+                let mut maxs = mins;
+                mins[axis] = -TARGET_MAXS[2] / 2.0;
+                maxs[axis] = TARGET_MAXS[2] / 2.0;
+                mins[2] = -TARGET_MAXS[0].abs();
+                maxs[2] = TARGET_MAXS[0].abs();
+                (centre, mins, maxs)
+            }
+        }
     }
 }
 
@@ -58,6 +97,7 @@ impl TargetField {
                 .map(|origin| Target {
                     origin: *origin,
                     health: TARGET_HEALTH,
+                    fell: None,
                 })
                 .collect(),
         }
@@ -71,15 +111,25 @@ impl TargetField {
         self.targets.iter().filter(|target| target.alive()).count()
     }
 
-    /// The boxes of the posts still standing, as triangles.
+    /// Every post, standing or lying where it fell, as triangles.
     pub fn vertices(&self) -> Vec<Vertex3D> {
         let mut vertices = Vec::new();
         for target in &self.targets {
-            if let Some(color) = target.color() {
-                vertices.extend(items::cuboid(target.origin, TARGET_MINS, TARGET_MAXS, color));
-            }
+            let (origin, mins, maxs) = target.box_at();
+            vertices.extend(items::cuboid(origin, mins, maxs, target.color()));
         }
         vertices
+    }
+
+    /// Knocks a post over towards `at`, which is where it was shot from.
+    fn knock_down(&mut self, index: usize, at: [f32; 3]) {
+        let target = &mut self.targets[index];
+        let mut fall = [target.origin[0] - at[0], target.origin[1] - at[1], 0.0];
+        if fall[0] == 0.0 && fall[1] == 0.0 {
+            fall = [1.0, 0.0, 0.0];
+        }
+        target.health = 0;
+        target.fell = Some(fall);
     }
 
     /// Fires a shot segment at the posts. Returns the nearest hit's point and
@@ -103,10 +153,18 @@ impl TargetField {
             }
         }
 
-        let (_, index, at) = best?;
-        let target = &mut self.targets[index];
-        target.health -= TARGET_HIT_DAMAGE;
-        Some((at, !target.alive()))
+        let (fraction, index, at) = best?;
+        self.targets[index].health -= TARGET_HIT_DAMAGE;
+        let down = self.targets[index].health <= 0;
+        if down {
+            let from = [
+                from[0] + (to[0] - from[0]) * fraction,
+                from[1] + (to[1] - from[1]) * fraction,
+                from[2] + (to[2] - from[2]) * fraction,
+            ];
+            self.knock_down(index, from);
+        }
+        Some((at, down))
     }
 
     /// A rocket's blast: every standing post within `radius` of `at` loses
@@ -114,7 +172,8 @@ impl TargetField {
     /// a post. Returns how many posts went down.
     pub fn blast(&mut self, at: [f32; 3], radius: f32, damage: i32) -> usize {
         let mut down = 0;
-        for target in &mut self.targets {
+        for index in 0..self.targets.len() {
+            let target = self.targets[index];
             if !target.alive() {
                 continue;
             }
@@ -133,8 +192,18 @@ impl TargetField {
             if distance > radius {
                 continue;
             }
-            target.health -= damage;
-            if !target.alive() {
+            self.targets[index].health -= damage;
+            if self.targets[index].health <= 0 {
+                let mut fall = [
+                    target.origin[0] - at[0],
+                    target.origin[1] - at[1],
+                    0.0,
+                ];
+                if fall[0] == 0.0 && fall[1] == 0.0 {
+                    fall = [1.0, 0.0, 0.0];
+                }
+                self.targets[index].health = 0;
+                self.targets[index].fell = Some(fall);
                 down += 1;
             }
         }
@@ -223,9 +292,25 @@ mod tests {
         assert!(destroyed, "the third hit puts it down");
         assert_eq!(field.alive(), 1);
 
-        // A downed post is neither hit nor drawn.
+        // A downed post is no longer a target, but it is still there, lying
+        // on the floor along the line it was shot from.
         assert!(field.shoot(from, to).is_none(), "the far post is behind this one");
-        assert_eq!(field.vertices().len(), 36);
+        assert!(field.targets()[0].fallen());
+        let fallen = &field.vertices()[..36];
+        let top = fallen
+            .iter()
+            .map(|vertex| vertex.pos[2])
+            .fold(f32::MIN, f32::max);
+        let floor = field.targets()[0].origin[2] - TARGET_BASE;
+        assert!(
+            top <= floor + TARGET_MAXS[0].abs() * 2.0 + 0.001,
+            "lies flat, top at {top}"
+        );
+        assert!(
+            (top - (floor + TARGET_MAXS[0].abs() * 2.0)).abs() < 0.001,
+            "and resting on it"
+        );
+        assert_eq!(field.vertices().len(), 72, "one lying, one standing");
     }
 
     #[test]
@@ -252,13 +337,13 @@ mod tests {
     #[test]
     fn a_post_dims_as_it_is_shot() {
         let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
-        let fresh = field.targets()[0].color().unwrap();
+        let fresh = field.targets()[0].color();
         field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0]);
         field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0]);
-        let hurt = field.targets()[0].color().unwrap();
+        let hurt = field.targets()[0].color();
         assert_ne!(fresh, hurt, "a hurt post reads differently");
         field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0]);
-        assert!(field.targets()[0].color().is_none());
-        assert!(field.vertices().is_empty());
+        assert_ne!(hurt, field.targets()[0].color(), "a fallen post is bare");
+        assert_eq!(field.vertices().len(), 36, "and still drawn");
     }
 }
