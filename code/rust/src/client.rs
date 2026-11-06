@@ -623,6 +623,28 @@ fn bolt_lead(eye: [f32; 3], velocity: [f32; 3], flight: f32, lead: f32) -> [f32;
     ]
 }
 
+/// What becomes of a post's lined-up shot this frame: it fires, it keeps
+/// lining up, or it is dropped because the post is no longer standing.
+#[derive(Debug, PartialEq)]
+enum Shot {
+    Fire,
+    Wait,
+    Drop,
+}
+
+/// A post that has just been knocked down loses the shot it was lining up
+/// straight away, so its glow and its mark on your ring go with it instead of
+/// hanging in the air for a bolt that will never come.
+fn shot_state(wind: &WindUp, alive: bool, now: u32) -> Shot {
+    if !alive {
+        Shot::Drop
+    } else if now < wind.fires_at {
+        Shot::Wait
+    } else {
+        Shot::Fire
+    }
+}
+
 /// How much of the flight time the post filling `slot` of a volley leads you
 /// by. The nearest leads the shot; a second post firing with it aims where you
 /// are right now, so stepping one way to dodge the first walks into the second
@@ -2157,25 +2179,25 @@ impl Client {
         let lining_up = std::mem::take(&mut self.wind_ups);
         let mut still_lining_up = Vec::with_capacity(lining_up.len());
         for wind in lining_up {
-            if now < wind.fires_at {
-                // Still lining up: keep the glow going.
-                still_lining_up.push(wind);
-                continue;
-            }
             let alive = self
                 .targets
                 .as_ref()
                 .map(|field| field.targets()[wind.index].alive())
                 .unwrap_or(false);
-            if alive {
-                let flight = away(wind.from, eye) / BOLT_SPEED;
-                let aim = bolt_lead(eye, prediction.velocity(), flight, wind.lead);
-                self.bolts.push(Bolt {
-                    at: wind.from,
-                    velocity: bolt_aim(wind.from, aim),
-                    until: now + 6_000,
-                    grazed: false,
-                });
+            match shot_state(&wind, alive, now) {
+                // Still lining up: keep the glow going.
+                Shot::Wait => still_lining_up.push(wind),
+                Shot::Drop => {}
+                Shot::Fire => {
+                    let flight = away(wind.from, eye) / BOLT_SPEED;
+                    let aim = bolt_lead(eye, prediction.velocity(), flight, wind.lead);
+                    self.bolts.push(Bolt {
+                        at: wind.from,
+                        velocity: bolt_aim(wind.from, aim),
+                        until: now + 6_000,
+                        grazed: false,
+                    });
+                }
             }
         }
         self.wind_ups = still_lining_up;
@@ -2950,6 +2972,26 @@ mod bolt_arc_tests {
         assert_eq!(wind.progress(1_000), 0.0);
         assert!((wind.progress(1_000 + BOLT_TELEGRAPH_NEAR / 2) - 0.5).abs() < 0.02);
         assert_eq!(wind.progress(1_000 + BOLT_TELEGRAPH_NEAR), 1.0);
+    }
+
+    #[test]
+    fn a_post_shot_down_while_aiming_loses_its_shot() {
+        let wind = WindUp {
+            index: 2,
+            from: [200.0, 0.0, 24.0],
+            started_at: 0,
+            fires_at: 450,
+            lead: BOLT_LEAD,
+        };
+        assert_eq!(shot_state(&wind, false, 10), Shot::Drop, "down before it fires");
+        assert_eq!(
+            shot_state(&wind, false, 450),
+            Shot::Drop,
+            "and still dropped when its turn comes"
+        );
+        assert_eq!(shot_state(&wind, true, 10), Shot::Wait);
+        assert_eq!(shot_state(&wind, true, 450), Shot::Fire);
+        assert_eq!(shot_state(&wind, true, 900), Shot::Fire, "late is still a shot");
     }
 
     #[test]
