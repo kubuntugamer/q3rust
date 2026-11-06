@@ -60,6 +60,38 @@ fn mark_of(entity: &Entity) -> Option<ItemMark> {
     })
 }
 
+/// The sound the game plays when a pickup is taken, by what it gives.
+///
+/// `bg_itemlist` carries a `pickup_sound` per row; these are the stock files
+/// those rows name, chosen by kind so the table does not have to repeat a path
+/// thirty-six times. Flags and anything without a sound return `None`.
+pub fn pickup_sound(class_name: &str) -> Option<&'static str> {
+    Some(match class_name {
+        "item_health_small" => "sound/items/s_health.wav",
+        "item_health" => "sound/items/m_health.wav",
+        "item_health_large" => "sound/items/l_health.wav",
+        "item_health_mega" => "sound/items/n_health.wav",
+        "item_armor_shard" | "item_armor_combat" | "item_armor_body" => {
+            "sound/items/armourfield.wav"
+        }
+        "holdable_teleporter" | "holdable_medkit" => "sound/items/holdable.wav",
+        "item_quad" => "sound/items/quaddamage.wav",
+        "item_enviro" => "sound/items/protect.wav",
+        "item_haste" => "sound/items/haste.wav",
+        "item_invis" => "sound/items/invisibility.wav",
+        "item_regen" => "sound/items/regen.wav",
+        "item_flight" => "sound/items/flight.wav",
+        _ => {
+            let item = bg_misc::find(class_name)?;
+            match item.item_type {
+                ItemType::Weapon => "sound/misc/w_pkup.wav",
+                ItemType::Ammo => "sound/misc/am_pkup.wav",
+                _ => return None,
+            }
+        }
+    })
+}
+
 /// A colour per kind of pickup, so a weapon, a health pack and a flag read
 /// apart at a glance. Team items take their team's colour; anything with no
 /// kind of its own is not a pickup and gets no box.
@@ -367,6 +399,20 @@ mod tests {
         assert_ne!(marks[0].color, marks[1].color);
         assert_eq!(marks[0].class_name, "team_CTF_redflag");
         assert_eq!(marks[1].class_name, "team_CTF_blueflag");
+    }
+
+    #[test]
+    fn each_kind_of_pickup_names_its_sound() {
+        assert_eq!(pickup_sound("item_health_small"), Some("sound/items/s_health.wav"));
+        assert_eq!(pickup_sound("item_health_mega"), Some("sound/items/n_health.wav"));
+        assert_eq!(pickup_sound("item_armor_body"), Some("sound/items/armourfield.wav"));
+        assert_eq!(pickup_sound("weapon_rocketlauncher"), Some("sound/misc/w_pkup.wav"));
+        assert_eq!(pickup_sound("ammo_rockets"), Some("sound/misc/am_pkup.wav"));
+        assert_eq!(pickup_sound("item_quad"), Some("sound/items/quaddamage.wav"));
+        assert_eq!(pickup_sound("holdable_medkit"), Some("sound/items/holdable.wav"));
+        // Flags and names that are not items have nothing to play.
+        assert_eq!(pickup_sound("team_CTF_redflag"), None);
+        assert_eq!(pickup_sound("worldspawn"), None);
     }
 
     #[test]

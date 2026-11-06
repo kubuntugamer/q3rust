@@ -411,6 +411,8 @@ pub struct Client {
     sparks: Vec<Spark>,
     /// The machinegun's shot sounds, decoded once and shared per shot.
     sounds: Vec<Arc<Vec<f32>>>,
+    /// The pickup sounds, by the path the item table names.
+    pickup_sounds: std::collections::HashMap<&'static str, Arc<Vec<f32>>>,
     /// Which of those the next shot uses, so repeated fire varies.
     next_sound: usize,
     /// Movement keys held this frame.
@@ -531,15 +533,43 @@ impl Client {
         // The machinegun's four shot sounds, decoded once into the mixer's
         // format; every shot reuses one of them.
         let mut sounds = Vec::new();
+        let mut pickup_sounds = std::collections::HashMap::new();
         if let Some(assets) = assets.as_ref() {
-            for name in ["machgf1b", "machgf2b", "machgf3b", "machgf4b"] {
-                let path = format!("sound/weapons/machinegun/{name}.wav");
-                let Some(bytes) = assets.read(&path) else {
-                    continue;
-                };
+            let mut load = |path: &str| -> Option<Arc<Vec<f32>>> {
+                let bytes = assets.read(path)?;
                 match wav::decode(&bytes) {
-                    Ok(samples) => sounds.push(Arc::new(samples)),
-                    Err(e) => eprintln!("{path}: {e:?}"),
+                    Ok(samples) => Some(Arc::new(samples)),
+                    Err(e) => {
+                        eprintln!("{path}: {e:?}");
+                        None
+                    }
+                }
+            };
+            for name in ["machgf1b", "machgf2b", "machgf3b", "machgf4b"] {
+                if let Some(sound) = load(&format!("sound/weapons/machinegun/{name}.wav")) {
+                    sounds.push(sound);
+                }
+            }
+            // The pickup sounds: every path the item table can name, loaded
+            // once and looked up when something is taken.
+            for path in [
+                "sound/items/s_health.wav",
+                "sound/items/m_health.wav",
+                "sound/items/l_health.wav",
+                "sound/items/n_health.wav",
+                "sound/items/armourfield.wav",
+                "sound/items/holdable.wav",
+                "sound/items/quaddamage.wav",
+                "sound/items/protect.wav",
+                "sound/items/haste.wav",
+                "sound/items/invisibility.wav",
+                "sound/items/regen.wav",
+                "sound/items/flight.wav",
+                "sound/misc/w_pkup.wav",
+                "sound/misc/am_pkup.wav",
+            ] {
+                if let Some(sound) = load(path) {
+                    pickup_sounds.insert(path, sound);
                 }
             }
         }
@@ -699,6 +729,7 @@ impl Client {
             items,
             sparks: Vec::new(),
             sounds,
+            pickup_sounds,
             next_sound: 0,
             input: Input::default(),
         })
@@ -1174,6 +1205,13 @@ impl Client {
             field.refresh(now);
             for class_name in prediction.collect(field, now) {
                 console::print(&format!("picked up {class_name}"));
+                if let Some(audio) = self.audio.as_ref() {
+                    if let Some(sound) = items::pickup_sound(class_name)
+                        .and_then(|path| self.pickup_sounds.get(path))
+                    {
+                        audio.play(Arc::clone(sound));
+                    }
+                }
             }
         }
         // The trigger. A hit leaves a brief mark where the bullet stopped.
