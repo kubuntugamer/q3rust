@@ -132,6 +132,17 @@ impl TargetField {
         &self.targets
     }
 
+    /// The longest any post currently on the floor will lie there, so the line
+    /// that says one went down can say how long the wait is.
+    pub fn down_wait_ms(&self) -> u32 {
+        self.targets
+            .iter()
+            .filter(|target| target.fallen_at != 0)
+            .map(|target| recovery_for(target.downs))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Wipes how many times each post has been put down, for the player coming
     /// back from the dead: a fresh life starts the fight over at the plain
     /// recovery time.
@@ -444,6 +455,28 @@ mod tests {
         field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 34, 0);
         assert_ne!(hurt, field.targets()[0].color(), "a fallen post is bare");
         assert_eq!(field.vertices().len(), 36, "and still drawn");
+    }
+
+    #[test]
+    fn a_down_post_can_say_how_long_it_will_lie_there() {
+        let mut field = TargetField::new(&[[0.0, 0.0, 0.0], [400.0, 0.0, 0.0]]);
+        assert_eq!(field.down_wait_ms(), 0, "nothing is down yet");
+
+        let shot = ([0.0, 0.0, 40.0], [100.0, 0.0, 40.0]);
+        field.shoot(shot.0, shot.1, 200, 500);
+        assert_eq!(field.down_wait_ms(), TARGET_RECOVERY_MS);
+
+        // A post put down for the second time sets the wait for the pair.
+        field.recover(500 + TARGET_RECOVERY_MS);
+        field.shoot(shot.0, shot.1, 200, 10_000);
+        assert_eq!(
+            field.down_wait_ms(),
+            TARGET_RECOVERY_MS + TARGET_RECOVERY_STEP_MS
+        );
+
+        // Once they are all up there is no wait to speak of.
+        field.recover(10_000 + TARGET_RECOVERY_MAX_MS);
+        assert_eq!(field.down_wait_ms(), 0);
     }
 
     #[test]

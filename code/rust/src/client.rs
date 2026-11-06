@@ -494,12 +494,14 @@ fn push_notice(notices: &mut Vec<(String, u32)>, text: &str, now: u32) {
     }
 }
 
-/// The on-screen line for posts going down: one, or how many at once.
-fn down_line(count: u32) -> String {
+/// The on-screen line for posts going down: one, or how many at once, and how
+/// long the wait for it to get back up will be.
+fn down_line(count: u32, wait_ms: u32) -> String {
+    let seconds = wait_ms.div_ceil(1_000).max(1);
     if count > 1 {
-        format!("{count} posts down")
+        format!("{count} posts down {seconds}s")
     } else {
-        "post down".to_string()
+        format!("post down {seconds}s")
     }
 }
 
@@ -2391,7 +2393,7 @@ impl Client {
                             if destroyed {
                                 self.posts_down += 1;
                                 console::print("target down");
-                                push_notice(&mut self.notices, &down_line(1), now);
+                                push_notice(&mut self.notices, &down_line(1, field.down_wait_ms()), now);
                             }
                         }
                         if shot.splash > 0.0 {
@@ -2400,7 +2402,11 @@ impl Client {
                             self.posts_down += (field.downed() - before) as u32;
                             if down > 0 {
                                 console::print("target down");
-                                push_notice(&mut self.notices, &down_line(down as u32), now);
+                                push_notice(
+                                    &mut self.notices,
+                                    &down_line(down as u32, field.down_wait_ms()),
+                                    now,
+                                );
                             }
                         }
                     }
@@ -2609,10 +2615,13 @@ mod bolt_arc_tests {
         assert_eq!((notices[0].0.as_str(), notices[0].1), ("post down", 1_000 + NOTICE_MS));
 
         for n in 0..5 {
-            push_notice(&mut notices, &down_line(1), 1_000 + n);
+            push_notice(&mut notices, &down_line(1, 8_000), 1_000 + n);
         }
         assert_eq!(notices.len(), NOTICE_LINES, "the stack stays small");
-        assert_eq!(notices.last().unwrap(), &("post down".to_string(), 1_004 + NOTICE_MS));
+        assert_eq!(
+            notices.last().unwrap(),
+            &("post down 8s".to_string(), 1_004 + NOTICE_MS)
+        );
 
         // Lines that have run out are cleared before the new one joins.
         push_notice(&mut notices, "post down", 1_004 + NOTICE_MS + 1);
@@ -2621,10 +2630,17 @@ mod bolt_arc_tests {
 
     #[test]
     fn a_burst_of_posts_says_how_many() {
-        assert_eq!(down_line(1), "post down");
-        assert_eq!(down_line(2), "2 posts down");
+        assert_eq!(down_line(1, 6_000), "post down 6s");
+        assert_eq!(down_line(2, 8_000), "2 posts down 8s");
         assert_eq!(up_line(1), "post back up");
         assert_eq!(up_line(3), "3 posts back up");
+    }
+
+    #[test]
+    fn the_wait_is_rounded_up_to_whole_seconds() {
+        assert_eq!(down_line(1, 6_001), "post down 7s");
+        assert_eq!(down_line(1, 1), "post down 1s", "never a zero second wait");
+        assert_eq!(down_line(1, 12_000), "post down 12s");
     }
 
     #[test]
