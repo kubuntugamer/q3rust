@@ -60,7 +60,7 @@ fn main() -> ExitCode {
         let audit = world::map_edges(&bsp);
         let notes = skipped_notes(&audit);
         println!(
-            "{map:<30} {:>5} faces {:>4} patch faces {:>7} tris {:>7} tessellated {:>3} rooms {:>4} ents {:>3} spawns{}",
+            "{map:<30} {:>5} faces {:>4} patch faces {:>7} tris {:>7} tessellated {:>3} rooms {:>4} ents {:>3} spawns {:>3} items{}",
             audit.faces,
             audit.patch_faces,
             audit.triangles,
@@ -68,6 +68,7 @@ fn main() -> ExitCode {
             audit.rooms,
             audit.entities,
             audit.player_spawns,
+            audit.items,
             notes
         );
 
@@ -82,10 +83,11 @@ fn main() -> ExitCode {
         totals.out_of_range += audit.out_of_range;
         totals.entities += audit.entities;
         totals.player_spawns += audit.player_spawns;
+        totals.items += audit.items;
     }
 
     println!(
-        "{} maps: {} rooms, {} faces ({} patch), {} triangles ({} tessellated), {} entities ({} player spawns)",
+        "{} maps: {} rooms, {} faces ({} patch), {} triangles ({} tessellated), {} entities ({} player spawns, {} items)",
         maps.len(),
         totals.rooms,
         totals.faces,
@@ -93,7 +95,8 @@ fn main() -> ExitCode {
         totals.triangles,
         totals.patch_triangles,
         totals.entities,
-        totals.player_spawns
+        totals.player_spawns,
+        totals.items
     );
     println!(
         "skipped on purpose or by fault: {} nodraw, {} patch failed, {} empty, {} out of range; {} maps failed",

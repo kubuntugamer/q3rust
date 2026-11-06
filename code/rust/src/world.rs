@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 use crate::assets::Assets;
 use crate::bsp::{Bsp, BspFace, DrawVert, LIGHTMAP_SIZE, SURFACE_PATCH};
+use crate::items::{self, ItemMark};
 use crate::shader::{
     Parser, ShaderScript, ShaderStage, ShaderTextIndex, TexMod, TextureMap, GLS_DSTBLEND_ONE,
     GLS_SRCBLEND_ONE,
@@ -50,6 +51,8 @@ pub struct MapAudit {
     /// How many of those are `info_player_deathmatch` start points, which is
     /// what a match needs before it can spawn anyone.
     pub player_spawns: usize,
+    /// Pickups the map places: items with a row in `bg_itemlist` and an origin.
+    pub items: usize,
 }
 
 impl MapAudit {
@@ -152,6 +155,7 @@ fn audit_bsp(bsp: &Bsp) -> Result<MapAudit, String> {
         .iter()
         .filter(|entity| entity.classname.as_deref() == Some("info_player_deathmatch"))
         .count();
+    audit.items = items::marks_in(&entities).len();
     Ok(audit)
 }
 
@@ -229,6 +233,10 @@ pub struct World {
     /// Triangle-list vertexes; every batch indexes a range of this.
     pub vertices: Vec<Vertex3D>,
     pub batches: Vec<Batch>,
+    /// The pickups the map places, at the origins it gave them.
+    pub items: Vec<ItemMark>,
+    /// A box per pickup, built once at load.
+    pub item_vertices: Vec<Vertex3D>,
     /// The map's skybox, when its sky shader names one.
     pub sky: Option<Sky>,
     textures: Vec<(String, Texture)>,
@@ -338,6 +346,8 @@ impl World {
         let mut world = World {
             vertices: Vec::new(),
             batches: Vec::new(),
+            items: Vec::new(),
+            item_vertices: Vec::new(),
             sky: None,
             textures: Vec::new(),
             faces: faces.len(),
@@ -404,6 +414,10 @@ impl World {
                 stages,
             });
         }
+
+        // The pickups, read from the same entity lump `audit_bsp` counts.
+        world.items = items::item_marks(bsp.entities());
+        world.item_vertices = items::box_vertices(&world.items);
 
         world.sky = sky_name
             .as_deref()
@@ -1225,6 +1239,8 @@ mod tests {
         let audit = audit_map(&bytes).unwrap();
         assert_eq!(audit.entities, 3);
         assert_eq!(audit.player_spawns, 1);
+        // The health pack is a pickup; the other two blocks are not items.
+        assert_eq!(audit.items, 1);
     }
 
     #[test]

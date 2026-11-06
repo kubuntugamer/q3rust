@@ -22,6 +22,7 @@ pub mod fs;
 pub mod game;
 pub mod game_imports;
 pub mod hunk;
+pub mod items;
 pub mod mmap;
 pub mod model;
 pub mod pak;

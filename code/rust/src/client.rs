@@ -29,7 +29,7 @@ use crate::cvar::{Cvars, CVAR_ARCHIVE};
 use crate::font::Face;
 use crate::prediction::{Input, Prediction};
 use crate::texture;
-use crate::vk::{Texture, Vertex2D, Vulkan};
+use crate::vk::{BlendMode, Texture, Vertex2D, Vulkan};
 use crate::world::{self, Camera, World};
 
 /// Set by the `quit` command and cleared when the client shuts down.
@@ -532,11 +532,12 @@ impl Client {
             match World::build(&mut renderer.vk, assets, bytes) {
                 Ok(built) => {
                     println!(
-                        "world: {} surfaces, {} triangles, {} textures, {} shaders without art",
+                        "world: {} surfaces, {} triangles, {} textures, {} shaders without art, {} items",
                         built.drawn,
                         built.vertices.len() / 3,
                         built.textures().len(),
-                        built.missing.len()
+                        built.missing.len(),
+                        built.items.len()
                     );
                     world = Some(built);
                 }
@@ -888,6 +889,20 @@ impl Client {
                     .vk
                     .draw_stage(texture, vertices, &mvp, uv, stage.blend, stage.lit)?;
             }
+        }
+
+        // The map's pickups: a box each, coloured by kind. The colour rides in
+        // the vertex colour, which is the lit path's tint, and the white
+        // texture leaves it alone.
+        if !world.item_vertices.is_empty() {
+            self.renderer.vk.draw_stage(
+                &self.renderer.white,
+                &world.item_vertices,
+                &mvp,
+                [1.0, 1.0, 0.0, 0.0],
+                BlendMode::Opaque,
+                true,
+            )?;
         }
         Ok(())
     }

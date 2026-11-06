@@ -154,6 +154,17 @@ pub fn tag_of(index: i32) -> i32 {
     item(index).map(|item| item.tag).unwrap_or(HI_NONE)
 }
 
+/// `BG_FindItem`: the row a map's `classname` spawns. Index 0 is the empty row
+/// the C keeps clear, so the empty name finds nothing.
+pub fn find(class_name: &str) -> Option<&'static Item> {
+    if class_name.is_empty() {
+        return None;
+    }
+    BG_ITEMLIST
+        .iter()
+        .find(|item| item.class_name == class_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
