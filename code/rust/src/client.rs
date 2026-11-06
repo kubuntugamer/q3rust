@@ -491,6 +491,12 @@ pub struct Client {
     pain_sound: Option<Arc<Vec<f32>>>,
     /// The fall when your health runs out.
     death_sound: Option<Arc<Vec<f32>>>,
+    /// Ricochets for a shot that stops on the map, and the lightning gun's own
+    /// crackle for its hits.
+    ricochets: Vec<Arc<Vec<f32>>>,
+    lightning_hits: Vec<Arc<Vec<f32>>>,
+    /// Which ricochet or crackle comes next.
+    next_impact: usize,
     /// When the weapon in hand stops kicking after the last shot.
     kick_until: u32,
     /// When the red wash of a fresh hit should have faded out.
@@ -624,6 +630,8 @@ impl Client {
         let mut fire_sounds: Vec<(i32, Arc<Vec<f32>>)> = Vec::new();
         let mut pain_sound: Option<Arc<Vec<f32>>> = None;
         let mut death_sound: Option<Arc<Vec<f32>>> = None;
+        let mut ricochets = Vec::new();
+        let mut lightning_hits = Vec::new();
         let mut pickup_sounds = std::collections::HashMap::new();
         if let Some(assets) = assets.as_ref() {
             let load = |path: &str| -> Option<Arc<Vec<f32>>> {
@@ -651,6 +659,16 @@ impl Client {
             // stock `sarge` voice is used for every grunt and fall.
             pain_sound = load("sound/player/sarge/pain50_1.wav");
             death_sound = load("sound/player/sarge/death1.wav");
+            for name in ["ric1", "ric2", "ric3"] {
+                if let Some(sound) = load(&format!("sound/weapons/machinegun/{name}.wav")) {
+                    ricochets.push(sound);
+                }
+            }
+            for name in ["lg_hit", "lg_hit2", "lg_hit3"] {
+                if let Some(sound) = load(&format!("sound/weapons/lightning/{name}.wav")) {
+                    lightning_hits.push(sound);
+                }
+            }
             // The weapons that had no sound of their own were firing with the
             // machinegun's. These are the ones the paks hold.
             for (weapon, path) in [
@@ -861,6 +879,9 @@ impl Client {
             fire_sounds,
             pain_sound,
             death_sound,
+            ricochets,
+            lightning_hits,
+            next_impact: 0,
             kick_until: 0,
             hurt_until: 0,
             pickup_sounds,
@@ -1768,6 +1789,19 @@ impl Client {
                             color: [255, 225, 140, 255],
                             until: now + 150,
                         });
+                        // Hear where the shot stopped, not only where it began.
+                        let sounds = if prediction.weapon() == WP_LIGHTNING {
+                            &self.lightning_hits
+                        } else {
+                            &self.ricochets
+                        };
+                        if let (Some(sound), Some(audio)) = (
+                            sounds.get(self.next_impact % sounds.len().max(1)).cloned(),
+                            self.audio.as_ref(),
+                        ) {
+                            self.next_impact += 1;
+                            audio.play_at(sound, shot.to);
+                        }
                     }
                     if shot.splash > 0.0 {
                         self.sparks.push(Spark {
