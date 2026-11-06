@@ -45,6 +45,8 @@ const FALL_DAMAGE_MEDIUM: i32 = 5;
 const RESPAWN_DELAY: u32 = 1_700;
 /// A rocket's speed, from `g_weapon.c`: 900 units a second.
 const ROCKET_SPEED: f32 = 900.0;
+/// `sv_gravity`: what pulls a lobbed grenade down.
+const GRAVITY: f32 = 800.0;
 /// A plasma ball is quicker and shorter-lived than a rocket.
 const PLASMA_SPEED: f32 = 2_000.0;
 /// How long a projectile lives before it goes off in the air.
@@ -66,6 +68,8 @@ pub struct Projectile {
     radius: f32,
     /// Blue for plasma, warm for a rocket.
     pub plasma: bool,
+    /// Whether the round falls as it flies, the way a grenade does.
+    gravity: bool,
 }
 
 /// Where a projectile went off, and what it does there.
@@ -106,6 +110,8 @@ struct Pattern {
     radius: f32,
     /// Whether it is plasma rather than a rocket.
     plasma: bool,
+    /// Whether it falls as it flies, the way a grenade does.
+    gravity: bool,
 }
 
 const PATTERNS: [Pattern; 7] = [
@@ -119,6 +125,7 @@ const PATTERNS: [Pattern; 7] = [
         speed: 0.0,
         radius: 0.0,
         plasma: false,
+        gravity: false,
     },
     Pattern {
         weapon: WP_SHOTGUN,
@@ -131,6 +138,7 @@ const PATTERNS: [Pattern; 7] = [
         speed: 0.0,
         radius: 0.0,
         plasma: false,
+        gravity: false,
     },
     Pattern {
         weapon: WP_ROCKET_LAUNCHER,
@@ -142,6 +150,7 @@ const PATTERNS: [Pattern; 7] = [
         speed: ROCKET_SPEED,
         radius: ROCKET_RADIUS,
         plasma: false,
+        gravity: false,
     },
     Pattern {
         weapon: WP_RAILGUN,
@@ -154,6 +163,7 @@ const PATTERNS: [Pattern; 7] = [
         speed: 0.0,
         radius: 0.0,
         plasma: false,
+        gravity: false,
     },
     Pattern {
         weapon: WP_PLASMAGUN,
@@ -166,6 +176,7 @@ const PATTERNS: [Pattern; 7] = [
         speed: PLASMA_SPEED,
         radius: PLASMA_RADIUS,
         plasma: true,
+        gravity: false,
     },
     Pattern {
         weapon: WP_GRENADE_LAUNCHER,
@@ -173,11 +184,13 @@ const PATTERNS: [Pattern; 7] = [
         pellets: 1,
         spread: 0.0,
         splash: 0.0,
-        // Slower than a rocket, and it bursts as wide as one.
+        // Slower than a rocket, and it bursts as wide as one, falling as it
+        // goes so it has to be lobbed.
         damage: 100,
         speed: 700.0,
         radius: ROCKET_RADIUS,
         plasma: false,
+        gravity: true,
     },
     Pattern {
         weapon: WP_LIGHTNING,
@@ -190,6 +203,7 @@ const PATTERNS: [Pattern; 7] = [
         speed: 0.0,
         radius: 0.0,
         plasma: false,
+        gravity: false,
     },
 ];
 
@@ -400,6 +414,7 @@ impl Prediction {
                 damage: pattern.damage,
                 radius: pattern.radius,
                 plasma: pattern.plasma,
+                gravity: pattern.gravity,
             });
             return vec![Shot {
                 from,
@@ -540,7 +555,11 @@ impl Prediction {
     /// outlives `PROJECTILE_LIFE_MS`, goes off where it stopped.
     fn advance_rockets(&mut self, seconds: f32) {
         let mut in_flight = Vec::with_capacity(self.projectiles.len());
-        for shot in std::mem::take(&mut self.projectiles) {
+        for mut shot in std::mem::take(&mut self.projectiles) {
+            // A grenade falls the way the game's gravity would pull it.
+            if shot.gravity {
+                shot.velocity[2] -= GRAVITY * seconds;
+            }
             let to = [
                 shot.origin[0] + shot.velocity[0] * seconds,
                 shot.origin[1] + shot.velocity[1] * seconds,
@@ -976,6 +995,29 @@ mod tests {
             let turned = (off - prediction.yaw() + 180.0).rem_euclid(360.0) - 180.0;
             assert!(turned.abs() <= 3.5, "pellet {turned} degrees off centre");
         }
+    }
+
+    #[test]
+    fn a_grenade_falls_as_it_flies() {
+        let mut prediction = prediction_on_a_test_map();
+        prediction.pm.ps.stats[STAT_WEAPONS] |= 1 << WP_GRENADE_LAUNCHER;
+        prediction.pm.ps.ammo[WP_GRENADE_LAUNCHER as usize] = 5;
+        assert!(prediction.select_weapon(WP_GRENADE_LAUNCHER));
+        for tick in 0..40 {
+            prediction.step(1_000 + tick * 50, &Input::default());
+        }
+        let now = 1_000 + 40 * 50;
+        assert_eq!(prediction.fire(now).len(), 1);
+        let start = prediction.projectiles()[0].origin;
+
+        prediction.step(now + 100, &Input::default());
+        // Fired level, so any drop is gravity's doing.
+        let after = prediction
+            .projectiles()
+            .first()
+            .expect("the grenade is still in the air")
+            .origin;
+        assert!(after[2] < start[2], "the grenade drops: {after:?}");
     }
 
     #[test]
