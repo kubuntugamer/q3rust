@@ -483,6 +483,11 @@ pub struct Client {
     charge_sound: Option<Arc<Vec<f32>>>,
     /// The one fire sound each weapon with its own, by weapon number.
     fire_sounds: Vec<(i32, Arc<Vec<f32>>)>,
+    /// The grunt when something hurts you. The player model's sound is the
+    /// stock `sarge` one; the client draws no player model to disagree.
+    pain_sound: Option<Arc<Vec<f32>>>,
+    /// The fall when your health runs out.
+    death_sound: Option<Arc<Vec<f32>>>,
     /// When the weapon in hand stops kicking after the last shot.
     kick_until: u32,
     /// The pickup sounds, by the path the item table names.
@@ -612,6 +617,8 @@ impl Client {
         let mut explosion_sound: Option<Arc<Vec<f32>>> = None;
         let mut charge_sound: Option<Arc<Vec<f32>>> = None;
         let mut fire_sounds: Vec<(i32, Arc<Vec<f32>>)> = Vec::new();
+        let mut pain_sound: Option<Arc<Vec<f32>>> = None;
+        let mut death_sound: Option<Arc<Vec<f32>>> = None;
         let mut pickup_sounds = std::collections::HashMap::new();
         if let Some(assets) = assets.as_ref() {
             let load = |path: &str| -> Option<Arc<Vec<f32>>> {
@@ -635,6 +642,10 @@ impl Client {
             rocket_sound = load("sound/weapons/rocket/rocklf1a.wav");
             explosion_sound = load("sound/weapons/rocket/rocklx1a.wav");
             charge_sound = load("sound/weapons/bfg/bfg_hum.wav");
+            // The player's own voice. The client draws no player model, so the
+            // stock `sarge` voice is used for every grunt and fall.
+            pain_sound = load("sound/player/sarge/pain50_1.wav");
+            death_sound = load("sound/player/sarge/death1.wav");
             // The weapons that had no sound of their own were firing with the
             // machinegun's. These are the ones the paks hold.
             for (weapon, path) in [
@@ -843,6 +854,8 @@ impl Client {
             explosion_sound,
             charge_sound,
             fire_sounds,
+            pain_sound,
+            death_sound,
             kick_until: 0,
             pickup_sounds,
             next_sound: 0,
@@ -1530,7 +1543,17 @@ impl Client {
             });
         }
         if damage > 0 {
+            let was_alive = prediction.health() > 0;
             prediction.hurt(damage);
+            // Say so out loud: a grunt for a hit and the fall for a death.
+            let sound = if prediction.health() <= 0 && was_alive {
+                self.death_sound.clone()
+            } else {
+                self.pain_sound.clone()
+            };
+            if let (Some(sound), Some(audio)) = (sound, self.audio.as_ref()) {
+                audio.play_at(sound, eye);
+            }
         }
     }
 
