@@ -458,6 +458,18 @@ const RECOVERY_GRACE_MS: u32 = 700;
 /// is the warning you get from the far edge of its range.
 const BOLT_TELEGRAPH: u32 = 450;
 
+/// How long the bar under the crosshair takes to shrink away after a bolt was
+/// stepped out of, and how wide it starts.
+const DODGE_FLASH_MS: u32 = 240;
+const DODGE_FLASH_WIDTH: f32 = 26.0;
+
+/// How wide the dodge bar is with `left_ms` still to run: full at the moment the
+/// bolt goes past, gone by the time the bar has run out.
+fn dodge_bar_width(left_ms: u32) -> f32 {
+    let left = left_ms.min(DODGE_FLASH_MS) as f32 / DODGE_FLASH_MS as f32;
+    DODGE_FLASH_WIDTH * left
+}
+
 /// How long a short line like "post down" stays on screen before it fades out.
 const NOTICE_MS: u32 = 1_600;
 
@@ -705,6 +717,8 @@ pub struct Client {
     hurt_until: u32,
     /// When the hit marker on the crosshair should have faded out.
     hit_until: u32,
+    /// When the short bar saying "you stepped out of that" should have gone.
+    dodge_until: u32,
     /// How many practice posts have been put on the floor this life.
     posts_down: u32,
     /// Whether the player was dead last frame, so a respawn can be noticed.
@@ -1096,6 +1110,7 @@ impl Client {
             kick_until: 0,
             hurt_until: 0,
             hit_until: 0,
+            dodge_until: 0,
             posts_down: 0,
             was_dead: false,
             pickup_sounds,
@@ -1759,6 +1774,19 @@ impl Client {
         ] {
             self.renderer.fill(x, y, w, h, [235, 235, 235, 190])?;
         }
+        // A bar under the crosshair shrinks away as it shows the step of speed
+        // a bolt that just missed paid for, so the reward is seen, not guessed.
+        if now < self.dodge_until {
+            let bar = dodge_bar_width(self.dodge_until - now);
+            self.renderer.fill(
+                mid_x - bar * 0.5,
+                mid_y + 16.0,
+                bar,
+                2.0,
+                [150, 225, 255, 220],
+            )?;
+        }
+
         // A shot that hits a post flares the corners of the crosshair amber.
         if now < self.hit_until {
             for (x, y, w, h) in [
@@ -2053,6 +2081,7 @@ impl Client {
         });
         if dodged && prediction.health() > 0 {
             prediction.dodge();
+            self.dodge_until = now + DODGE_FLASH_MS;
         }
         // A fading trail behind each bolt, so an incoming shot can be tracked
         // and stepped out of.
@@ -2531,6 +2560,18 @@ mod bolt_arc_tests {
         assert!(bearing(eye, 90.0, [0.0, 100.0, 24.0]).abs() < 0.01);
         // And it wraps rather than jumping at north.
         assert!(bearing(eye, 350.0, [100.0, 20.0, 24.0]) > 0.0);
+    }
+
+    #[test]
+    fn the_dodge_bar_shrinks_away() {
+        assert_eq!(dodge_bar_width(DODGE_FLASH_MS), DODGE_FLASH_WIDTH);
+        assert!((dodge_bar_width(DODGE_FLASH_MS / 2) - DODGE_FLASH_WIDTH * 0.5).abs() < 0.01);
+        assert_eq!(dodge_bar_width(0), 0.0, "gone when the time is up");
+        assert_eq!(
+            dodge_bar_width(DODGE_FLASH_MS * 2),
+            DODGE_FLASH_WIDTH,
+            "a stale clock never makes it wider than it starts"
+        );
     }
 
     #[test]
