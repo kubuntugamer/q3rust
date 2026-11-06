@@ -1287,6 +1287,29 @@ impl Client {
                 if let Some(field) = self.targets.as_mut() {
                     field.blast(at, crate::prediction::ROCKET_RADIUS, 100);
                 }
+                // A rocket fired into the floor hurts the one who fired it, less
+                // the further away the blast is.
+                let eye = prediction.origin();
+                let away = ((eye[0] - at[0]).powi(2)
+                    + (eye[1] - at[1]).powi(2)
+                    + (eye[2] - at[2]).powi(2))
+                .sqrt();
+                let radius = crate::prediction::ROCKET_RADIUS;
+                if away < radius {
+                    let hurt = ((1.0 - away / radius) * 50.0) as i32;
+                    if hurt > 0 {
+                        prediction.hurt(hurt);
+                    }
+                }
+            }
+            // A short-lived spark at each rocket leaves a trail behind it.
+            for at in self.rockets.clone() {
+                self.sparks.push(Spark {
+                    at,
+                    half: 2.5,
+                    color: [255, 210, 150, 255],
+                    until: now + 120,
+                });
             }
         }
         // The ear is where the camera is, so sounds can fall off with distance.
@@ -1365,7 +1388,7 @@ impl Client {
                         audio.play_at(sound, shot.from);
                     }
                     if let Some(field) = self.targets.as_mut() {
-                        if let Some((at, destroyed)) = field.shoot(shot.from, shot.to) {
+                        if let Some((at, destroyed)) = field.shoot(shot.from, shot.to, shot.damage) {
                             self.sparks.push(Spark {
                                 at,
                                 half: 3.0,

@@ -18,7 +18,7 @@ use crate::assets::Assets;
 use crate::bg_misc::{self, ItemType};
 use crate::bg_pmove::{
     pmove, Pmove, UserCmd, ENTITYNUM_NONE, EV_FALL_FAR, EV_FALL_MEDIUM, STAT_ARMOR, STAT_HEALTH,
-    STAT_WEAPONS, WP_MACHINEGUN, WP_ROCKET_LAUNCHER, WP_SHOTGUN,
+    STAT_WEAPONS, WP_MACHINEGUN, WP_RAILGUN, WP_ROCKET_LAUNCHER, WP_SHOTGUN,
 };
 use crate::bsp::Bsp;
 use crate::collision::Collision;
@@ -67,6 +67,8 @@ pub struct Shot {
     pub hit: bool,
     /// Blast radius in units, or 0 for a plain bullet.
     pub splash: f32,
+    /// What this round takes off whatever it hits.
+    pub damage: i32,
 }
 
 /// What a weapon does when the trigger is pulled: how often it fires, how many
@@ -78,15 +80,18 @@ struct Pattern {
     /// Full cone width in degrees; a machinegun fires one pellet straight.
     spread: f32,
     splash: f32,
+    /// Per round, or per pellet for the shotgun.
+    damage: i32,
 }
 
-const PATTERNS: [Pattern; 3] = [
+const PATTERNS: [Pattern; 4] = [
     Pattern {
         weapon: WP_MACHINEGUN,
         interval: 100,
         pellets: 1,
         spread: 0.0,
         splash: 0.0,
+        damage: 34,
     },
     Pattern {
         weapon: WP_SHOTGUN,
@@ -94,6 +99,8 @@ const PATTERNS: [Pattern; 3] = [
         pellets: 11,
         spread: 6.0,
         splash: 0.0,
+        // A pellet, not a shell: eleven of them at close range add up.
+        damage: 12,
     },
     Pattern {
         weapon: WP_ROCKET_LAUNCHER,
@@ -101,6 +108,16 @@ const PATTERNS: [Pattern; 3] = [
         pellets: 1,
         spread: 0.0,
         splash: 120.0,
+        damage: 100,
+    },
+    Pattern {
+        weapon: WP_RAILGUN,
+        interval: 1_500,
+        pellets: 1,
+        spread: 0.0,
+        splash: 0.0,
+        // One slug, straight through: a post goes down in a single shot.
+        damage: 100,
     },
 ];
 
@@ -314,6 +331,7 @@ impl Prediction {
                 to: muzzle,
                 hit: false,
                 splash: 0.0,
+                damage: pattern.damage,
             }];
         }
 
@@ -356,6 +374,7 @@ impl Prediction {
                 to: trace.endpos,
                 hit: trace.fraction < 1.0,
                 splash: pattern.splash,
+                damage: pattern.damage,
             });
         }
         shots

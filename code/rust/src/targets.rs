@@ -134,7 +134,12 @@ impl TargetField {
 
     /// Fires a shot segment at the posts. Returns the nearest hit's point and
     /// whether that hit put the post down.
-    pub fn shoot(&mut self, from: [f32; 3], to: [f32; 3]) -> Option<([f32; 3], bool)> {
+    pub fn shoot(
+        &mut self,
+        from: [f32; 3],
+        to: [f32; 3],
+        damage: i32,
+    ) -> Option<([f32; 3], bool)> {
         let mut best: Option<(f32, usize, [f32; 3])> = None;
         for (index, target) in self.targets.iter().enumerate() {
             if !target.alive() {
@@ -154,7 +159,7 @@ impl TargetField {
         }
 
         let (fraction, index, at) = best?;
-        self.targets[index].health -= TARGET_HIT_DAMAGE;
+        self.targets[index].health -= damage;
         let down = self.targets[index].health <= 0;
         if down {
             let from = [
@@ -282,19 +287,22 @@ mod tests {
 
         let from = [0.0, 0.0, 40.0];
         let to = [600.0, 0.0, 40.0];
-        let (at, destroyed) = field.shoot(from, to).expect("the post is in the way");
+        let (at, destroyed) = field.shoot(from, to, TARGET_HIT_DAMAGE).expect("the post is in the way");
         assert!(destroyed == false);
         assert!((at[0] - 240.0).abs() < 0.001, "{at:?}");
         assert_eq!(field.alive(), 2, "one hit does not kill it");
 
-        field.shoot(from, to);
-        let (_, destroyed) = field.shoot(from, to).expect("still standing");
+        field.shoot(from, to, TARGET_HIT_DAMAGE);
+        let (_, destroyed) = field.shoot(from, to, TARGET_HIT_DAMAGE).expect("still standing");
         assert!(destroyed, "the third hit puts it down");
         assert_eq!(field.alive(), 1);
 
         // A downed post is no longer a target, but it is still there, lying
         // on the floor along the line it was shot from.
-        assert!(field.shoot(from, to).is_none(), "the far post is behind this one");
+        assert!(
+            field.shoot(from, to, TARGET_HIT_DAMAGE).is_none(),
+            "the far post is behind this one"
+        );
         assert!(field.targets()[0].fallen());
         let fallen = &field.vertices()[..36];
         let top = fallen
@@ -314,6 +322,15 @@ mod tests {
     }
 
     #[test]
+    fn one_rail_slug_is_enough_and_a_pellet_is_not() {
+        let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
+        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 12);
+        assert_eq!(field.alive(), 1, "a pellet does not put a post down");
+        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 100);
+        assert_eq!(field.alive(), 0, "a slug does");
+    }
+
+    #[test]
     fn a_rocket_near_a_post_takes_it_down() {
         let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
         // Just outside its box, so the blast is what does the work.
@@ -329,8 +346,16 @@ mod tests {
     fn a_shot_that_misses_touches_nothing() {
         let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
         // Upwards past the side of the post, and across in front of it.
-        assert!(field.shoot([0.0, 100.0, 40.0], [0.0, 100.0, 800.0]).is_none());
-        assert!(field.shoot([0.0, -100.0, 40.0], [600.0, -100.0, 40.0]).is_none());
+        assert!(
+            field
+                .shoot([0.0, 100.0, 40.0], [0.0, 100.0, 800.0], 34)
+                .is_none()
+        );
+        assert!(
+            field
+                .shoot([0.0, -100.0, 40.0], [600.0, -100.0, 40.0], 34)
+                .is_none()
+        );
         assert_eq!(field.alive(), 1);
     }
 
@@ -338,11 +363,11 @@ mod tests {
     fn a_post_dims_as_it_is_shot() {
         let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
         let fresh = field.targets()[0].color();
-        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0]);
-        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0]);
+        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 34);
+        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 34);
         let hurt = field.targets()[0].color();
         assert_ne!(fresh, hurt, "a hurt post reads differently");
-        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0]);
+        field.shoot([0.0, 0.0, 40.0], [100.0, 0.0, 40.0], 34);
         assert_ne!(hurt, field.targets()[0].color(), "a fallen post is bare");
         assert_eq!(field.vertices().len(), 36, "and still drawn");
     }
