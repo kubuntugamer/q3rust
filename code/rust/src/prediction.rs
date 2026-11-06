@@ -42,6 +42,8 @@ const SHOT_RANGE: f32 = 8192.0;
 /// What `ClientEvents` takes off for a hard landing, and for a medium one.
 const FALL_DAMAGE_FAR: i32 = 10;
 const FALL_DAMAGE_MEDIUM: i32 = 5;
+/// `player_die`'s `respawnTime`: how long a body lies before it comes back.
+const RESPAWN_DELAY: u32 = 1_700;
 
 /// One round leaving the weapon: where it started, where it stopped, and
 /// whether it stopped on something.
@@ -98,6 +100,10 @@ pub struct Prediction {
     requested_weapon: i32,
     /// When the last round left, so the trigger cannot outrun the weapon.
     last_shot: i32,
+    /// Every spot the map offers, kept so a respawn has one to choose.
+    spawns: Vec<SpawnPoint>,
+    /// When the body comes back, or 0 while the player is alive.
+    respawn_at: u32,
 }
 
 impl Prediction {
@@ -114,7 +120,8 @@ impl Prediction {
             .ok_or_else(|| MapError::Missing(path.clone()))?
             .into_owned();
         let bsp = Bsp::load(bytes)?;
-        let (spawn, yaw) = pick_spawn(&spawn_points(bsp.entities())).unwrap_or(([0.0; 3], 0.0));
+        let spawns = spawn_points(bsp.entities());
+        let (spawn, yaw) = pick_spawn(&spawns).unwrap_or(([0.0; 3], 0.0));
 
         let world: &'static Collision = Box::leak(Box::new(Collision::load(&bsp)?));
         let mut pm = Pmove::new(spawn, world);
@@ -131,6 +138,8 @@ impl Prediction {
             last_time: 0,
             requested_weapon: WP_MACHINEGUN,
             last_shot: -1000,
+            spawns,
+            respawn_at: 0,
         })
     }
 
@@ -283,6 +292,15 @@ impl Prediction {
     /// `now` is the client's millisecond clock. `Pmove` chops a long gap into
     /// 66 ms pieces, so a stalled frame catches up instead of teleporting.
     pub fn step(&mut self, now: u32, input: &Input) {
+        // A body that has waited out its death comes back before anything else
+        // happens this frame.
+        if self.respawn_at != 0 && now >= self.respawn_at {
+            self.respawn();
+        }
+        // A corpse does not walk, whatever keys are held.
+        let still = Input::default();
+        let input = if self.health() <= 0 { &still } else { input };
+
         let now = now as i32;
         let elapsed = (now - self.last_time).clamp(0, 1000) as f32 / 1000.0;
         self.last_time = now;
@@ -308,6 +326,35 @@ impl Prediction {
         // the server would apply it.
         let events = std::mem::take(&mut self.pm.ps.events);
         self.apply_events(&events);
+
+        // `player_die`: health that has run out starts the respawn clock.
+        if self.health() <= 0 && self.respawn_at == 0 {
+            self.respawn_at = self.last_time.max(0) as u32 + RESPAWN_DELAY;
+        }
+    }
+
+    /// `PutClientInServer`: a fresh body on one of the map's spots, with the
+    /// health, armour and starting weapon the game gives a new player.
+    pub fn respawn(&mut self) {
+        let (origin, yaw) = pick_spawn(&self.spawns).unwrap_or(([0.0; 3], 0.0));
+        self.pm.mv.origin = origin;
+        self.pm.mv.velocity = [0.0; 3];
+        self.pm.ps.stats[STAT_HEALTH] = 100;
+        self.pm.ps.stats[STAT_ARMOR] = 0;
+        self.pm.ps.stats[STAT_WEAPONS] = 1 << WP_MACHINEGUN;
+        self.pm.ps.ammo[WP_MACHINEGUN as usize] = STARTING_AMMO;
+        self.pm.ps.weapon = WP_MACHINEGUN;
+        self.pm.ps.ground_entity_num = ENTITYNUM_NONE;
+        self.requested_weapon = WP_MACHINEGUN;
+        self.last_shot = -1000;
+        self.yaw = yaw;
+        self.pitch = 0.0;
+        self.respawn_at = 0;
+    }
+
+    /// Whether the player is waiting to come back.
+    pub fn dead(&self) -> bool {
+        self.respawn_at != 0
     }
 
     /// The events the move raised. Only landings hurt so far: nothing on the
@@ -626,6 +673,32 @@ mod tests {
         }
         assert_eq!(prediction.ammo(), 0);
         assert!(prediction.fire((now + 500) as u32).is_none());
+    }
+
+    #[test]
+    fn dying_comes_back_whole_on_a_map_spot() {
+        let mut prediction = prediction_on_a_test_map();
+        prediction.hurt(200);
+        assert_eq!(prediction.health(), 0);
+        assert!(!prediction.dead(), "the clock starts on the next move");
+
+        prediction.step(1_000, &Input::default());
+        assert!(prediction.dead());
+        assert_eq!(prediction.health(), 0, "a body stays down for a moment");
+
+        prediction.step(1_000 + RESPAWN_DELAY, &Input::default());
+        assert!(!prediction.dead());
+        assert_eq!(prediction.health(), 100);
+        assert_eq!(prediction.ammo(), STARTING_AMMO);
+        // The spot it chose, on the last frame's drop: the move still applies
+        // gravity to the fresh body on the frame it comes back.
+        let origin = prediction.origin();
+        assert!(
+            spawn_points(MAP_ENTITIES)
+                .iter()
+                .any(|spot| spot.origin[0] == origin[0] && spot.origin[1] == origin[1]),
+            "{origin:?} is not above one of the map's spawns"
+        );
     }
 
     #[test]

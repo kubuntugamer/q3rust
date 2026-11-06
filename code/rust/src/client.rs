@@ -535,7 +535,7 @@ impl Client {
         let mut sounds = Vec::new();
         let mut pickup_sounds = std::collections::HashMap::new();
         if let Some(assets) = assets.as_ref() {
-            let mut load = |path: &str| -> Option<Arc<Vec<f32>>> {
+            let load = |path: &str| -> Option<Arc<Vec<f32>>> {
                 let bytes = assets.read(path)?;
                 match wav::decode(&bytes) {
                     Ok(samples) => Some(Arc::new(samples)),
