@@ -1580,17 +1580,11 @@ impl Client {
         let weapon = bg_misc::class_of_weapon(prediction.weapon())
             .map(|name| name.trim_start_matches("weapon_"))
             .unwrap_or("none");
-        let mut status = format!(
-            "HEALTH {health}   ARMOR {armor}   {weapon} {ammo}   DOWN {}",
+        let status = format!(
+            "HEALTH {health}   ARMOR {armor}   DOWN {}",
             self.posts_down
         );
-        // A charged weapon shows how far the held charge has got, since
-        // nothing else on screen says when it is ready to let go.
         let now = self.millis();
-        let charging = prediction.charge(now);
-        if charging > 0.0 {
-            status.push_str(&format!("   CHARGING {}%", (charging * 100.0) as u32));
-        }
         let [x, y, z] = prediction.origin();
         let line = format!(
             "{x:.0} {y:.0} {z:.0}   {:.0} u/s   {}",
@@ -1681,6 +1675,58 @@ impl Client {
                 bar_width * armour / 100.0,
                 armour_height,
                 [95, 170, 235, 255],
+            )?;
+        }
+
+        // What is in hand sits in its own panel at the bottom right: the
+        // weapon's name over its clip, so the numbers are where the eye already
+        // goes for a weapon and not mixed in with health.
+        let panel_width = 170.0;
+        let big_scale = scale * 1.7;
+        let big_height = self.renderer.face().line_height(big_scale);
+        let panel_height = line_height + big_height + 16.0;
+        let panel_x = width as f32 - 8.0 - panel_width;
+        let panel_y = height as f32 - 8.0 - panel_height;
+        self.renderer.fill(
+            panel_x,
+            panel_y,
+            panel_width,
+            panel_height,
+            [0, 0, 0, 150],
+        )?;
+        let name = weapon.to_uppercase();
+        let name_width = self.renderer.face().width(&name, scale);
+        self.renderer.text(
+            &name,
+            panel_x + panel_width - 8.0 - name_width,
+            panel_y + 6.0,
+            scale,
+            [200, 200, 200, 255],
+        )?;
+        let clip = format!("{ammo}");
+        let clip_width = self.renderer.face().width(&clip, big_scale);
+        let clip_colour = if ammo > 0 {
+            [245, 245, 245, 255]
+        } else {
+            [225, 90, 80, 255]
+        };
+        self.renderer.text(
+            &clip,
+            panel_x + panel_width - 8.0 - clip_width,
+            panel_y + 6.0 + line_height,
+            big_scale,
+            clip_colour,
+        )?;
+        // A charged weapon fills a violet bar along the bottom of the panel,
+        // since nothing else on screen says when it is ready to let go.
+        let charging = prediction.charge(now);
+        if charging > 0.0 {
+            self.renderer.fill(
+                panel_x + 2.0,
+                panel_y + panel_height - 6.0,
+                (panel_width - 4.0) * charging.clamp(0.0, 1.0),
+                4.0,
+                [170, 110, 235, 255],
             )?;
         }
 
