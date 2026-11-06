@@ -422,6 +422,8 @@ pub struct Client {
     explosion_sound: Option<Arc<Vec<f32>>>,
     /// The BFG's hum, played once when a charge starts.
     charge_sound: Option<Arc<Vec<f32>>>,
+    /// The one fire sound each weapon with its own, by weapon number.
+    fire_sounds: Vec<(i32, Arc<Vec<f32>>)>,
     /// When the weapon in hand stops kicking after the last shot.
     kick_until: u32,
     /// The pickup sounds, by the path the item table names.
@@ -550,6 +552,7 @@ impl Client {
         let mut rocket_sound: Option<Arc<Vec<f32>>> = None;
         let mut explosion_sound: Option<Arc<Vec<f32>>> = None;
         let mut charge_sound: Option<Arc<Vec<f32>>> = None;
+        let mut fire_sounds: Vec<(i32, Arc<Vec<f32>>)> = Vec::new();
         let mut pickup_sounds = std::collections::HashMap::new();
         if let Some(assets) = assets.as_ref() {
             let load = |path: &str| -> Option<Arc<Vec<f32>>> {
@@ -573,6 +576,19 @@ impl Client {
             rocket_sound = load("sound/weapons/rocket/rocklf1a.wav");
             explosion_sound = load("sound/weapons/rocket/rocklx1a.wav");
             charge_sound = load("sound/weapons/bfg/bfg_hum.wav");
+            // The weapons that had no sound of their own were firing with the
+            // machinegun's. These are the ones the paks hold.
+            for (weapon, path) in [
+                (WP_GRENADE_LAUNCHER, "sound/weapons/grenade/grenlf1a.wav"),
+                (WP_LIGHTNING, "sound/weapons/lightning/lg_fire.wav"),
+                (WP_RAILGUN, "sound/weapons/railgun/railgf1a.wav"),
+                (WP_PLASMAGUN, "sound/weapons/plasma/hyprbf1a.wav"),
+                (WP_BFG, "sound/weapons/bfg/bfg_fire.wav"),
+            ] {
+                if let Some(sound) = load(path) {
+                    fire_sounds.push((weapon, sound));
+                }
+            }
             // The pickup sounds: every path the item table can name, loaded
             // once and looked up when something is taken.
             for path in [
@@ -763,6 +779,7 @@ impl Client {
             rocket_sound,
             explosion_sound,
             charge_sound,
+            fire_sounds,
             kick_until: 0,
             pickup_sounds,
             next_sound: 0,
@@ -1506,19 +1523,26 @@ impl Client {
                         }
                     }
                     // Each weapon fires with its own sound.
-                    let fired = match prediction.weapon() {
+                    let weapon = prediction.weapon();
+                    let fired = match weapon {
                         WP_SHOTGUN => self.shotgun_sound.clone(),
                         WP_ROCKET_LAUNCHER => self.rocket_sound.clone(),
-                        _ => {
-                            if self.sounds.is_empty() {
-                                None
-                            } else {
-                                let sound =
-                                    Arc::clone(&self.sounds[self.next_sound % self.sounds.len()]);
-                                self.next_sound += 1;
-                                Some(sound)
-                            }
-                        }
+                        _ => self
+                            .fire_sounds
+                            .iter()
+                            .find(|(number, _)| *number == weapon)
+                            .map(|(_, sound)| Arc::clone(sound))
+                            .or_else(|| {
+                                if self.sounds.is_empty() {
+                                    None
+                                } else {
+                                    let sound = Arc::clone(
+                                        &self.sounds[self.next_sound % self.sounds.len()],
+                                    );
+                                    self.next_sound += 1;
+                                    Some(sound)
+                                }
+                            }),
                     };
                     if let (Some(sound), Some(audio)) = (fired, self.audio.as_ref()) {
                         audio.play_at(sound, shot.from);
