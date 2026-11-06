@@ -23,6 +23,11 @@ use sdl2::{EventPump, Sdl, VideoSubsystem};
 
 use crate::assets::Assets;
 use crate::audio::Audio;
+use crate::bg_misc;
+use crate::bg_pmove::{
+    WP_BFG, WP_GAUNTLET, WP_GRENADE_LAUNCHER, WP_LIGHTNING, WP_MACHINEGUN, WP_PLASMAGUN, WP_RAILGUN,
+    WP_ROCKET_LAUNCHER, WP_SHOTGUN,
+};
 use crate::cmd::CmdSystem;
 use crate::console;
 use crate::cvar::{Cvars, CVAR_ARCHIVE};
@@ -635,6 +640,7 @@ impl Client {
         banner.push_str(
             "console open: Esc closes it, Tab completes, Up/Down walks history\n\
              move: WASD, jump: Space, turn: Left/Right, look: mouse\n\
+             weapons: 1-9 switch to a weapon you are carrying\n\
              display: Q3_WIDTH/Q3_HEIGHT pick a resolution, Q3_FULLSCREEN=1 a native TV mode\n\
              cg_fov widens with the aspect ratio; the vertical view stays 4:3",
         );
@@ -758,6 +764,29 @@ impl Client {
         }
 
         if !console::lock().is_open() {
+            // The weapon keys, bound the way the stock config binds them: 1 is
+            // the gauntlet, 2 the machinegun, and so on up to 9 for the bfg.
+            let weapon = match key {
+                Keycode::Num1 => Some(WP_GAUNTLET),
+                Keycode::Num2 => Some(WP_MACHINEGUN),
+                Keycode::Num3 => Some(WP_SHOTGUN),
+                Keycode::Num4 => Some(WP_GRENADE_LAUNCHER),
+                Keycode::Num5 => Some(WP_ROCKET_LAUNCHER),
+                Keycode::Num6 => Some(WP_LIGHTNING),
+                Keycode::Num7 => Some(WP_RAILGUN),
+                Keycode::Num8 => Some(WP_PLASMAGUN),
+                Keycode::Num9 => Some(WP_BFG),
+                _ => None,
+            };
+            if let Some(weapon) = weapon {
+                if !repeat {
+                    if let Some(prediction) = self.prediction.as_mut() {
+                        prediction.select_weapon(weapon);
+                    }
+                }
+                return true;
+            }
+
             if key == Keycode::Escape && !repeat {
                 // Keys held when the console opens would otherwise stay down.
                 self.input = Input::default();
@@ -1058,7 +1087,14 @@ impl Client {
 
         let now = self.millis();
         if let Some(prediction) = self.prediction.as_mut() {
+            let before = prediction.weapon();
             prediction.step(now, &self.input);
+            // Say so when a change finishes, so the keys are not silent.
+            if prediction.weapon() != before {
+                if let Some(name) = bg_misc::class_of_weapon(prediction.weapon()) {
+                    console::print(&format!("weapon: {name}"));
+                }
+            }
         }
         // Bring back what has waited long enough, then take what the player is
         // standing in.

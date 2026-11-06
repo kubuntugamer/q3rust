@@ -15,6 +15,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::assets::Assets;
+use crate::bg_misc::{self, ItemType};
 use crate::bg_pmove::{
     pmove, Pmove, UserCmd, ENTITYNUM_NONE, STAT_ARMOR, STAT_HEALTH, STAT_WEAPONS, WP_MACHINEGUN,
 };
@@ -54,6 +55,9 @@ pub struct Prediction {
     /// The previous command time, so turning follows the frame length instead
     /// of the frame count.
     last_time: i32,
+    /// The weapon asked for, which `PM_Weapon` drops the old one and raises.
+    /// It differs from the weapon in hand while a change is playing out.
+    requested_weapon: i32,
 }
 
 impl Prediction {
@@ -85,6 +89,7 @@ impl Prediction {
             yaw,
             pitch: 0.0,
             last_time: 0,
+            requested_weapon: WP_MACHINEGUN,
         })
     }
 
@@ -124,10 +129,40 @@ impl Prediction {
             .unwrap_or(0)
     }
 
+    /// The weapon in hand, as a `WP_*`.
+    pub fn weapon(&self) -> i32 {
+        self.pm.ps.weapon
+    }
+
+    /// A weapon key: ask for the weapon in that slot, if the player has it.
+    /// Returns whether the weapon is one the player owns, so a key bound to a
+    /// weapon still on the floor does nothing.
+    pub fn select_weapon(&mut self, weapon: i32) -> bool {
+        let owned = usize::try_from(weapon)
+            .ok()
+            .map(|slot| self.pm.ps.stats[STAT_WEAPONS] & (1 << slot) != 0)
+            .unwrap_or(false);
+        if !owned {
+            return false;
+        }
+        self.requested_weapon = weapon;
+        true
+    }
+
     /// `CG_TouchItem`: take every pickup the player is standing in, and say
-    /// what was taken.
+    /// what was taken. A weapon the player did not have comes up in hand, the
+    /// way it does in a match.
     pub fn collect(&mut self, field: &mut ItemField, now: u32) -> Vec<&'static str> {
-        field.touch(&mut self.pm.ps, self.pm.mv.origin, now)
+        let taken = field.touch(&mut self.pm.ps, self.pm.mv.origin, now);
+        for class_name in &taken {
+            let Some(item) = bg_misc::find(class_name) else {
+                continue;
+            };
+            if item.item_type == ItemType::Weapon {
+                self.requested_weapon = item.tag;
+            }
+        }
+        taken
     }
 
     /// `cl.viewangles[YAW]`: degrees, growing to the left.
@@ -166,9 +201,9 @@ impl Prediction {
             forward_move: (input.forward as i32 - input.back as i32) * MOVE_SCALE,
             right_move: (input.right as i32 - input.left as i32) * MOVE_SCALE,
             up_move: if input.jump { MOVE_SCALE } else { 0 },
-            // Keep the weapon in hand: a command with no weapon would make
-            // `PM_Weapon` put it away every frame.
-            weapon: self.pm.ps.weapon,
+            // The weapon asked for; `PM_Weapon` turns a change into a drop and
+            // a raise, and leaves the weapon alone when the two agree.
+            weapon: self.requested_weapon,
             ..UserCmd::default()
         };
         pmove(&mut self.pm);
@@ -245,6 +280,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::bg_pmove::{WP_BFG, WP_ROCKET_LAUNCHER, WP_SHOTGUN};
 
     /// Two deathmatch spots with directions, plus a start with no origin and an
     /// intermission spot the player must never appear on.
@@ -355,6 +391,52 @@ mod tests {
             .map(|_| pick_spawn(&spawn_points(spot)).unwrap().1)
             .collect();
         assert!(yaws.iter().all(|yaw| (0.0..360.0).contains(yaw)), "{yaws:?}");
+    }
+
+    const MAP_WITH_ROCKETS: &[u8] = br#"{
+"classname" "worldspawn"
+}
+{
+"classname" "info_player_deathmatch"
+"origin" "64 128 16"
+"angle" "270"
+}
+{
+"classname" "weapon_rocketlauncher"
+"origin" "64 128 17"
+}
+"#;
+
+    #[test]
+    fn a_picked_up_weapon_comes_up_in_hand() {
+        let assets = assets_with_map(MAP_WITH_ROCKETS);
+        let mut prediction = Prediction::load(&assets, "q3dm1").unwrap();
+        let mut field = ItemField::new(&crate::items::item_marks(MAP_WITH_ROCKETS));
+        assert_eq!(prediction.weapon(), WP_MACHINEGUN);
+        assert_eq!(prediction.ammo(), STARTING_AMMO);
+
+        prediction.step(16, &Input::default());
+        assert_eq!(prediction.collect(&mut field, 16), ["weapon_rocketlauncher"]);
+        assert!(
+            !prediction.select_weapon(WP_SHOTGUN),
+            "a weapon still on the floor cannot be selected"
+        );
+
+        // Dropping the machinegun and raising the launcher takes time.
+        for tick in 1..60 {
+            prediction.step(16 + tick * 20, &Input::default());
+        }
+        assert_eq!(prediction.weapon(), WP_ROCKET_LAUNCHER);
+        assert_eq!(prediction.ammo(), 10);
+    }
+
+    #[test]
+    fn a_weapon_key_only_works_for_a_weapon_in_hand() {
+        let mut prediction = prediction_on_a_test_map();
+        assert!(prediction.select_weapon(WP_MACHINEGUN));
+        assert!(!prediction.select_weapon(WP_BFG));
+        // The clip counter follows the weapon in hand once a change completes.
+        assert_eq!(prediction.ammo(), STARTING_AMMO);
     }
 
     #[test]

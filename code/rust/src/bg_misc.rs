@@ -188,6 +188,15 @@ pub static WORLD_MODELS: [&str; 36] = [
     "models/flags/b_flag.md3",
 ];
 
+/// `BG_FindItemForWeapon`: the table row a weapon number names, which is how
+/// the client turns a `WP_*` into something printable.
+pub fn class_of_weapon(weapon: i32) -> Option<&'static str> {
+    BG_ITEMLIST
+        .iter()
+        .find(|item| item.item_type == IT_WEAPON && item.tag == weapon)
+        .map(|item| item.class_name)
+}
+
 /// The model a pickup puts on the map, by its `bg_itemlist` row.
 pub fn world_model(index: usize) -> Option<&'static str> {
     WORLD_MODELS
@@ -231,6 +240,7 @@ pub fn index_of(class_name: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bg_pmove::WP_NONE;
 
     #[test]
     fn the_table_keeps_the_c_indices() {
@@ -264,5 +274,14 @@ mod tests {
         }
         assert_eq!(world_model(12), Some("models/weapons2/rocketl/rocketl.md3"));
         assert_eq!(world_model(BG_NUM_ITEMS), None);
+    }
+
+    #[test]
+    fn a_weapon_number_names_its_table_row() {
+        assert_eq!(class_of_weapon(WP_ROCKET_LAUNCHER), Some("weapon_rocketlauncher"));
+        assert_eq!(class_of_weapon(WP_RAILGUN), Some("weapon_railgun"));
+        // Not weapon numbers, so not rows a weapon key can name.
+        assert_eq!(class_of_weapon(-1), None);
+        assert_eq!(class_of_weapon(WP_NONE), None);
     }
 }
