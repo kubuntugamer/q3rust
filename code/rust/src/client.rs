@@ -424,6 +424,10 @@ struct WindUp {
     from: [f32; 3],
     started_at: u32,
     fires_at: u32,
+    /// How much of the flight time to lead you by: the usual `BOLT_LEAD` for a
+    /// post firing alone, nothing at all for the second post of a volley, which
+    /// aims where you stand so that stopping is not a safe answer.
+    lead: f32,
 }
 
 impl WindUp {
@@ -440,6 +444,10 @@ impl WindUp {
 
 /// How long the red wash of a fresh hit lasts, in milliseconds.
 const HURT_FLASH_MS: u32 = 250;
+
+/// How many posts may have a shot lined up at once. Two is enough to catch you
+/// whichever way you step; more than that is a wall of bolts, not a fight.
+const MAX_FIRING_POSTS: usize = 2;
 
 /// How close a post has to be to shoot, how often it fires, how fast its bolt
 /// flies, and what it takes off you when it lands.
@@ -607,12 +615,62 @@ const BOLT_LEAD: f32 = 0.5;
 
 /// Where a post aims to catch you: ahead of where you are, by the time the
 /// bolt takes to arrive.
-fn bolt_lead(eye: [f32; 3], velocity: [f32; 3], flight: f32) -> [f32; 3] {
+fn bolt_lead(eye: [f32; 3], velocity: [f32; 3], flight: f32, lead: f32) -> [f32; 3] {
     [
-        eye[0] + velocity[0] * flight * BOLT_LEAD,
-        eye[1] + velocity[1] * flight * BOLT_LEAD,
-        eye[2] + velocity[2] * flight * BOLT_LEAD,
+        eye[0] + velocity[0] * flight * lead,
+        eye[1] + velocity[1] * flight * lead,
+        eye[2] + velocity[2] * flight * lead,
     ]
+}
+
+/// How much of the flight time the post filling `slot` of a volley leads you
+/// by. The nearest leads the shot; a second post firing with it aims where you
+/// are right now, so stepping one way to dodge the first walks into the second
+/// and standing still eats both.
+fn lead_for(slot: usize) -> f32 {
+    if slot == 0 {
+        BOLT_LEAD
+    } else {
+        0.0
+    }
+}
+
+/// Which posts should line up a shot right now, nearest first: those still
+/// standing, with a clear line to `eye`, in range, and not already lining one
+/// up. Up to `limit` of them may fire together, so two posts with you in the
+/// open between them can catch you whichever way you step.
+fn volley_candidates(
+    field: &TargetField,
+    eye: [f32; 3],
+    already: &[WindUp],
+    limit: usize,
+    sees: impl Fn([f32; 3], [f32; 3]) -> bool,
+) -> Vec<(usize, [f32; 3], f32)> {
+    let mut found: Vec<(usize, [f32; 3], f32)> = field
+        .targets()
+        .iter()
+        .enumerate()
+        .filter(|(_, target)| target.alive())
+        .filter(|(index, _)| !already.iter().any(|wind| wind.index == *index))
+        .filter(|(_, target)| {
+            sees(
+                [
+                    target.origin[0],
+                    target.origin[1],
+                    target.origin[2] + 24.0,
+                ],
+                eye,
+            )
+        })
+        .map(|(index, target)| (index, target.origin, away(target.origin, eye)))
+        .filter(|(_, _, distance)| *distance < BOLT_RANGE)
+        .collect();
+    found.sort_by(|a, b| {
+        a.2.partial_cmp(&b.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    found.truncate(limit);
+    found
 }
 
 /// Where a post lies relative to where you face, in degrees: zero dead ahead,
@@ -756,8 +814,9 @@ pub struct Client {
     bolts: Vec<Bolt>,
     /// When the posts may fire again, so they do not all fire at once.
     next_bolt: u32,
+    /// The posts lining shots up right now, at most `MAX_FIRING_POSTS` of them.
     /// The post that is lining one up right now, if any.
-    wind_up: Option<WindUp>,
+    wind_ups: Vec<WindUp>,
     /// The last post the console named a shot for, and when, so a post that
     /// keeps firing does not fill the log.
     bolt_call: Option<(usize, u32)>,
@@ -1178,7 +1237,7 @@ impl Client {
             beams: Vec::new(),
             bolts: Vec::new(),
             next_bolt: 0,
-            wind_up: None,
+            wind_ups: Vec::new(),
             bolt_call: None,
             notices: Vec::new(),
             bolts_moved_at: 0,
@@ -1559,10 +1618,11 @@ impl Client {
             )?;
         }
 
-        // A post that is lining up a shot glows at its gun, growing and
-        // brightening until the bolt leaves.
-        if let Some(wind) = self.wind_up.as_ref() {
-            let progress = wind.progress(self.millis());
+        // Every post that is lining up a shot glows at its gun, growing and
+        // brightening until its bolt leaves.
+        let glow_now = self.millis();
+        for wind in &self.wind_ups {
+            let progress = wind.progress(glow_now);
             let color = [
                 255,
                 (110.0 + 145.0 * progress) as u8,
@@ -1894,13 +1954,16 @@ impl Client {
 
         // A post lining a shot up shows on a ring around the crosshair, on the
         // side the post is on and brighter as the shot gets closer, so a shot
-        // from off screen can be found and turned into before it fires.
-        if let Some(wind) = self.wind_up.as_ref().filter(|_| !prediction.dead()) {
-            let progress = wind.progress(now);
-            let heading = bearing(prediction.origin(), prediction.yaw(), wind.from);
-            let arrow = threat_arrow([mid_x, mid_y], heading, 34.0);
-            let color = [255, (210.0 - 90.0 * progress) as u8, 70, 230];
-            self.renderer.triangle(arrow, color)?;
+        // from off screen can be found and turned into before it fires. A
+        // volley shows a mark for each post, so both can be found.
+        if !prediction.dead() {
+            for wind in &self.wind_ups {
+                let progress = wind.progress(now);
+                let heading = bearing(prediction.origin(), prediction.yaw(), wind.from);
+                let arrow = threat_arrow([mid_x, mid_y], heading, 34.0);
+                let color = [255, (210.0 - 90.0 * progress) as u8, 70, 230];
+                self.renderer.triangle(arrow, color)?;
+            }
         }
 
         // The shield a respawn buys pulses at the edges of the frame while it
@@ -2090,57 +2153,55 @@ impl Client {
         let step = ((now.wrapping_sub(self.bolts_moved_at)) as f32 / 1000.0).min(0.1);
         self.bolts_moved_at = now;
 
-        // A post that has finished lining up takes its shot.
-        if let Some(wind) = self.wind_up.take() {
-            if now >= wind.fires_at {
-                let alive = self
-                    .targets
-                    .as_ref()
-                    .map(|field| field.targets()[wind.index].alive())
-                    .unwrap_or(false);
-                if alive {
-                    let flight = away(wind.from, eye) / BOLT_SPEED;
-                    let aim = bolt_lead(eye, prediction.velocity(), flight);
-                    self.bolts.push(Bolt {
-                        at: wind.from,
-                        velocity: bolt_aim(wind.from, aim),
-                        until: now + 6_000,
-                        grazed: false,
-                    });
-                }
-            } else {
+        // Any post that has finished lining up takes its shot.
+        let lining_up = std::mem::take(&mut self.wind_ups);
+        let mut still_lining_up = Vec::with_capacity(lining_up.len());
+        for wind in lining_up {
+            if now < wind.fires_at {
                 // Still lining up: keep the glow going.
-                self.wind_up = Some(wind);
+                still_lining_up.push(wind);
+                continue;
+            }
+            let alive = self
+                .targets
+                .as_ref()
+                .map(|field| field.targets()[wind.index].alive())
+                .unwrap_or(false);
+            if alive {
+                let flight = away(wind.from, eye) / BOLT_SPEED;
+                let aim = bolt_lead(eye, prediction.velocity(), flight, wind.lead);
+                self.bolts.push(Bolt {
+                    at: wind.from,
+                    velocity: bolt_aim(wind.from, aim),
+                    until: now + 6_000,
+                    grazed: false,
+                });
             }
         }
+        self.wind_ups = still_lining_up;
 
-        if self.wind_up.is_none() && now >= self.next_bolt && prediction.health() > 0 {
+        if self.wind_ups.len() < MAX_FIRING_POSTS
+            && now >= self.next_bolt
+            && prediction.health() > 0
+        {
             if let Some(field) = self.targets.as_ref() {
-                let nearest = field
-                    .targets()
-                    .iter()
-                    .filter(|target| target.alive())
-                    // A post only fires when the map leaves it a clear line.
-                    .filter(|target| {
-                        let chest = [
-                            target.origin[0],
-                            target.origin[1],
-                            target.origin[2] + 24.0,
-                        ];
+                // A post only fires when the map leaves it a clear line.
+                let room = MAX_FIRING_POSTS - self.wind_ups.len();
+                let chosen =
+                    volley_candidates(field, eye, &self.wind_ups, room, |chest, eye| {
                         prediction.sees(chest, eye)
-                    })
-                    .enumerate()
-                    .map(|(index, target)| (index, target.origin, away(target.origin, eye)))
-                    .filter(|(_, _, distance)| *distance < BOLT_RANGE)
-                    .min_by(|a, b| {
-                        a.2.partial_cmp(&b.2)
-                            .unwrap_or(std::cmp::Ordering::Equal)
                     });
-                if let Some((index, from, distance)) = nearest {
+                if !chosen.is_empty() {
+                    // The wait for the next shot starts now, so a post whose
+                    // shot is cancelled still keeps its rhythm.
+                    self.next_bolt = now + BOLT_INTERVAL;
+                }
+                for (slot, (index, from, distance)) in chosen.into_iter().enumerate() {
                     // Say which post has you and which way to look, since a
                     // post off screen is easy to miss otherwise. A post that
-                    // keeps firing only gets a line now and then.
-                    if worth_saying(self.bolt_call, index, now) {
+                    // keeps firing only gets a line now and then, and a volley
+                    // names the one to turn to first.
+                    if slot == 0 && worth_saying(self.bolt_call, index, now) {
                         self.bolt_call = Some((index, now));
                         let heading = bearing(prediction.origin(), prediction.yaw(), from);
                         console::print(&format!(
@@ -2148,14 +2209,13 @@ impl Client {
                             side_words(heading)
                         ));
                     }
-                    // The wait for the next shot starts now, so a post whose
-                    // shot is cancelled still keeps its rhythm.
-                    self.next_bolt = now + BOLT_INTERVAL;
-                    self.wind_up = Some(WindUp {
+                    let lead = lead_for(slot);
+                    self.wind_ups.push(WindUp {
                         index,
                         from,
                         started_at: now,
                         fires_at: now + telegraph_for(distance),
+                        lead,
                     });
                 }
             }
@@ -2257,7 +2317,7 @@ impl Client {
             if self.was_dead && !dead_now {
                 self.posts_down = 0;
                 self.bolts.clear();
-                self.wind_up = None;
+                self.wind_ups.clear();
                 self.bolt_call = None;
                 self.next_bolt = now + SPAWN_GRACE_MS;
                 self.spawn_grace_until = now + SPAWN_GRACE_MS;
@@ -2639,6 +2699,7 @@ mod bolt_arc_tests {
             from: [0.0, 0.0, 24.0],
             started_at: 0,
             fires_at: 450,
+            lead: BOLT_LEAD,
         };
         assert_eq!(wind.progress(0), 0.0, "dark the moment it starts lining up");
         assert!((wind.progress(225) - 0.5).abs() < 0.01);
@@ -2884,10 +2945,57 @@ mod bolt_arc_tests {
             from: [0.0, 0.0, 24.0],
             started_at: 1_000,
             fires_at: 1_000 + BOLT_TELEGRAPH_NEAR,
+            lead: BOLT_LEAD,
         };
         assert_eq!(wind.progress(1_000), 0.0);
         assert!((wind.progress(1_000 + BOLT_TELEGRAPH_NEAR / 2) - 0.5).abs() < 0.02);
         assert_eq!(wind.progress(1_000 + BOLT_TELEGRAPH_NEAR), 1.0);
+    }
+
+    #[test]
+    fn posts_in_the_open_on_both_sides_line_up_together() {
+        assert_eq!(MAX_FIRING_POSTS, 2, "a fight, not a wall of bolts");
+        let field = TargetField::new(&[[100.0, 0.0, 0.0], [300.0, 0.0, 0.0], [900.0, 0.0, 0.0]]);
+        let chosen = volley_candidates(&field, [0.0; 3], &[], MAX_FIRING_POSTS, |_, _| true);
+        assert_eq!(chosen.len(), 2, "the two nearest, and no more");
+        assert_eq!(chosen[0].0, 0, "nearest first, so it fires first");
+        assert_eq!(chosen[1].0, 1);
+        assert!((chosen[0].2 - 100.0).abs() < 0.01);
+        assert_eq!(lead_for(0), BOLT_LEAD, "the first post leads the shot");
+        assert_eq!(lead_for(1), 0.0, "the second aims where you stand");
+    }
+
+    #[test]
+    fn a_post_behind_a_wall_or_already_firing_is_left_out() {
+        let field = TargetField::new(&[[100.0, 0.0, 0.0], [150.0, 0.0, 0.0]]);
+        // The second post is behind something as far as this test is concerned.
+        let blocked = volley_candidates(&field, [0.0; 3], &[], MAX_FIRING_POSTS, |chest, _| {
+            chest[0] < 120.0
+        });
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].0, 0);
+
+        // With the nearest already lining up, the other takes the free slot.
+        let busy = [WindUp {
+            index: 0,
+            from: [100.0, 0.0, 0.0],
+            started_at: 0,
+            fires_at: 450,
+            lead: BOLT_LEAD,
+        }];
+        let next = volley_candidates(&field, [0.0; 3], &busy, MAX_FIRING_POSTS - 1, |_, _| true);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].0, 1, "no post takes two shots at once");
+        assert!(
+            volley_candidates(&field, [0.0; 3], &busy, 0, |_, _| true).is_empty(),
+            "no room means no volley"
+        );
+    }
+
+    #[test]
+    fn a_post_out_of_reach_is_left_out() {
+        let far = TargetField::new(&[[BOLT_RANGE + 50.0, 0.0, 0.0]]);
+        assert!(volley_candidates(&far, [0.0; 3], &[], MAX_FIRING_POSTS, |_, _| true).is_empty());
     }
 
     #[test]
@@ -2904,11 +3012,13 @@ mod bolt_arc_tests {
     fn a_post_leads_a_moving_target_but_only_half_way() {
         let eye = [100.0, 0.0, 24.0];
         let running = [400.0, 0.0, 0.0];
-        let aimed = bolt_lead(eye, running, 0.5);
+        let aimed = bolt_lead(eye, running, 0.5, BOLT_LEAD);
         // Half a second at 400 a second is 200 units, so half is 100.
         assert!((aimed[0] - 200.0).abs() < 0.01, "{aimed:?}");
         // Standing still, the aim is exactly where you are.
-        assert_eq!(bolt_lead(eye, [0.0; 3], 0.5), eye);
+        assert_eq!(bolt_lead(eye, [0.0; 3], 0.5, BOLT_LEAD), eye);
+        // Without lead it aims at where you stand, wall or no wall.
+        assert_eq!(bolt_lead(eye, running, 0.5, 0.0), eye);
         // It never leads further than you could have moved.
         let full = [eye[0] + running[0] * 0.5, eye[1], eye[2]];
         assert!(aimed[0] < full[0]);
