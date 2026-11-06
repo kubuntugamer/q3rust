@@ -1251,7 +1251,7 @@ impl Client {
         // The trigger. A hit leaves a brief mark where the bullet stopped.
         if self.input.attack {
             if let Some(prediction) = self.prediction.as_mut() {
-                if let Some(shot) = prediction.fire(now) {
+                for shot in prediction.fire(now) {
                     // The flash sits just past the muzzle, along the shot.
                     let forward = shot.forward();
                     self.sparks.push(Spark {
@@ -1272,11 +1272,23 @@ impl Client {
                             until: now + 150,
                         });
                     }
-                    if let Some(audio) = self.audio.as_ref() {
-                        if !self.sounds.is_empty() {
-                            let sound = Arc::clone(&self.sounds[self.next_sound % self.sounds.len()]);
-                            self.next_sound += 1;
-                            audio.play_at(sound, shot.from);
+                    if shot.splash > 0.0 {
+                        self.sparks.push(Spark {
+                            at: shot.to,
+                            half: 12.0,
+                            color: [255, 190, 120, 255],
+                            until: now + 200,
+                        });
+                    }
+                    // Only the machinegun has a sound so far.
+                    if prediction.weapon() == WP_MACHINEGUN {
+                        if let Some(audio) = self.audio.as_ref() {
+                            if !self.sounds.is_empty() {
+                                let sound =
+                                    Arc::clone(&self.sounds[self.next_sound % self.sounds.len()]);
+                                self.next_sound += 1;
+                                audio.play_at(sound, shot.from);
+                            }
                         }
                     }
                     if let Some(field) = self.targets.as_mut() {
@@ -1288,6 +1300,12 @@ impl Client {
                                 until: now + 150,
                             });
                             if destroyed {
+                                console::print("target down");
+                            }
+                        }
+                        if shot.splash > 0.0 {
+                            let down = field.blast(shot.to, shot.splash, 100);
+                            if down > 0 {
                                 console::print("target down");
                             }
                         }

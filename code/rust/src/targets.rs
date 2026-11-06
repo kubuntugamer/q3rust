@@ -108,6 +108,38 @@ impl TargetField {
         target.health -= TARGET_HIT_DAMAGE;
         Some((at, !target.alive()))
     }
+
+    /// A rocket's blast: every standing post within `radius` of `at` loses
+    /// `damage`, which is what makes a rocket worth aiming at the floor near
+    /// a post. Returns how many posts went down.
+    pub fn blast(&mut self, at: [f32; 3], radius: f32, damage: i32) -> usize {
+        let mut down = 0;
+        for target in &mut self.targets {
+            if !target.alive() {
+                continue;
+            }
+            let centre = [
+                target.origin[0],
+                target.origin[1],
+                target.origin[2] + TARGET_MAXS[2] / 2.0,
+            ];
+            let delta = [
+                centre[0] - at[0],
+                centre[1] - at[1],
+                centre[2] - at[2],
+            ];
+            let distance =
+                (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+            if distance > radius {
+                continue;
+            }
+            target.health -= damage;
+            if !target.alive() {
+                down += 1;
+            }
+        }
+        down
+    }
 }
 
 /// Where a segment first enters the post's box, as a fraction of the segment,
@@ -194,6 +226,18 @@ mod tests {
         // A downed post is neither hit nor drawn.
         assert!(field.shoot(from, to).is_none(), "the far post is behind this one");
         assert_eq!(field.vertices().len(), 36);
+    }
+
+    #[test]
+    fn a_rocket_near_a_post_takes_it_down() {
+        let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
+        // Just outside its box, so the blast is what does the work.
+        assert_eq!(field.blast([0.0, 60.0, 32.0], 120.0, 100), 1);
+        assert_eq!(field.alive(), 0);
+
+        let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
+        assert_eq!(field.blast([0.0, 400.0, 32.0], 120.0, 100), 0, "out of range");
+        assert_eq!(field.alive(), 1);
     }
 
     #[test]

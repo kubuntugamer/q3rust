@@ -18,7 +18,7 @@ use crate::assets::Assets;
 use crate::bg_misc::{self, ItemType};
 use crate::bg_pmove::{
     pmove, Pmove, UserCmd, ENTITYNUM_NONE, EV_FALL_FAR, EV_FALL_MEDIUM, STAT_ARMOR, STAT_HEALTH,
-    STAT_WEAPONS, WP_MACHINEGUN,
+    STAT_WEAPONS, WP_MACHINEGUN, WP_ROCKET_LAUNCHER, WP_SHOTGUN,
 };
 use crate::bsp::Bsp;
 use crate::collision::Collision;
@@ -35,8 +35,6 @@ const TURN_SPEED: f32 = 180.0;
 /// `G_InitPlayer`'s starting clip. Handing the player the machinegun means the
 /// readout and the ammo rules start where the game does instead of at zero.
 const STARTING_AMMO: i32 = 50;
-/// The machinegun's shot interval: `fireTime` is 100 ms.
-const FIRE_TIME: i32 = 100;
 /// `MAX_SHOT_RANGE`: a shot that hits nothing travels this far.
 const SHOT_RANGE: f32 = 8192.0;
 /// What `ClientEvents` takes off for a hard landing, and for a medium one.
@@ -52,7 +50,44 @@ pub struct Shot {
     pub from: [f32; 3],
     pub to: [f32; 3],
     pub hit: bool,
+    /// Blast radius in units, or 0 for a plain bullet.
+    pub splash: f32,
 }
+
+/// What a weapon does when the trigger is pulled: how often it fires, how many
+/// pellets leave, how far they spread, and whether the hit explodes.
+struct Pattern {
+    weapon: i32,
+    interval: i32,
+    pellets: usize,
+    /// Full cone width in degrees; a machinegun fires one pellet straight.
+    spread: f32,
+    splash: f32,
+}
+
+const PATTERNS: [Pattern; 3] = [
+    Pattern {
+        weapon: WP_MACHINEGUN,
+        interval: 100,
+        pellets: 1,
+        spread: 0.0,
+        splash: 0.0,
+    },
+    Pattern {
+        weapon: WP_SHOTGUN,
+        interval: 1000,
+        pellets: 11,
+        spread: 6.0,
+        splash: 0.0,
+    },
+    Pattern {
+        weapon: WP_ROCKET_LAUNCHER,
+        interval: 800,
+        pellets: 1,
+        spread: 0.0,
+        splash: 120.0,
+    },
+];
 
 impl Shot {
     /// The direction the round travelled, as a unit vector. A shooter's flash
@@ -204,18 +239,21 @@ impl Prediction {
     ///
     /// Only the machinegun fires so far; the other weapons need their own shot
     /// patterns, which is a bigger port than one hitscan line.
-    pub fn fire(&mut self, now: u32) -> Option<Shot> {
-        if self.pm.ps.weapon != WP_MACHINEGUN {
-            return None;
-        }
+    pub fn fire(&mut self, now: u32) -> Vec<Shot> {
+        let Some(pattern) = PATTERNS
+            .iter()
+            .find(|pattern| pattern.weapon == self.pm.ps.weapon)
+        else {
+            return Vec::new();
+        };
         let now = now as i32;
-        if now - self.last_shot < FIRE_TIME {
-            return None;
+        if now - self.last_shot < pattern.interval {
+            return Vec::new();
         }
-        let slot = WP_MACHINEGUN as usize;
-        let ammo = *self.pm.ps.ammo.get(slot)?;
+        let slot = pattern.weapon as usize;
+        let ammo = self.pm.ps.ammo.get(slot).copied().unwrap_or(0);
         if ammo <= 0 {
-            return None;
+            return Vec::new();
         }
         self.last_shot = now;
         if let Some(clip) = self.pm.ps.ammo.get_mut(slot) {
@@ -227,31 +265,49 @@ impl Prediction {
             self.pm.mv.origin[1],
             self.pm.mv.origin[2] + DEFAULT_VIEW_HEIGHT,
         ];
-        // `AngleVectors`: a positive pitch looks down, and yaw grows to the
-        // left, which is the basis the camera uses too.
-        let (yaw, pitch) = (self.yaw.to_radians(), self.pitch.to_radians());
-        let forward = [
-            pitch.cos() * yaw.cos(),
-            pitch.cos() * yaw.sin(),
-            -pitch.sin(),
-        ];
-        let to = [
-            from[0] + forward[0] * SHOT_RANGE,
-            from[1] + forward[1] * SHOT_RANGE,
-            from[2] + forward[2] * SHOT_RANGE,
-        ];
 
-        // Shots stop on the same surfaces the player's body does; bodies and
-        // glass are part of `MASK_SHOT`, which has nothing to hit yet.
-        let trace = self
-            .pm
-            .world
-            .trace(from, to, [0.0; 3], [0.0; 3], MASK_PLAYERSOLID);
-        Some(Shot {
-            from,
-            to: trace.endpos,
-            hit: trace.fraction < 1.0,
-        })
+        let mut shots = Vec::with_capacity(pattern.pellets);
+        for pellet in 0..pattern.pellets {
+            // A spread is a fan across the cone, deterministic so a replay
+            // looks the same; the shotgun's pellets scatter around the centre.
+            let step = if pattern.pellets > 1 {
+                pellet as f32 / (pattern.pellets - 1) as f32 - 0.5
+            } else {
+                0.0
+            };
+            let sideways = step * pattern.spread;
+            let lift = (((pellet * 5) % 7) as f32 / 6.0 - 0.5) * pattern.spread;
+            let (yaw, pitch) = (
+                (self.yaw + sideways).to_radians(),
+                (self.pitch + lift).to_radians(),
+            );
+            // `AngleVectors`: a positive pitch looks down, and yaw grows to the
+            // left, which is the basis the camera uses too.
+            let forward = [
+                pitch.cos() * yaw.cos(),
+                pitch.cos() * yaw.sin(),
+                -pitch.sin(),
+            ];
+            let to = [
+                from[0] + forward[0] * SHOT_RANGE,
+                from[1] + forward[1] * SHOT_RANGE,
+                from[2] + forward[2] * SHOT_RANGE,
+            ];
+
+            // Shots stop on the same surfaces the player's body does; bodies
+            // and glass are part of `MASK_SHOT`, which has nothing to hit yet.
+            let trace = self
+                .pm
+                .world
+                .trace(from, to, [0.0; 3], [0.0; 3], MASK_PLAYERSOLID);
+            shots.push(Shot {
+                from,
+                to: trace.endpos,
+                hit: trace.fraction < 1.0,
+                splash: pattern.splash,
+            });
+        }
+        shots
     }
 
     /// `CG_TouchItem`: take every pickup the player is standing in, and say
@@ -624,7 +680,7 @@ mod tests {
         let mut prediction = prediction_on_a_test_map();
         assert_eq!(prediction.ammo(), STARTING_AMMO);
 
-        let shot = prediction.fire(1_000).expect("the first press fires");
+        let shot = prediction.fire(1_000).pop().expect("the first press fires");
         assert!(!shot.hit, "the test map has no geometry to stop a bullet");
         let travel = ((shot.to[0] - shot.from[0]).powi(2)
             + (shot.to[1] - shot.from[1]).powi(2)
@@ -633,8 +689,8 @@ mod tests {
         assert!(travel > 1_000.0, "the round went nowhere: {:?}", shot);
         assert_eq!(prediction.ammo(), STARTING_AMMO - 1);
 
-        assert!(prediction.fire(1_050).is_none(), "too soon for a second round");
-        assert!(prediction.fire(1_100).is_some());
+        assert!(prediction.fire(1_050).is_empty(), "too soon for a second round");
+        assert!(!prediction.fire(1_100).is_empty());
         assert_eq!(prediction.ammo(), STARTING_AMMO - 2);
     }
 
@@ -642,7 +698,7 @@ mod tests {
     fn a_round_travels_along_a_unit_direction() {
         let mut prediction = prediction_on_a_test_map();
         prediction.turn(90.0 - prediction.yaw(), 0.0);
-        let forward = prediction.fire(1_000).unwrap().forward();
+        let forward = prediction.fire(1_000).pop().unwrap().forward();
         let length = (forward[0] * forward[0] + forward[1] * forward[1] + forward[2] * forward[2])
             .sqrt();
         assert!((length - 1.0).abs() < 1e-4, "{forward:?}");
@@ -653,13 +709,13 @@ mod tests {
     fn the_trigger_looks_where_the_player_looks() {
         let mut prediction = prediction_on_a_test_map();
         prediction.turn(90.0 - prediction.yaw(), 0.0);
-        let shot = prediction.fire(1_000).unwrap();
+        let shot = prediction.fire(1_000).pop().unwrap();
         assert!(shot.to[1] > shot.from[1], "{:?}", shot);
         assert!((shot.to[0] - shot.from[0]).abs() < 1.0, "{:?}", shot);
 
         let mut prediction = prediction_on_a_test_map();
         prediction.turn(0.0, 90.0);
-        let shot = prediction.fire(1_000).unwrap();
+        let shot = prediction.fire(1_000).pop().unwrap();
         assert!(shot.to[2] < shot.from[2], "looking down shoots down: {:?}", shot);
     }
 
@@ -669,10 +725,10 @@ mod tests {
         let mut now = 0;
         for _ in 0..STARTING_AMMO {
             now += 100;
-            assert!(prediction.fire(now as u32).is_some());
+            assert!(!prediction.fire(now as u32).is_empty());
         }
         assert_eq!(prediction.ammo(), 0);
-        assert!(prediction.fire((now + 500) as u32).is_none());
+        assert!(prediction.fire((now + 500) as u32).is_empty());
     }
 
     #[test]
@@ -699,6 +755,56 @@ mod tests {
                 .any(|spot| spot.origin[0] == origin[0] && spot.origin[1] == origin[1]),
             "{origin:?} is not above one of the map's spawns"
         );
+    }
+
+    #[test]
+    fn the_shotgun_fires_a_spread_for_one_shell() {
+        let mut prediction = prediction_on_a_test_map();
+        prediction.select_weapon(WP_MACHINEGUN);
+        // Give the player the shotgun and its shells, as a pickup would.
+        prediction.pm.ps.stats[STAT_WEAPONS] |= 1 << WP_SHOTGUN;
+        prediction.pm.ps.ammo[WP_SHOTGUN as usize] = 10;
+        assert!(prediction.select_weapon(WP_SHOTGUN));
+        for tick in 0..40 {
+            prediction.step(1_000 + tick * 50, &Input::default());
+        }
+        assert_eq!(prediction.weapon(), WP_SHOTGUN);
+
+        let now = 1_000 + 40 * 50;
+        let shots = prediction.fire(now);
+        assert_eq!(shots.len(), 11, "a full load of pellets");
+        assert_eq!(prediction.ammo(), 9, "one shell, not one per pellet");
+        assert!(prediction.fire(now + 500).is_empty(), "the pump takes a second");
+
+        // Every pellet is inside the cone the pattern names.
+        let centre = [
+            prediction.origin()[0],
+            prediction.origin()[1],
+            prediction.origin()[2] + DEFAULT_VIEW_HEIGHT,
+        ];
+        for shot in &shots {
+            let side = [shot.to[0] - centre[0], shot.to[1] - centre[1]];
+            let off = side[1].atan2(side[0]).to_degrees();
+            let turned = (off - prediction.yaw() + 180.0).rem_euclid(360.0) - 180.0;
+            assert!(turned.abs() <= 3.5, "pellet {turned} degrees off centre");
+        }
+    }
+
+    #[test]
+    fn the_rocket_launcher_fires_one_round_that_splashes() {
+        let mut prediction = prediction_on_a_test_map();
+        prediction.pm.ps.stats[STAT_WEAPONS] |= 1 << WP_ROCKET_LAUNCHER;
+        prediction.pm.ps.ammo[WP_ROCKET_LAUNCHER as usize] = 5;
+        assert!(prediction.select_weapon(WP_ROCKET_LAUNCHER));
+        for tick in 0..40 {
+            prediction.step(1_000 + tick * 50, &Input::default());
+        }
+        assert_eq!(prediction.weapon(), WP_ROCKET_LAUNCHER);
+
+        let shots = prediction.fire(1_000 + 40 * 50);
+        assert_eq!(shots.len(), 1);
+        assert!(shots[0].splash > 0.0, "a rocket explodes");
+        assert_eq!(prediction.ammo(), 4);
     }
 
     #[test]
