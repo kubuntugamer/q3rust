@@ -372,9 +372,13 @@ fn quad(
     ]
 }
 
-/// A shot's mark: where it stopped and how long it stays.
+/// A brief mark a shot leaves: where it is, how big, its colour, and how long
+/// it stays. The impact mark and the muzzle flash are the same thing at
+/// different sizes and lives.
 struct Spark {
     at: [f32; 3],
+    half: f32,
+    color: [u8; 4],
     until: u32,
 }
 
@@ -952,7 +956,7 @@ impl Client {
 
         // The marks this frame's shots left.
         for spark in &self.sparks {
-            let mark = items::cube(spark.at, 2.0, [255, 225, 140, 255]);
+            let mark = items::cube(spark.at, spark.half, spark.color);
             self.renderer.vk.draw_stage(
                 &self.renderer.white,
                 &mark,
@@ -1152,9 +1156,23 @@ impl Client {
         if self.input.attack {
             if let Some(prediction) = self.prediction.as_mut() {
                 if let Some(shot) = prediction.fire(now) {
+                    // The flash sits just past the muzzle, along the shot.
+                    let forward = shot.forward();
+                    self.sparks.push(Spark {
+                        at: [
+                            shot.from[0] + forward[0] * 24.0,
+                            shot.from[1] + forward[1] * 24.0,
+                            shot.from[2] + forward[2] * 24.0,
+                        ],
+                        half: 4.0,
+                        color: [255, 250, 210, 255],
+                        until: now + 45,
+                    });
                     if shot.hit {
                         self.sparks.push(Spark {
                             at: shot.to,
+                            half: 2.0,
+                            color: [255, 225, 140, 255],
                             until: now + 150,
                         });
                     }

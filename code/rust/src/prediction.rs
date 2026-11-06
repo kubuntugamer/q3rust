@@ -48,6 +48,23 @@ pub struct Shot {
     pub hit: bool,
 }
 
+impl Shot {
+    /// The direction the round travelled, as a unit vector. A shooter's flash
+    /// sits along it, just past the muzzle.
+    pub fn forward(&self) -> [f32; 3] {
+        let delta = [
+            self.to[0] - self.from[0],
+            self.to[1] - self.from[1],
+            self.to[2] - self.from[2],
+        ];
+        let length = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+        if length == 0.0 {
+            return [1.0, 0.0, 0.0];
+        }
+        [delta[0] / length, delta[1] / length, delta[2] / length]
+    }
+}
+
 /// The movement keys the client is holding. The client sets these from SDL
 /// key events; [`Prediction::step`] turns them into a command.
 #[derive(Clone, Copy, Debug, Default)]
@@ -539,6 +556,17 @@ mod tests {
         assert!(prediction.fire(1_050).is_none(), "too soon for a second round");
         assert!(prediction.fire(1_100).is_some());
         assert_eq!(prediction.ammo(), STARTING_AMMO - 2);
+    }
+
+    #[test]
+    fn a_round_travels_along_a_unit_direction() {
+        let mut prediction = prediction_on_a_test_map();
+        prediction.turn(90.0 - prediction.yaw(), 0.0);
+        let forward = prediction.fire(1_000).unwrap().forward();
+        let length = (forward[0] * forward[0] + forward[1] * forward[1] + forward[2] * forward[2])
+            .sqrt();
+        assert!((length - 1.0).abs() < 1e-4, "{forward:?}");
+        assert!((forward[1] - 1.0).abs() < 1e-4, "{forward:?}");
     }
 
     #[test]
