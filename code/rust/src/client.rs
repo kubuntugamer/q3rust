@@ -24,7 +24,7 @@ use sdl2::video::Window;
 use sdl2::{EventPump, Sdl, VideoSubsystem};
 
 use crate::assets::Assets;
-use crate::audio::Audio;
+use crate::audio::{Audio, SAMPLE_RATE};
 use crate::bg_misc;
 use crate::bg_pmove::{
     WP_BFG, WP_GAUNTLET, WP_GRENADE_LAUNCHER, WP_LIGHTNING,    WP_MACHINEGUN, WP_ROCKET_LAUNCHER, WP_SHOTGUN, WP_PLASMAGUN, WP_RAILGUN,
@@ -646,6 +646,27 @@ fn shot_state(wind: &WindUp, alive: bool, now: u32) -> Shot {
     }
 }
 
+/// How long the chirp that says a second post has joined a volley lasts.
+const VOLLEY_CHIRP_MS: u32 = 140;
+
+/// A short two-note rising chirp for the second post of a volley. It is made
+/// here rather than taken from the paks, so it sounds unlike anything a weapon
+/// makes and can never be mistaken for a shot.
+fn volley_chirp() -> Arc<Vec<f32>> {
+    let total = (SAMPLE_RATE as u32 * VOLLEY_CHIRP_MS / 1_000) as usize;
+    let half = total / 2;
+    let mut samples = Vec::with_capacity(total);
+    for i in 0..total {
+        let progress = i as f32 / total as f32;
+        // Two steps up, fading in and out so neither end clicks.
+        let freq = if i < half { 640.0 } else { 900.0 };
+        let envelope = (progress * std::f32::consts::PI).sin();
+        let t = i as f32 / SAMPLE_RATE as f32;
+        samples.push(0.35 * envelope * (std::f32::consts::TAU * freq * t).sin());
+    }
+    Arc::new(samples)
+}
+
 /// How much of the flight time the post filling `slot` of a volley leads you
 /// by. The nearest leads the shot; a second post firing with it aims where you
 /// are right now, so stepping one way to dodge the first walks into the second
@@ -896,6 +917,8 @@ pub struct Client {
     shotgun_sound: Option<Arc<Vec<f32>>>,
     rocket_sound: Option<Arc<Vec<f32>>>,
     explosion_sound: Option<Arc<Vec<f32>>>,
+    /// The chirp for a second post joining a volley, made rather than loaded.
+    volley_chirp: Arc<Vec<f32>>,
     /// The BFG's hum, played once when a charge starts.
     charge_sound: Option<Arc<Vec<f32>>>,
     /// The one fire sound each weapon with its own, by weapon number.
@@ -1305,6 +1328,7 @@ impl Client {
             shotgun_sound,
             rocket_sound,
             explosion_sound,
+            volley_chirp: volley_chirp(),
             charge_sound,
             fire_sounds,
             pain_sound,
@@ -2269,6 +2293,13 @@ impl Client {
                             side_words(heading)
                         ));
                     }
+                    // A second post joining the shot is heard as well as seen,
+                    // so the split is noticed even with the post off screen.
+                    if slot == 1 {
+                        if let Some(audio) = self.audio.as_ref() {
+                            audio.play_at(self.volley_chirp.clone(), from);
+                        }
+                    }
                     let lead = lead_for(slot);
                     self.wind_ups.push(WindUp {
                         index,
@@ -3010,6 +3041,28 @@ mod bolt_arc_tests {
         assert_eq!(wind.progress(1_000), 0.0);
         assert!((wind.progress(1_000 + BOLT_TELEGRAPH_NEAR / 2) - 0.5).abs() < 0.02);
         assert_eq!(wind.progress(1_000 + BOLT_TELEGRAPH_NEAR), 1.0);
+    }
+
+    #[test]
+    fn the_volley_chirp_is_short_quiet_and_rises() {
+        let chirp = volley_chirp();
+        let expected = (SAMPLE_RATE as u32 * VOLLEY_CHIRP_MS / 1_000) as usize;
+        assert_eq!(chirp.len(), expected);
+        assert!(expected as u32 > SAMPLE_RATE as u32 / 20, "long enough to hear");
+        assert!(
+            chirp[0].abs() < 0.01 && chirp[chirp.len() - 1].abs() < 0.01,
+            "it starts and ends at silence, so it does not click"
+        );
+        assert!(chirp.iter().all(|s| s.abs() <= 0.4), "quiet enough to sit under a fight");
+        // The second half is the higher note.
+        let crossings = |slice: &[f32]| {
+            slice
+                .windows(2)
+                .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+                .count()
+        };
+        let half = chirp.len() / 2;
+        assert!(crossings(&chirp[half..]) > crossings(&chirp[..half]));
     }
 
     #[test]
