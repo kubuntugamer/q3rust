@@ -634,7 +634,15 @@ impl Prediction {
     /// `CG_TouchItem`: take every pickup the player is standing in, and say
     /// what was taken. A weapon the player did not have comes up in hand, the
     /// way it does in a match.
+    ///
+    /// A corpse takes nothing. The body can still be lying on a pickup while it
+    /// waits to come back, and taking it would spend the item, heal a body that
+    /// is about to be replaced, and put a weapon in the hands of someone lying
+    /// on the floor.
     pub fn collect(&mut self, field: &mut ItemField, now: u32) -> Vec<&'static str> {
+        if self.health() <= 0 {
+            return Vec::new();
+        }
         let taken = field.touch(&mut self.pm.ps, self.pm.mv.origin, now);
         for class_name in &taken {
             let Some(item) = bg_misc::find(class_name) else {
@@ -1086,6 +1094,26 @@ mod tests {
         }
         assert_eq!(prediction.weapon(), WP_ROCKET_LAUNCHER);
         assert_eq!(prediction.ammo(), 10);
+    }
+
+    #[test]
+    fn a_corpse_leaves_the_pickup_it_falls_on_for_the_next_life() {
+        let assets = assets_with_map(MAP_WITH_ROCKETS);
+        let mut prediction = Prediction::load(&assets, "q3dm1").unwrap();
+        let mut field = ItemField::new(&crate::items::item_marks(MAP_WITH_ROCKETS));
+
+        // Killed where it stands, with the launcher's box still around the
+        // body: the corpse waits there until it comes back.
+        prediction.step(16, &Input::default());
+        prediction.pm.ps.stats[STAT_HEALTH] = 0;
+
+        assert!(
+            prediction.collect(&mut field, 16).is_empty(),
+            "a body on the floor takes nothing"
+        );
+        assert_eq!(field.vertices().len(), 36, "the launcher stays on the map");
+        assert_eq!(prediction.weapon(), WP_MACHINEGUN);
+        assert_eq!(prediction.ammo(), STARTING_AMMO);
     }
 
     #[test]
