@@ -260,7 +260,9 @@ impl TargetField {
 
     /// Splashes damage over every post within `radius` of `at`, by distance
     /// only: like the player's own splash this ignores walls, so a rocket that
-    /// bursts on the far side of one still catches whoever is hugging it.
+    /// bursts on the far side of one still catches whoever is hugging it. The
+    /// distance is measured to the middle of the post's drawn body, so a blast
+    /// that lands on its chest is at its centre and one over its head is not.
     ///
     /// How hard it lands fades with distance, though, the way the player's own
     /// splash does: all of `damage` at the centre of the blast, nothing at the
@@ -272,10 +274,14 @@ impl TargetField {
             if !target.alive() {
                 continue;
             }
+            // The blast reaches the post where it is drawn: the middle of the
+            // body standing on the floor under the marker, not the marker
+            // raised by half the post's height.
+            let (foot, mins, maxs) = target.box_at();
             let centre = [
-                target.origin[0],
-                target.origin[1],
-                target.origin[2] + TARGET_MAXS[2] / 2.0,
+                foot[0] + (mins[0] + maxs[0]) / 2.0,
+                foot[1] + (mins[1] + maxs[1]) / 2.0,
+                foot[2] + (mins[2] + maxs[2]) / 2.0,
             ];
             let delta = [
                 centre[0] - at[0],
@@ -452,19 +458,37 @@ mod tests {
 
     #[test]
     fn a_rocket_near_a_post_takes_it_down() {
-        let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
+        // The post stands on the floor at 0, so its middle is 32 up.
+        let mut field = TargetField::new(&[[0.0, 0.0, 24.0]]);
         // Halfway out, the blast lands for half: hurt but still standing.
         assert_eq!(field.blast([0.0, 60.0, 32.0], 120.0, 100, 0), 0);
         assert_eq!(field.alive(), 1);
         assert_eq!(field.targets()[0].health, 50, "the blast fades with distance");
 
-        // At the post's feet the whole of it lands.
+        // On its middle the whole of it lands.
         assert_eq!(field.blast([0.0, 0.0, 32.0], 120.0, 100, 0), 1);
         assert_eq!(field.alive(), 0);
 
-        let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
+        let mut field = TargetField::new(&[[0.0, 0.0, 24.0]]);
         assert_eq!(field.blast([0.0, 400.0, 32.0], 120.0, 100, 0), 0, "out of range");
         assert_eq!(field.alive(), 1);
+    }
+
+    #[test]
+    fn a_blast_measures_from_the_middle_of_the_post_it_hits() {
+        let mut field = TargetField::new(&[[0.0, 0.0, 24.0]]);
+        // A blast along the marker's height used to read as dead centre; the
+        // post's middle is 24 lower than that, where its body actually is.
+        assert_eq!(field.blast([0.0, 0.0, 56.0], 120.0, 100, 0), 0);
+        assert_eq!(
+            field.targets()[0].health, 20,
+            "a blast over its head is not on its chest"
+        );
+        assert_eq!(
+            field.blast([0.0, 0.0, 32.0], 120.0, 100, 0),
+            1,
+            "a blast on its middle lands fully"
+        );
     }
 
     #[test]
@@ -478,8 +502,8 @@ mod tests {
 
     #[test]
     fn a_post_a_blast_puts_down_counts_towards_its_next_fall() {
-        let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
-        // A blast at its feet lands for everything, so one puts it down.
+        let mut field = TargetField::new(&[[0.0, 0.0, 24.0]]);
+        // A blast on its middle lands for everything, so one puts it down.
         let at_post = [0.0, 0.0, 32.0];
         assert_eq!(field.blast(at_post, 120.0, 100, 500), 1);
         assert_eq!(field.wait_at(500), TARGET_RECOVERY_MS);
