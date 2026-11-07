@@ -229,23 +229,15 @@ impl TargetField {
             }
         }
 
-        let (fraction, index, at) = best?;
+        let (_, index, at) = best?;
         self.targets[index].health -= damage;
         let down = self.targets[index].health <= 0;
         if down {
-            let from = [
-                from[0] + (to[0] - from[0]) * fraction,
-                from[1] + (to[1] - from[1]) * fraction,
-                from[2] + (to[2] - from[2]) * fraction,
-            ];
-            self.knock_down(index, from, now);
+            self.knock_down(index, at, now);
         }
         Some((at, down))
     }
 
-    /// A rocket's blast: every standing post within `radius` of `at` loses
-    /// `damage`, which is what makes a rocket worth aiming at the floor near
-    /// a post. Returns how many posts went down.
     /// How many posts are on the floor right now. The client diffs this around
     /// a hit to keep a tally of how many it has put down.
     pub fn downed(&self) -> usize {
