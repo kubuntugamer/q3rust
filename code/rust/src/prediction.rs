@@ -276,7 +276,7 @@ impl Shot {
 
 /// The movement keys the client is holding. The client sets these from SDL
 /// key events; [`Prediction::step`] turns them into a command.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Input {
     pub forward: bool,
     pub back: bool,
@@ -287,6 +287,16 @@ pub struct Input {
     pub turn_right: bool,
     /// The trigger.
     pub attack: bool,
+}
+
+impl Input {
+    /// Lets every key and button go at once. A window that loses focus stops
+    /// hearing that they came back up, so without this a player who alt-tabs
+    /// mid-run keeps walking, and a held trigger keeps firing, into whatever
+    /// they come back to.
+    pub fn release_all(&mut self) {
+        *self = Input::default();
+    }
 }
 
 /// A predicted player on a loaded map.
@@ -1038,6 +1048,22 @@ mod tests {
             .unwrap_or_else(|| panic!("{origin:?} is not one of the map's spawns"));
         // The map pointed this spot, so the player faces that way.
         assert_eq!(prediction.yaw(), spot.angle.unwrap());
+    }
+
+    #[test]
+    fn a_window_that_loses_focus_lets_every_key_go() {
+        let mut input = Input {
+            forward: true,
+            back: true,
+            left: true,
+            right: true,
+            jump: true,
+            turn_left: true,
+            turn_right: true,
+            attack: true,
+        };
+        input.release_all();
+        assert_eq!(input, Input::default(), "every key is up");
     }
 
     #[test]

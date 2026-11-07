@@ -1602,6 +1602,12 @@ impl Client {
                 } => {
                     self.renderer.resize(width.max(1) as u32, height.max(1) as u32)?;
                 }
+                // A window that loses focus never hears the keys come back up,
+                // so everything held is let go instead of being left pressed.
+                Event::Window {
+                    win_event: WindowEvent::FocusLost,
+                    ..
+                } => self.input.release_all(),
                 Event::KeyDown {
                     keycode: Some(key),
                     repeat,
