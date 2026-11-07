@@ -602,6 +602,13 @@ fn gone_past(point: [f32; 3], from: [f32; 3], to: [f32; 3]) -> bool {
         >= 0.0
 }
 
+/// Whether a bolt walked from `from` to `to` reaches the player: it has to pass
+/// within reach of the eye, and the player has to still be up. A bolt that lands
+/// after you fall finds a corpse, which takes no hurt and does not grunt again.
+fn hits_player(up: bool, eye: [f32; 3], from: [f32; 3], to: [f32; 3]) -> bool {
+    up && away_from_line(eye, from, to) < BOLT_HIT_RADIUS
+}
+
 /// What a bolt's step is worth as a dodge: how far it passed you, once it has
 /// gone by and if that was close enough to feel. `None` while it is still on
 /// its way in, when it went wide, and when it has already paid. The miss is
@@ -2455,6 +2462,10 @@ impl Client {
 
         let mut damage = 0;
         let mut strikes = Vec::new();
+        // A player who has already been dropped is not a target, so the bolts
+        // fired at where they fell pass through the corpse rather than hitting
+        // it over and over while it waits to respawn.
+        let up = prediction.health() > 0;
         // How close the nearest bolt of this frame came as it went past.
         let mut dodged: Option<f32> = None;
         self.bolts.retain_mut(|bolt| {
@@ -2470,7 +2481,7 @@ impl Client {
                 strikes.push(at);
                 return false;
             }
-            if away_from_line(eye, before, bolt.at) < BOLT_HIT_RADIUS {
+            if hits_player(up, eye, before, bolt.at) {
                 damage += BOLT_DAMAGE;
                 strikes.push(bolt.at);
                 return false;
@@ -2923,6 +2934,18 @@ mod bolt_tests {
         let eye = [0.0, 0.0, 0.0];
         let distance = away_from_line(eye, [-50.0, 100.0, 0.0], [50.0, 100.0, 0.0]);
         assert!((distance - 100.0).abs() < 1.0e-4, "{distance}");
+    }
+
+    #[test]
+    fn a_bolt_does_not_hit_a_player_already_down() {
+        let eye = [0.0, 0.0, 0.0];
+        let (before, after) = ([-50.0, 0.0, 0.0], [50.0, 0.0, 0.0]);
+        assert!(hits_player(true, eye, before, after), "it passes through the eye");
+        // The same bolt reaches a player who is already down without being a
+        // hit, so a corpse takes no hurt and does not grunt again.
+        assert!(!hits_player(false, eye, before, after));
+        // Close still has to mean close.
+        assert!(!hits_player(true, eye, [-50.0, 100.0, 0.0], [50.0, 100.0, 0.0]));
     }
 }
 
