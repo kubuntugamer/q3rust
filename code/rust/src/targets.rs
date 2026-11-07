@@ -258,6 +258,18 @@ impl TargetField {
         self.targets.iter().filter(|target| !target.alive()).count()
     }
 
+    /// The boxes of the posts still standing, as the origin, mins and maxs a
+    /// segment can be tested against. The client hands these to the prediction
+    /// so a rocket bursts on a post the map knows nothing about. A post on the
+    /// floor is not a body a round should stop on.
+    pub fn standing_bodies(&self) -> Vec<([f32; 3], [f32; 3], [f32; 3])> {
+        self.targets
+            .iter()
+            .filter(|target| target.alive())
+            .map(|target| target.box_at())
+            .collect()
+    }
+
     /// Splashes damage over every post within `radius` of `at`, by distance
     /// only: like the player's own splash this ignores walls, so a rocket that
     /// bursts on the far side of one still catches whoever is hugging it. The
@@ -306,9 +318,9 @@ impl TargetField {
     }
 }
 
-/// Where a segment first enters the post's box, as a fraction of the segment,
-/// or `None` when it misses. A slab test, with the box axis-aligned.
-fn hit_fraction(
+/// Where a segment first enters a box, as a fraction of the segment, or `None`
+/// when it misses. A slab test, with the box axis-aligned.
+pub(crate) fn hit_fraction(
     origin: [f32; 3],
     mins: [f32; 3],
     maxs: [f32; 3],
@@ -542,6 +554,20 @@ mod tests {
                 .is_none()
         );
         assert_eq!(field.alive(), 1);
+    }
+
+    #[test]
+    fn only_a_standing_post_is_a_body_a_round_can_stop_on() {
+        let mut field = TargetField::new(&[[0.0, 0.0, 24.0], [400.0, 0.0, 24.0]]);
+        let bodies = field.standing_bodies();
+        assert_eq!(bodies.len(), 2, "both stand at first");
+        assert_eq!(bodies[0].0, [0.0, 0.0, 0.0], "the body starts on the floor");
+        assert_eq!(bodies[0].2, TARGET_MAXS, "and is a body tall");
+
+        field.knock_down(0, [0.0, -300.0, 24.0], 100);
+        let bodies = field.standing_bodies();
+        assert_eq!(bodies.len(), 1, "a post on the floor is out of the way");
+        assert_eq!(bodies[0].0[0], 400.0);
     }
 
     #[test]

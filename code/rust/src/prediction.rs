@@ -325,6 +325,9 @@ pub struct Prediction {
     /// Projectiles in the air, and where the ones that went off did so.
     projectiles: Vec<Projectile>,
     blasts: Vec<Blast>,
+    /// The practice posts still standing, which the map knows nothing about.
+    /// A round that reaches one bursts on it instead of flying through.
+    bodies: Vec<([f32; 3], [f32; 3], [f32; 3])>,
 }
 
 impl Prediction {
@@ -365,6 +368,7 @@ impl Prediction {
             charge_started: None,
             projectiles: Vec::new(),
             blasts: Vec::new(),
+            bodies: Vec::new(),
         })
     }
 
@@ -433,6 +437,13 @@ impl Prediction {
     /// it can stop on the floor or a wall instead of passing through it.
     pub fn solid(&self, point: [f32; 3]) -> bool {
         self.pm.world.point_contents(point, 0) & crate::collision::CONTENTS_SOLID != 0
+    }
+
+    /// Tells the prediction where the practice posts stand this frame, so a
+    /// round bursts on one rather than passing through it to the wall behind.
+    pub fn set_bodies(&mut self, bodies: &[([f32; 3], [f32; 3], [f32; 3])]) {
+        self.bodies.clear();
+        self.bodies.extend_from_slice(bodies);
     }
 
     /// Rounds left in the weapon in hand.
@@ -767,7 +778,28 @@ impl Prediction {
                 .world
                 .trace(shot.origin, to, [0.0; 3], [0.0; 3], MASK_PLAYERSOLID);
             let old = self.last_time - shot.born >= PROJECTILE_LIFE_MS;
-            if trace.fraction < 1.0 && shot.gravity && !old {
+            // A post is the client's own and not part of the map, so the map
+            // trace would carry a rocket straight through one. Whichever the
+            // step reaches first, a post or a wall, stops the round.
+            let body = self
+                .bodies
+                .iter()
+                .filter_map(|(origin, mins, maxs)| {
+                    crate::targets::hit_fraction(*origin, *mins, *maxs, shot.origin, to)
+                })
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some(fraction) = body.filter(|fraction| *fraction < trace.fraction) {
+                let at = [
+                    shot.origin[0] + (to[0] - shot.origin[0]) * fraction,
+                    shot.origin[1] + (to[1] - shot.origin[1]) * fraction,
+                    shot.origin[2] + (to[2] - shot.origin[2]) * fraction,
+                ];
+                self.blasts.push(Blast {
+                    at,
+                    radius: shot.radius,
+                    damage: shot.damage,
+                });
+            } else if trace.fraction < 1.0 && shot.gravity && !old {
                 // A grenade skips off what it hits instead of bursting, losing
                 // energy each time; it bursts when its time runs out.
                 let normal = trace.plane.normal;
@@ -1621,6 +1653,63 @@ mod tests {
         assert_eq!(blasts[0].damage, 100, "a rocket's own damage");
         assert_eq!(blasts[0].radius, ROCKET_RADIUS);
         assert!(prediction.take_blasts().is_empty(), "and it is only reported once");
+    }
+
+    #[test]
+    fn a_rocket_bursts_on_a_practice_post_instead_of_flying_through_it() {
+        let mut prediction = prediction_on_a_test_map();
+        // A post standing on the floor sixty units along the shot's line.
+        prediction.set_bodies(&[(
+            [60.0, 0.0, 0.0],
+            crate::targets::TARGET_MINS,
+            crate::targets::TARGET_MAXS,
+        )]);
+        prediction.projectiles.push(Projectile {
+            origin: [0.0, 0.0, 32.0],
+            velocity: [ROCKET_SPEED, 0.0, 0.0],
+            born: 0,
+            damage: 100,
+            radius: ROCKET_RADIUS,
+            plasma: false,
+            gravity: false,
+        });
+
+        // A tenth of a second carries it ninety units: clean past the post, if
+        // the post were not there.
+        prediction.advance_rockets(0.1);
+        assert!(prediction.projectiles().is_empty(), "it stopped on the post");
+        let blasts = prediction.take_blasts();
+        assert_eq!(blasts.len(), 1, "and burst there");
+        assert!(
+            (blasts[0].at[0] - 44.0).abs() < 0.01,
+            "on the post's near face: {:?}",
+            blasts[0].at
+        );
+        assert_eq!(blasts[0].radius, ROCKET_RADIUS);
+        assert_eq!(blasts[0].damage, 100);
+    }
+
+    #[test]
+    fn a_rocket_flies_past_a_post_that_is_not_in_its_way() {
+        let mut prediction = prediction_on_a_test_map();
+        prediction.set_bodies(&[(
+            [60.0, 200.0, 0.0],
+            crate::targets::TARGET_MINS,
+            crate::targets::TARGET_MAXS,
+        )]);
+        prediction.projectiles.push(Projectile {
+            origin: [0.0, 0.0, 32.0],
+            velocity: [ROCKET_SPEED, 0.0, 0.0],
+            born: 0,
+            damage: 100,
+            radius: ROCKET_RADIUS,
+            plasma: false,
+            gravity: false,
+        });
+
+        prediction.advance_rockets(0.1);
+        assert_eq!(prediction.projectiles().len(), 1, "off it goes");
+        assert!(prediction.take_blasts().is_empty(), "with nothing hit");
     }
 
     #[test]

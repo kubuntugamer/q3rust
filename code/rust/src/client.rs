@@ -2529,6 +2529,11 @@ impl Client {
         if let Some(prediction) = self.prediction.as_mut() {
             let before = prediction.weapon();
             let health_before = prediction.health();
+            // The posts are the client's own, so the prediction has to be told
+            // where they stand before it moves this frame's rounds.
+            if let Some(field) = self.targets.as_ref() {
+                prediction.set_bodies(&field.standing_bodies());
+            }
             prediction.step(now, &self.input);
             // Any loss of health, from a bolt, a fall or your own rocket, shows
             // as a red wash for a moment.
