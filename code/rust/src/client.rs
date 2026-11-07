@@ -965,6 +965,20 @@ fn first_solid(
     None
 }
 
+/// Where a shot ends once the practice posts are counted: the map's trace stops
+/// at walls only, so a post catches the round first. The mark it leaves, the
+/// sound it makes and a rail's beam all end on the post rather than carrying on
+/// to the wall behind it. Also reports what the shot did to a post, if it
+/// reached one.
+fn shot_end(
+    shot: &crate::prediction::Shot,
+    field: &mut TargetField,
+    now: u32,
+) -> ([f32; 3], Option<([f32; 3], bool)>) {
+    let struck = field.shoot(shot.from, shot.to, shot.damage, now);
+    (struck.map_or(shot.to, |(at, _)| at), struck)
+}
+
 /// Engine state that survives a frame: SDL, the command buffer, the cvars, the
 /// renderer and the clock.
 pub struct Client {
@@ -2682,9 +2696,16 @@ impl Client {
                         color: [255, 235, 180, 255],
                         until: now + 30,
                     });
-                    if shot.hit {
+                    // The map's trace knows only its own walls, so a practice
+                    // post in the way stops the round before them. Wherever it
+                    // stopped, the mark and the sound belong there.
+                    let (stop, struck) = match self.targets.as_mut() {
+                        Some(field) => shot_end(&shot, field, now),
+                        None => (shot.to, None),
+                    };
+                    if shot.hit || struck.is_some() {
                         self.sparks.push(Spark {
-                            at: shot.to,
+                            at: stop,
                             half: 2.0,
                             color: [255, 225, 140, 255],
                             until: now + 150,
@@ -2700,12 +2721,12 @@ impl Client {
                             self.audio.as_ref(),
                         ) {
                             self.next_impact += 1;
-                            audio.play_at(sound, shot.to);
+                            audio.play_at(sound, stop);
                         }
                     }
                     if shot.splash > 0.0 {
                         self.sparks.push(Spark {
-                            at: shot.to,
+                            at: stop,
                             half: 12.0,
                             color: [255, 190, 120, 255],
                             until: now + 200,
@@ -2713,7 +2734,7 @@ impl Client {
                         if let (Some(sound), Some(audio)) =
                             (self.explosion_sound.clone(), self.audio.as_ref())
                         {
-                            audio.play_at(sound, shot.to);
+                            audio.play_at(sound, stop);
                         }
                     }
                     // Each weapon fires with its own sound.
@@ -2721,7 +2742,7 @@ impl Client {
                     if weapon == WP_RAILGUN || weapon == WP_LIGHTNING {
                         self.beams.push(Beam {
                             from: shot.from,
-                            to: shot.to,
+                            to: stop,
                             color: if weapon == WP_RAILGUN {
                                 [120, 210, 255, 255]
                             } else {
@@ -2753,24 +2774,28 @@ impl Client {
                     if let (Some(sound), Some(audio)) = (fired, self.audio.as_ref()) {
                         audio.play_at(sound, shot.from);
                     }
-                    if let Some(field) = self.targets.as_mut() {
-                        if let Some((at, destroyed)) = field.shoot(shot.from, shot.to, shot.damage, now) {
-                            self.hit_until = now + 150;
-                            self.sparks.push(Spark {
-                                at,
-                                half: 3.0,
-                                color: [255, 170, 90, 255],
-                                until: now + 150,
-                            });
-                            if destroyed {
-                                self.posts_down += 1;
-                                console::print("target down");
-                                push_notice(&mut self.notices, &down_line(1, field.wait_at(now)), now);
-                            }
+                    if let Some((at, destroyed)) = struck {
+                        self.hit_until = now + 150;
+                        self.sparks.push(Spark {
+                            at,
+                            half: 3.0,
+                            color: [255, 170, 90, 255],
+                            until: now + 150,
+                        });
+                        if destroyed {
+                            self.posts_down += 1;
+                            console::print("target down");
+                            let wait = self
+                                .targets
+                                .as_ref()
+                                .map_or(0, |field| field.wait_at(now));
+                            push_notice(&mut self.notices, &down_line(1, wait), now);
                         }
+                    }
+                    if let Some(field) = self.targets.as_mut() {
                         if shot.splash > 0.0 {
                             let before = field.downed();
-                            let down = field.blast(shot.to, shot.splash, 100, now);
+                            let down = field.blast(stop, shot.splash, 100, now);
                             self.posts_down += (field.downed() - before) as u32;
                             if down > 0 {
                                 console::print("target down");
@@ -2904,6 +2929,9 @@ mod bolt_tests {
 #[cfg(test)]
 mod bolt_arc_tests {
     use super::*;
+    /// A round leaving the weapon, rather than the state of a post's shot,
+    /// which this module's own `Shot` already means.
+    use crate::prediction::Shot as Round;
 
     fn fly(from: [f32; 3], to: [f32; 3]) -> [f32; 3] {
         let step = 1.0 / 60.0;
@@ -3437,6 +3465,39 @@ mod bolt_arc_tests {
             "barely twenty degrees apart"
         );
         assert!(!brackets(eye, eye, [100.0, 0.0, 0.0]), "a post on top of you brackets nothing");
+    }
+
+    #[test]
+    fn a_shot_that_stops_on_a_post_ends_there() {
+        // The map knows only its walls, so its own trace runs on to the far
+        // one; the post in the way is what the round reaches first.
+        let mut field = TargetField::new(&[[240.0, 0.0, 24.0]]);
+        let shot = Round {
+            from: [0.0, 0.0, 40.0],
+            to: [600.0, 0.0, 40.0],
+            hit: true,
+            splash: 0.0,
+            damage: 34,
+        };
+        let (stop, struck) = shot_end(&shot, &mut field, 1_000);
+        assert!(
+            (stop[0] - 224.0).abs() < 0.001,
+            "the mark and the beam end on the post's near side: {stop:?}"
+        );
+        assert!(struck.is_some(), "and the post takes the round");
+        assert_eq!(field.targets()[0].health, 66);
+
+        // Nothing in the way: the shot still ends where the map said.
+        let clear = Round {
+            from: [0.0, 200.0, 40.0],
+            to: [600.0, 200.0, 40.0],
+            hit: true,
+            splash: 0.0,
+            damage: 34,
+        };
+        let (stop, struck) = shot_end(&clear, &mut field, 1_000);
+        assert_eq!(stop, clear.to);
+        assert!(struck.is_none());
     }
 
     #[test]
