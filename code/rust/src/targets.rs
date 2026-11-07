@@ -40,6 +40,17 @@ fn recovery_for(downs: u32) -> u32 {
     TARGET_RECOVERY_MS + extra
 }
 
+/// `G_RadiusDamage`: a blast lands for all of `damage` at its centre and fades
+/// to nothing at the edge of its radius. Without this a rocket that burst a
+/// room's width away would take a post down exactly as surely as one at its
+/// feet, and near enough was the same as on target.
+fn splash_damage(damage: i32, distance: f32, radius: f32) -> i32 {
+    if radius <= 0.0 || distance >= radius {
+        return 0;
+    }
+    (damage as f32 * (1.0 - distance / radius)) as i32
+}
+
 /// One post on the map.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Target {
@@ -247,6 +258,10 @@ impl TargetField {
     /// Splashes damage over every post within `radius` of `at`, by distance
     /// only: like the player's own splash this ignores walls, so a rocket that
     /// bursts on the far side of one still catches whoever is hugging it.
+    ///
+    /// How hard it lands fades with distance, though, the way the player's own
+    /// splash does: all of `damage` at the centre of the blast, nothing at the
+    /// edge of the radius, so where a rocket bursts is worth aiming.
     pub fn blast(&mut self, at: [f32; 3], radius: f32, damage: i32, now: u32) -> usize {
         let mut down = 0;
         for index in 0..self.targets.len() {
@@ -266,10 +281,11 @@ impl TargetField {
             ];
             let distance =
                 (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
-            if distance > radius {
+            let hurt = splash_damage(damage, distance, radius);
+            if hurt <= 0 {
                 continue;
             }
-            self.targets[index].health -= damage;
+            self.targets[index].health -= hurt;
             if self.targets[index].health <= 0 {
                 // A blast knocks a post down the same way a bullet does, so it
                 // counts towards the longer wait the next fall buys.
@@ -408,8 +424,13 @@ mod tests {
     #[test]
     fn a_rocket_near_a_post_takes_it_down() {
         let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
-        // Just outside its box, so the blast is what does the work.
-        assert_eq!(field.blast([0.0, 60.0, 32.0], 120.0, 100, 0), 1);
+        // Halfway out, the blast lands for half: hurt but still standing.
+        assert_eq!(field.blast([0.0, 60.0, 32.0], 120.0, 100, 0), 0);
+        assert_eq!(field.alive(), 1);
+        assert_eq!(field.targets()[0].health, 50, "the blast fades with distance");
+
+        // At the post's feet the whole of it lands.
+        assert_eq!(field.blast([0.0, 0.0, 32.0], 120.0, 100, 0), 1);
         assert_eq!(field.alive(), 0);
 
         let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
@@ -418,16 +439,26 @@ mod tests {
     }
 
     #[test]
+    fn a_blast_fades_from_the_centre_to_nothing_at_the_edge() {
+        assert_eq!(splash_damage(100, 0.0, 120.0), 100, "everything at the centre");
+        assert_eq!(splash_damage(100, 60.0, 120.0), 50, "half of it halfway out");
+        assert_eq!(splash_damage(100, 120.0, 120.0), 0, "the edge is nothing");
+        assert_eq!(splash_damage(100, 200.0, 120.0), 0, "and past it nothing");
+        assert_eq!(splash_damage(100, 10.0, 0.0), 0, "a blast with no width");
+    }
+
+    #[test]
     fn a_post_a_blast_puts_down_counts_towards_its_next_fall() {
         let mut field = TargetField::new(&[[0.0, 0.0, 0.0]]);
-        let beside = [0.0, 60.0, 32.0];
-        assert_eq!(field.blast(beside, 120.0, 100, 500), 1);
+        // A blast at its feet lands for everything, so one puts it down.
+        let at_post = [0.0, 0.0, 32.0];
+        assert_eq!(field.blast(at_post, 120.0, 100, 500), 1);
         assert_eq!(field.wait_at(500), TARGET_RECOVERY_MS);
         field.recover(500 + TARGET_RECOVERY_MS);
 
         // The second fall takes it down longer, whether a bullet or a blast
         // did it.
-        assert_eq!(field.blast(beside, 120.0, 100, 9_000), 1);
+        assert_eq!(field.blast(at_post, 120.0, 100, 9_000), 1);
         assert_eq!(
             field.wait_at(9_000),
             TARGET_RECOVERY_MS + TARGET_RECOVERY_STEP_MS
