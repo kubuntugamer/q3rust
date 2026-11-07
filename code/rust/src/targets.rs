@@ -227,7 +227,10 @@ impl TargetField {
             if !target.alive() {
                 continue;
             }
-            let Some(fraction) = hit_fraction(target.origin, from, to) else {
+            // The post is drawn standing on the floor under its marker, so
+            // that is the box a shot has to reach: not the marker's height.
+            let (foot, mins, maxs) = target.box_at();
+            let Some(fraction) = hit_fraction(foot, mins, maxs, from, to) else {
                 continue;
             };
             if best.map(|(at, _, _)| fraction < at).unwrap_or(true) {
@@ -299,16 +302,22 @@ impl TargetField {
 
 /// Where a segment first enters the post's box, as a fraction of the segment,
 /// or `None` when it misses. A slab test, with the box axis-aligned.
-fn hit_fraction(origin: [f32; 3], from: [f32; 3], to: [f32; 3]) -> Option<f32> {
+fn hit_fraction(
+    origin: [f32; 3],
+    mins: [f32; 3],
+    maxs: [f32; 3],
+    from: [f32; 3],
+    to: [f32; 3],
+) -> Option<f32> {
     let min = [
-        origin[0] + TARGET_MINS[0],
-        origin[1] + TARGET_MINS[1],
-        origin[2] + TARGET_MINS[2],
+        origin[0] + mins[0],
+        origin[1] + mins[1],
+        origin[2] + mins[2],
     ];
     let max = [
-        origin[0] + TARGET_MAXS[0],
-        origin[1] + TARGET_MAXS[1],
-        origin[2] + TARGET_MAXS[2],
+        origin[0] + maxs[0],
+        origin[1] + maxs[1],
+        origin[2] + maxs[2],
     ];
     let mut enter = 0.0f32;
     let mut exit = 1.0f32;
@@ -410,6 +419,26 @@ mod tests {
             "and resting on it"
         );
         assert_eq!(field.vertices().len(), 72, "one lying, one standing");
+    }
+
+    #[test]
+    fn a_shot_hits_the_post_where_it_is_drawn() {
+        // The marker sits a player's height off the floor and the post stands
+        // on the floor under it, so its legs are as shootable as its head --
+        // and the empty air above its head is not.
+        let mut field = TargetField::new(&[[0.0, 0.0, 24.0]]);
+        assert!(
+            field
+                .shoot([-100.0, 0.0, 10.0], [100.0, 0.0, 10.0], 10, 0)
+                .is_some(),
+            "the drawn body's legs are part of the post"
+        );
+        assert!(
+            field
+                .shoot([-100.0, 0.0, 80.0], [100.0, 0.0, 80.0], 10, 0)
+                .is_none(),
+            "nothing is there above its head"
+        );
     }
 
     #[test]
