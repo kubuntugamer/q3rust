@@ -494,9 +494,18 @@ impl Prediction {
     /// The trigger, for the length of one round: spends a cartridge, then
     /// traces the bullet from the eye along the view to whatever stops it.
     ///
+    /// A corpse has no trigger to pull. The client holds the button down across
+    /// a death, so without this a body on the floor would keep shooting, spend
+    /// a clip it is about to lose, and let a BFG charge go off from where it
+    /// fell.
+    ///
     /// Only the machinegun fires so far; the other weapons need their own shot
     /// patterns, which is a bigger port than one hitscan line.
     pub fn fire(&mut self, now: u32) -> Vec<Shot> {
+        if self.health() <= 0 {
+            self.charge_started = None;
+            return Vec::new();
+        }
         let Some(pattern) = PATTERNS
             .iter()
             .find(|pattern| pattern.weapon == self.pm.ps.weapon)
@@ -1114,6 +1123,47 @@ mod tests {
         assert_eq!(field.vertices().len(), 36, "the launcher stays on the map");
         assert_eq!(prediction.weapon(), WP_MACHINEGUN);
         assert_eq!(prediction.ammo(), STARTING_AMMO);
+    }
+
+    #[test]
+    fn a_corpse_cannot_pull_the_trigger() {
+        let mut prediction = prediction_on_a_test_map();
+        prediction.pm.ps.stats[STAT_HEALTH] = 0;
+
+        assert!(
+            prediction.fire(1_000).is_empty(),
+            "a body on the floor fires nothing"
+        );
+        assert_eq!(prediction.ammo(), STARTING_AMMO, "and spends nothing");
+        assert!(prediction.projectiles().is_empty());
+    }
+
+    #[test]
+    fn a_body_that_goes_down_drops_the_charge_it_was_holding() {
+        let mut prediction = prediction_on_a_test_map();
+        prediction.pm.ps.stats[STAT_WEAPONS] |= 1 << WP_BFG;
+        prediction.pm.ps.ammo[WP_BFG as usize] = 1;
+        assert!(prediction.select_weapon(WP_BFG));
+        for tick in 0..40 {
+            prediction.step(1_000 + tick * 50, &Input::default());
+        }
+        let now = 1_000 + 40 * 50;
+        assert_eq!(prediction.weapon(), WP_BFG);
+        // The first press starts the charge, and nothing leaves yet.
+        assert!(prediction.fire(now).is_empty());
+        assert_eq!(prediction.ammo(), 1);
+
+        prediction.pm.ps.stats[STAT_HEALTH] = 0;
+        assert!(
+            prediction.fire(now + 1_200).is_empty(),
+            "a full charge does not let go from a corpse"
+        );
+        assert_eq!(prediction.ammo(), 1, "the ball is not spent");
+        assert_eq!(
+            prediction.charge(now + 1_200),
+            0.0,
+            "the charge is dropped"
+        );
     }
 
     #[test]
