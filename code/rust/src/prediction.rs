@@ -17,8 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::assets::Assets;
 use crate::bg_misc::{self, ItemType};
 use crate::bg_pmove::{
-    pmove, Pmove, UserCmd, ENTITYNUM_NONE, EV_FALL_FAR, EV_FALL_MEDIUM, STAT_ARMOR, STAT_HEALTH,
-    STAT_WEAPONS, WP_BFG, WP_GAUNTLET, WP_GRENADE_LAUNCHER, WP_LIGHTNING, WP_MACHINEGUN, WP_PLASMAGUN, WP_RAILGUN,
+    pmove, Pmove, UserCmd, ENTITYNUM_NONE, EV_FALL_FAR, EV_FALL_MEDIUM, STAT_ARMOR,
+    STAT_HOLDABLE_ITEM, STAT_HEALTH, STAT_WEAPONS, WP_BFG, WP_GAUNTLET, WP_GRENADE_LAUNCHER, WP_LIGHTNING, WP_MACHINEGUN, WP_PLASMAGUN, WP_RAILGUN,
     WP_ROCKET_LAUNCHER, WP_SHOTGUN,
 };
 use crate::bsp::Bsp;
@@ -810,6 +810,12 @@ impl Prediction {
         self.pm.ps.stats[STAT_HEALTH] = 100;
         self.pm.ps.stats[STAT_ARMOR] = 0;
         self.pm.ps.stats[STAT_WEAPONS] = 1 << WP_MACHINEGUN;
+        // `PutClientInServer` wipes the player state before filling in a new
+        // body, so a powerup and a holdable stay with the life that picked them
+        // up: the timer on a quad does not run on through a death, and a medkit
+        // is not carried into the respawn.
+        self.pm.ps.powerups.fill(0);
+        self.pm.ps.stats[STAT_HOLDABLE_ITEM] = bg_misc::HI_NONE as i32;
         self.pm.ps.ammo[WP_MACHINEGUN as usize] = STARTING_AMMO;
         self.pm.ps.weapon = WP_MACHINEGUN;
         self.pm.ps.ground_entity_num = ENTITYNUM_NONE;
@@ -1163,6 +1169,28 @@ mod tests {
             prediction.charge(now + 1_200),
             0.0,
             "the charge is dropped"
+        );
+    }
+
+    #[test]
+    fn a_new_life_starts_without_the_last_ones_powerup_or_holdable() {
+        let mut prediction = prediction_on_a_test_map();
+        prediction.pm.ps.powerups[crate::bg_pmove::PW_QUAD as usize] = 30_000;
+        prediction.pm.ps.stats[STAT_HOLDABLE_ITEM] = 1;
+        prediction.hurt(200);
+
+        // The wait runs out and a fresh body comes back on a map spot.
+        prediction.step(1_000, &Input::default());
+        prediction.step(1_000 + RESPAWN_DELAY, &Input::default());
+        assert_eq!(prediction.health(), 100);
+        assert_eq!(
+            prediction.pm.ps.powerups[crate::bg_pmove::PW_QUAD as usize], 0,
+            "a powerup goes with the life that held it"
+        );
+        assert_eq!(
+            prediction.pm.ps.stats[STAT_HOLDABLE_ITEM],
+            bg_misc::HI_NONE as i32,
+            "and so does a holdable"
         );
     }
 
