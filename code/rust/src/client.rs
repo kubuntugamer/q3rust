@@ -2474,9 +2474,12 @@ impl Client {
         if let Some(distance) = dodged {
             if prediction.health() > 0 {
                 let push = dodge_push(distance);
-                prediction.dodge(push);
-                self.dodge_strength = dodge_strength(push);
-                self.dodge_until = now + DODGE_FLASH_MS;
+                // A dodge is only paid to a moving player, so standing still
+                // must not light up the bar for speed that was never given.
+                if prediction.dodge(push) {
+                    self.dodge_strength = dodge_strength(push);
+                    self.dodge_until = now + DODGE_FLASH_MS;
+                }
             }
         }
         // A fading trail behind each bolt, so an incoming shot can be tracked

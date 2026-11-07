@@ -388,15 +388,17 @@ impl Prediction {
 
     /// Adds `push` of speed for a bolt that just went past, in the direction
     /// the body is already running. Standing still there is nothing to reward,
-    /// so a dodge has to be a move and not a flick of the mouse.
-    pub fn dodge(&mut self, push: f32) {
+    /// so a dodge has to be a move and not a flick of the mouse. Says whether
+    /// any speed was paid, so the client only shows a dodge it gave.
+    pub fn dodge(&mut self, push: f32) -> bool {
         let speed = self.speed();
         if speed < 1.0 || push <= 0.0 {
-            return;
+            return false;
         }
         let velocity = self.pm.mv.velocity;
         self.pm.mv.velocity[0] += velocity[0] / speed * push;
         self.pm.mv.velocity[1] += velocity[1] / speed * push;
+        true
     }
 
     pub fn on_ground(&self) -> bool {
@@ -1069,12 +1071,13 @@ mod tests {
     #[test]
     fn a_bolt_stepped_out_of_is_worth_a_step_of_speed() {
         let mut prediction = prediction_on_a_test_map();
-        // Standing still, there is nothing to pay back.
-        prediction.dodge(DODGE_PUSH_NEAR);
+        // Standing still, there is nothing to pay back, and nothing to show.
+        assert!(!prediction.dodge(DODGE_PUSH_NEAR), "no speed for standing");
         assert_eq!(prediction.speed(), 0.0);
 
         prediction.pm.mv.velocity = [200.0, 0.0, 0.0];
-        prediction.dodge(DODGE_PUSH_NEAR);
+        assert!(prediction.dodge(DODGE_PUSH_NEAR), "a move is paid");
+        assert!(!prediction.dodge(0.0), "and a dodge worth nothing is not");
         let velocity = prediction.velocity();
         assert!(
             (velocity[0] - (200.0 + DODGE_PUSH_NEAR)).abs() < 0.01,
@@ -1084,7 +1087,7 @@ mod tests {
 
         // On a diagonal it keeps the line you picked, and stays on the floor.
         prediction.pm.mv.velocity = [100.0, 100.0, 0.0];
-        prediction.dodge(DODGE_PUSH_NEAR);
+        assert!(prediction.dodge(DODGE_PUSH_NEAR));
         let velocity = prediction.velocity();
         assert!((velocity[0] - velocity[1]).abs() < 0.01, "{velocity:?}");
         assert!(velocity[0] > 100.0, "{velocity:?}");
