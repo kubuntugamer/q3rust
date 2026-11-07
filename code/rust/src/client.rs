@@ -587,6 +587,34 @@ fn near_miss(distance: f32) -> bool {
     distance > BOLT_HIT_RADIUS && distance < BOLT_GRAZE_RADIUS
 }
 
+/// Whether a bolt walked from `from` to `to` has gone by `point`: its far end
+/// is moving away from it. Until then a close pass is a shot still coming, and
+/// paying for it would reward the player for the bolt that is about to hit
+/// them.
+fn gone_past(point: [f32; 3], from: [f32; 3], to: [f32; 3]) -> bool {
+    let line = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+    if line[0] == 0.0 && line[1] == 0.0 && line[2] == 0.0 {
+        return false;
+    }
+    (to[0] - point[0]) * line[0]
+        + (to[1] - point[1]) * line[1]
+        + (to[2] - point[2]) * line[2]
+        >= 0.0
+}
+
+/// What a bolt's step is worth as a dodge: how far it passed you, once it has
+/// gone by and if that was close enough to feel. `None` while it is still on
+/// its way in, when it went wide, and when it has already paid. The miss is
+/// measured on the whole step, so a bolt that crosses close between two frames
+/// still counts.
+fn grazed_by(point: [f32; 3], from: [f32; 3], to: [f32; 3], already: bool) -> Option<f32> {
+    if already || !gone_past(point, from, to) {
+        return None;
+    }
+    let miss = away_from_line(point, from, to);
+    near_miss(miss).then_some(miss)
+}
+
 /// What a dodge at `distance` is worth: full pay for a bolt that nearly
 /// clipped you, tapering to the least for one that went past with room.
 fn dodge_push(distance: f32) -> f32 {
@@ -2433,10 +2461,11 @@ impl Client {
                 strikes.push(bolt.at);
                 return false;
             }
-            // A shot that goes past close enough to feel is worth a little
-            // speed, so stepping out of one is paid back.
-            let distance = away(bolt.at, eye);
-            if !bolt.grazed && near_miss(distance) {
+            // A shot that has gone past close enough to feel is worth a little
+            // speed, so stepping out of one is paid back. One still on its way
+            // in is not: paying then would speed you up for the bolt about to
+            // hit you.
+            if let Some(distance) = grazed_by(eye, before, bolt.at, bolt.grazed) {
                 bolt.grazed = true;
                 dodged = Some(dodged.map_or(distance, |best: f32| best.min(distance)));
             }
@@ -3075,6 +3104,43 @@ mod bolt_arc_tests {
         assert!(near_miss(70.0), "past your shoulder counts");
         assert!(!near_miss(BOLT_GRAZE_RADIUS), "a wide shot is no dodge");
         assert!(!near_miss(400.0));
+    }
+
+    #[test]
+    fn a_bolt_still_on_its_way_in_is_not_yet_a_dodge() {
+        // Coming at your face from 70 out: close enough to feel, but it has
+        // not gone by, and paying here would reward the bolt that hits you.
+        let eye = [0.0; 3];
+        assert_eq!(
+            grazed_by(eye, [80.0, 0.0, 0.0], [70.0, 0.0, 0.0], false),
+            None
+        );
+
+        // Level with you, then past: that is the dodge.
+        assert_eq!(
+            grazed_by(eye, [10.0, 50.0, 0.0], [-10.0, 50.0, 0.0], false),
+            Some(50.0)
+        );
+    }
+
+    #[test]
+    fn a_dodge_is_paid_once_and_only_for_a_close_pass() {
+        let eye = [0.0; 3];
+        // Wide enough to be no dodge at all.
+        assert_eq!(
+            grazed_by(eye, [10.0, 200.0, 0.0], [-10.0, 200.0, 0.0], false),
+            None
+        );
+        // A bolt that did not move cannot have gone by.
+        assert_eq!(
+            grazed_by(eye, [50.0, 50.0, 0.0], [50.0, 50.0, 0.0], false),
+            None
+        );
+        // And a bolt that already paid does not pay twice.
+        assert_eq!(
+            grazed_by(eye, [10.0, 50.0, 0.0], [-10.0, 50.0, 0.0], true),
+            None
+        );
     }
 
     #[test]
