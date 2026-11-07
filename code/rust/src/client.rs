@@ -665,9 +665,12 @@ enum Shot {
 
 /// A post that has just been knocked down loses the shot it was lining up
 /// straight away, so its glow and its mark on your ring go with it instead of
-/// hanging in the air for a bolt that will never come.
-fn shot_state(wind: &WindUp, alive: bool, now: u32) -> Shot {
-    if !alive {
+/// hanging in the air for a bolt that will never come. A shot lined up at a
+/// player who has died is let go of the same way: a body on the floor cannot be
+/// hurt, and a post that kept shooting at it would spend its rhythm on nothing
+/// until the respawn.
+fn shot_state(wind: &WindUp, alive: bool, player_up: bool, now: u32) -> Shot {
+    if !alive || !player_up {
         Shot::Drop
     } else if now < wind.fires_at {
         Shot::Wait
@@ -2319,7 +2322,7 @@ impl Client {
                 .as_ref()
                 .map(|field| field.targets()[wind.index].alive())
                 .unwrap_or(false);
-            match shot_state(&wind, alive, now) {
+            match shot_state(&wind, alive, prediction.health() > 0, now) {
                 // Still lining up: keep the glow going.
                 Shot::Wait => still_lining_up.push(wind),
                 Shot::Drop => {
@@ -3258,15 +3261,41 @@ mod bolt_arc_tests {
             fires_at: 450,
             lead: BOLT_LEAD,
         };
-        assert_eq!(shot_state(&wind, false, 10), Shot::Drop, "down before it fires");
         assert_eq!(
-            shot_state(&wind, false, 450),
+            shot_state(&wind, false, true, 10),
+            Shot::Drop,
+            "down before it fires"
+        );
+        assert_eq!(
+            shot_state(&wind, false, true, 450),
             Shot::Drop,
             "and still dropped when its turn comes"
         );
-        assert_eq!(shot_state(&wind, true, 10), Shot::Wait);
-        assert_eq!(shot_state(&wind, true, 450), Shot::Fire);
-        assert_eq!(shot_state(&wind, true, 900), Shot::Fire, "late is still a shot");
+        assert_eq!(shot_state(&wind, true, true, 10), Shot::Wait);
+        assert_eq!(shot_state(&wind, true, true, 450), Shot::Fire);
+        assert_eq!(
+            shot_state(&wind, true, true, 900),
+            Shot::Fire,
+            "late is still a shot"
+        );
+    }
+
+    #[test]
+    fn a_post_lets_go_of_a_shot_at_a_body_on_the_floor() {
+        let wind = WindUp {
+            index: 1,
+            from: [200.0, 0.0, 24.0],
+            started_at: 0,
+            fires_at: 450,
+            lead: BOLT_LEAD,
+        };
+        // The post is still standing, so only the player being down decides it.
+        assert_eq!(shot_state(&wind, true, false, 200), Shot::Drop);
+        assert_eq!(
+            shot_state(&wind, true, false, 450),
+            Shot::Drop,
+            "a bolt is not spent on a corpse"
+        );
     }
 
     #[test]
