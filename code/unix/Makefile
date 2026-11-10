@@ -196,6 +196,7 @@ DEBUG_CFLAGS += -O
 	  $(B)/$(PLATFORM)q3ded \
 	  $(B)/baseq3/cgame$(ARCH).$(SHLIBEXT) \
 	  $(B)/baseq3/qagame$(ARCH).$(SHLIBEXT) \
+	  $(B)/baseq3/ui$(ARCH).$(SHLIBEXT) \
 	  $(B)/missionpack/cgame$(ARCH).$(SHLIBEXT) \
 	  $(B)/missionpack/qagame$(ARCH).$(SHLIBEXT) \
 	  $(B)/missionpack/ui$(ARCH).$(SHLIBEXT) \
@@ -205,13 +206,6 @@ DEBUG_CFLAGS += -O
 #	  $(B)/missionpack/vm/qagame.qvm \
 #	  $(B)/missionpack/vm/cgame.qvm \
 #	  $(B)/missionpack/vm/ui.qvm
-
-# The baseq3 UI is not built from this tree: code/q3_ui/ui_syscalls.c was
-# never part of the release, and the ranking menus (ui_login.c, ui_signup.c,
-# ui_rankings.c, ui_rankstatus.c, ui_specifyleague.c) call trap_CL_UI_Rank*
-# entry points that neither ui_public.h nor cl_ui.c define. The shipped
-# uix86_64.so / ui.qvm is used instead. Re-add
-# $(B)/baseq3/ui$(ARCH).$(SHLIBEXT) here once those sources exist.
   endif
 
 ## $(B)/$(PLATFORM)q3static   \
@@ -1317,6 +1311,9 @@ $(B)/missionpack/game/q_shared.o : $(GDIR)/q_shared.c; $(DO_SHLIB_CC)      -DMIS
 ## BASEQ3 UI
 #############################################################################
 
+# The unfinished GRank menus (ui_login.c, ui_signup.c, ui_rankings.c,
+# ui_rankstatus.c, ui_specifyleague.c) are not part of the shipped baseq3 UI
+# module and are not built, matching q3_ui.sh.
 Q3UIOBJ = \
         $(B)/baseq3/ui/bg_misc.o \
         $(B)/baseq3/ui/ui_addbots.o \
@@ -1406,7 +1403,7 @@ $(B)/baseq3/ui/ui_spskill.o : $(Q3UIDIR)/ui_spskill.c; $(DO_SHLIB_CC)
 $(B)/baseq3/ui/ui_startserver.o : $(Q3UIDIR)/ui_startserver.c; $(DO_SHLIB_CC) 
 $(B)/baseq3/ui/ui_team.o : $(Q3UIDIR)/ui_team.c; $(DO_SHLIB_CC) 
 $(B)/baseq3/ui/ui_teamorders.o : $(Q3UIDIR)/ui_teamorders.c; $(DO_SHLIB_CC) 
-$(B)/baseq3/ui/ui_syscalls.o : $(Q3UIDIR)/ui_syscalls.c; $(DO_SHLIB_CC) 
+$(B)/baseq3/ui/ui_syscalls.o : $(UIDIR)/ui_syscalls.c; $(DO_SHLIB_CC)
 $(B)/baseq3/ui/ui_video.o : $(Q3UIDIR)/ui_video.c; $(DO_SHLIB_CC) 
 
 # bk001205 - these wre the only SHLIB compiles in 1.17
@@ -1963,7 +1960,7 @@ $(B)/q3static/ui_spskill.o : $(Q3UIDIR)/ui_spskill.c; $(DO_CC) -DQ3_STATIC
 $(B)/q3static/ui_startserver.o : $(Q3UIDIR)/ui_startserver.c; $(DO_CC) -DQ3_STATIC 
 $(B)/q3static/ui_team.o : $(Q3UIDIR)/ui_team.c; $(DO_CC) -DQ3_STATIC 
 $(B)/q3static/ui_teamorders.o : $(Q3UIDIR)/ui_teamorders.c; $(DO_CC) -DQ3_STATIC 
-$(B)/q3static/ui_syscalls.o : $(Q3UIDIR)/ui_syscalls.c; $(DO_CC) -DQ3_STATIC 
+$(B)/q3static/ui_syscalls.o : $(UIDIR)/ui_syscalls.c; $(DO_CC) -DQ3_STATIC
 $(B)/q3static/ui_video.o : $(Q3UIDIR)/ui_video.c; $(DO_CC) -DQ3_STATIC 
 
 
