@@ -1,8 +1,9 @@
 target/
 
-# Compiled QVMs. The i386 copies are build outputs of the debug tree, not
-# sources; the game code lives in code/game, code/cgame and code/q3_ui.
-code/unix/debugx86_64/*/*i386.so
+# Debug build trees are compile output: objects, engine binaries, game
+# modules and generated configs. Build them with
+# `make -C code/unix ARCH=x86_64`; a checkout should not carry them.
+code/unix/debugx86_64/
 
 # The i386 build tree is output for a dead target: the 2005 release already
 # covers that architecture, and no 32-bit object can be loaded by the 64-bit

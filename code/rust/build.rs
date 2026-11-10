@@ -47,11 +47,13 @@ fn main() {
                 let stderr = String::from_utf8_lossy(&result.stderr);
                 panic!("glslc failed for {}:\n{stderr}", source.display());
             }
-            Err(e) => {
-                println!(
-                    "cargo:warning=glslc not found ({e}); the Vulkan renderer needs it to build shaders"
-                );
-            }
+            Err(e) => panic!(
+                "glslc is required to build q3rust: the Vulkan renderer embeds the \
+                 SPIR-V it generates, so a build without it cannot succeed.\n\
+                 Install shaderc's glslc (Debian/Ubuntu: `sudo apt install glslc`) \
+                 and build again.\n\
+                 Could not run glslc: {e}"
+            ),
         }
     }
 }

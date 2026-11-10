@@ -129,7 +129,10 @@ ifeq ($(PLATFORM),linux)
 
   # bk001205: no mo'  -I/usr/include/glide, no FX
   # bk001205: no mo'  -Dstricmp=strcasecmp, see q_shared.h
-  BASE_CFLAGS =  -pipe -fsigned-char
+  # GCC 10 defaults to -fno-common, but the engine still relies on tentative
+  # definitions in headers (`re`, the qgl* pointers). Without -fcommon a clean
+  # client link fails with multiple definition errors.
+  BASE_CFLAGS =  -pipe -fsigned-char -fcommon
   # rcg010216: DLL_ONLY for PPC
   ifeq ($(strip $(DLL_ONLY)),true)
     BASE_CFLAGS += -DDLL_ONLY
@@ -142,7 +145,8 @@ ifeq ($(PLATFORM),linux)
   # bk001204 - need -O for -Wall for uninitialized
   # bk001205 - took out -O to get assertions (NDEBUG)
   # bk001206 - MALLOC_CHECK in addition to ZONE_DEBUG
-  # TTimo 03/30/2001 temporary took out -Werror for initial merge  DEBUG_CFLAGS = $(BASE_CFLAGS) -g  -Wall -Wno-unused-but-set-variable
+  # TTimo 03/30/2001 temporary took out -Werror for initial merge
+  DEBUG_CFLAGS = $(BASE_CFLAGS) -g  -Wall -Wno-unused-but-set-variable
 DEBUG_CFLAGS += -DNO_MOUSEGRAB
 DEBUG_CFLAGS += -O
 #  DEBUG_CFLAGS=$(BASE_CFLAGS) -g  -Wall -O
@@ -365,10 +369,14 @@ default:build_debug
 debug: build_debug
 release: build_release
 
+# Create the output directories in a separate make invocation first: with -j,
+# a shared prerequisite would let compiles race ahead of makedirs on a fresh tree.
 build_debug:
+	@$(MAKE) makedirs B=$(BD)
 	$(MAKE)  targets B=$(BD) CFLAGS="$(DEBUG_CFLAGS)"
 
 build_release:
+	@$(MAKE) makedirs B=$(BR)
 	$(MAKE)  targets B=$(BR) CFLAGS="$(RELEASE_CFLAGS)"
 
 #Build both debug and release builds
