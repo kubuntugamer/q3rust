@@ -144,6 +144,36 @@ fn main() -> ExitCode {
         count = BG_NUM_ITEMS - 1,
     );
 
+    // Second pass over the item models: report any surface whose shader begins
+    // with "maps/" even when the surface did find a texture. The C renderer's
+    // default shader path falls back to "maps/<shader>.tga" only when the
+    // shader has no parsed art, so a map texture used as a model shader is a
+    // real mismatch worth surfacing on its own.
+    let mut map_shaders = 0usize;
+    for index in 1..BG_NUM_ITEMS {
+        let Some(path) = bg_misc::world_model(index) else {
+            continue;
+        };
+        let Some(bytes) = assets.read(path) else {
+            continue;
+        };
+        if let Ok(model) = Md3Model::load(&bytes) {
+            for surface in &model.surfaces {
+                for shader in &surface.shaders {
+                    if shader.name.starts_with("maps/") {
+                        eprintln!("{path}: surface {} uses map shader {}", surface.name, shader.name);
+                        map_shaders += 1;
+                    }
+                }
+            }
+        }
+    }
+    if map_shaders > 0 {
+        println!("item models: {map_shaders} surfaces reference map shaders");
+    } else {
+        println!("item models: no surfaces reference map shaders");
+    }
+
     if failed == 0 {
         ExitCode::SUCCESS
     } else {
