@@ -9,6 +9,7 @@ use q3rust::assets::Assets;
 use q3rust::bg_misc::{self, BG_NUM_ITEMS};
 use q3rust::bsp::Bsp;
 use q3rust::model::Md3Model;
+use q3rust::shader::ShaderTextIndex;
 use q3rust::world::{self, MapAudit};
 
 fn main() -> ExitCode {
@@ -33,6 +34,13 @@ fn main() -> ExitCode {
         eprintln!("  skipped {error}");
     }
 
+    // `ScanAndLoadShaderFiles`'s table: a name resolves to a shader script
+    // first and only falls back to an image file, so anything asking for a
+    // name has to be checked against both.
+    let scripts = shader_scripts(&assets);
+    let script_texts: Vec<&str> = scripts.iter().map(String::as_str).collect();
+    let shader_text = ShaderTextIndex::build(&script_texts);
+
     let mut maps = assets.files("maps/", ".bsp");
     maps.sort();
     if maps.is_empty() {
@@ -42,6 +50,8 @@ fn main() -> ExitCode {
 
     let mut totals = MapAudit::default();
     let mut failed = 0usize;
+    let mut shader_names = 0usize;
+    let mut missing_shaders = 0usize;
 
     for map in &maps {
         let Some(bytes) = assets.read(map) else {
@@ -58,6 +68,15 @@ fn main() -> ExitCode {
                 continue;
             }
         };
+
+        let names = surface_shader_names(&bsp);
+        shader_names += names.len();
+        for name in names {
+            if resolve(&assets, &shader_text, &name) == Resolution::Missing {
+                eprintln!("{map}: shader {name} is neither a script nor an image");
+                missing_shaders += 1;
+            }
+        }
 
         let audit = world::map_edges(&bsp);
         let notes = skipped_notes(&audit);
@@ -104,11 +123,14 @@ fn main() -> ExitCode {
         "skipped on purpose or by fault: {} nodraw, {} patch failed, {} empty, {} out of range; {} maps failed",
         totals.nodraw, totals.patch_failed, totals.empty, totals.out_of_range, failed
     );
+    println!(
+        "surface shaders: {shader_names} distinct names, {missing_shaders} neither a script nor an image"
+    );
 
     // The pickups' own models: the client draws these in place of the marker
     // boxes, so each one has to parse and every surface has to find its art.
     let mut parsed = 0usize;
-    let mut without_texture = 0usize;
+    let mut unresolved = 0usize;
     let mut broken = 0usize;
     for index in 1..BG_NUM_ITEMS {
         let Some(path) = bg_misc::world_model(index) else {
@@ -124,9 +146,12 @@ fn main() -> ExitCode {
                 parsed += 1;
                 for surface in &model.surfaces {
                     for shader in &surface.shaders {
-                        if !texture_present(&assets, &shader.name) {
-                            eprintln!("{path}: texture {} is missing", shader.name);
-                            without_texture += 1;
+                        if resolve(&assets, &shader_text, &shader.name) == Resolution::Missing {
+                            eprintln!(
+                                "{path}: shader {} is neither a script nor an image",
+                                shader.name
+                            );
+                            unresolved += 1;
                             break;
                         }
                     }
@@ -139,7 +164,7 @@ fn main() -> ExitCode {
         }
     }
     println!(
-        "item models: {parser} of {count} models parse, {without_texture} surfaces without a texture, {broken} broken",
+        "item models: {parser} of {count} models parse, {unresolved} surfaces with unresolved shaders, {broken} broken",
         parser = parsed,
         count = BG_NUM_ITEMS - 1,
     );
@@ -181,7 +206,69 @@ fn main() -> ExitCode {
     }
 }
 
-/// Whether a shader name resolves to an image, with the `.tga`→`.jpg` fallback
+/// The `scripts/*.shader` files, as text, in pak order.
+fn shader_scripts(assets: &Assets) -> Vec<String> {
+    assets
+        .files("scripts/", ".shader")
+        .into_iter()
+        .filter_map(|path| assets.read(&path))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .collect()
+}
+
+/// How a name a surface asks for resolves. `R_FindShader` takes the shader
+/// script's definition when one claims the name and only then loads it as an
+/// image, so a name that is neither is a surface nothing can draw.
+#[derive(PartialEq, Eq)]
+enum Resolution {
+    /// A `scripts/*.shader` block defines it.
+    Shader,
+    /// A pak holds it as an image.
+    Image,
+    /// Neither: the renderer would fall back to its default shader.
+    Missing,
+}
+
+/// `COM_StripExtension`: the name without its file extension. `R_FindShader`
+/// strips it before looking anything up, because an MD3 stores
+/// `models/x/armor.tga` while the script that claims it is labelled
+/// `models/x/armor`.
+fn strip_extension(name: &str) -> &str {
+    match (name.rfind('.'), name.rfind('/')) {
+        (Some(dot), slash) if slash.map_or(true, |slash| dot > slash) => &name[..dot],
+        _ => name,
+    }
+}
+
+fn resolve(assets: &Assets, index: &ShaderTextIndex, name: &str) -> Resolution {
+    let name = strip_extension(name);
+    if index.find(name).is_some() {
+        Resolution::Shader
+    } else if texture_present(assets, name) {
+        Resolution::Image
+    } else {
+        Resolution::Missing
+    }
+}
+
+/// The distinct shader names the map's faces reference. `ShaderForShaderNum`
+/// resolves a name per face, so a lump entry no face points at is never looked
+/// up and is not a dangling reference.
+fn surface_shader_names(bsp: &Bsp) -> Vec<String> {
+    let (Ok(textures), Ok(faces)) = (bsp.textures(), bsp.faces()) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = faces
+        .iter()
+        .filter_map(|face| textures.get(face.shader))
+        .map(|texture| texture.name.clone())
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Whether a name resolves to an image, with the `.tga`→`.jpg` fallback
 /// the renderer uses: this installation ships some of those as JPEGs.
 fn texture_present(assets: &Assets, name: &str) -> bool {
     if assets.read(name).is_some() {
