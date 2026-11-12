@@ -13,6 +13,11 @@ use q3rust::shader::ShaderTextIndex;
 use q3rust::world::{self, MapAudit};
 
 fn main() -> ExitCode {
+    // `--strict` turns a dangling shader reference into a failure. The renderer
+    // only falls back to its default shader, so the shipping data is allowed
+    // to have them; a check that wants to gate on new ones can ask for it.
+    let strict = std::env::args().any(|arg| arg == "--strict");
+
     let assets = match Assets::mount_default() {
         Ok(assets) => assets,
         Err(e) => {
@@ -199,7 +204,12 @@ fn main() -> ExitCode {
         println!("item models: no surfaces reference map shaders");
     }
 
-    if failed == 0 {
+    let dangling = missing_shaders + unresolved;
+    if dangling > 0 && !strict {
+        println!("dangling shaders: {dangling} (pass --strict to fail on them)");
+    }
+
+    if failed == 0 && (!strict || dangling == 0) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
