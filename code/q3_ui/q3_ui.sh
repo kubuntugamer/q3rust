@@ -38,7 +38,7 @@ $CC ../ui_specifyserver.c
 $CC ../ui_splevel.c
 $CC ../ui_sppostgame.c
 $CC ../ui_startserver.c
-$CC ../ui_syscalls.c
+$CC ../../ui/ui_syscalls.c
 $CC ../ui_team.c
 $CC ../ui_video.c
 $CC ../ui_cinematics.c

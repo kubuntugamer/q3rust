@@ -129,7 +129,10 @@ ifeq ($(PLATFORM),linux)
 
   # bk001205: no mo'  -I/usr/include/glide, no FX
   # bk001205: no mo'  -Dstricmp=strcasecmp, see q_shared.h
-  BASE_CFLAGS =  -pipe -fsigned-char
+  # GCC 10 defaults to -fno-common, but the engine still relies on tentative
+  # definitions in headers (`re`, the qgl* pointers). Without -fcommon a clean
+  # client link fails with multiple definition errors.
+  BASE_CFLAGS =  -pipe -fsigned-char -fcommon
   # rcg010216: DLL_ONLY for PPC
   ifeq ($(strip $(DLL_ONLY)),true)
     BASE_CFLAGS += -DDLL_ONLY
@@ -142,7 +145,8 @@ ifeq ($(PLATFORM),linux)
   # bk001204 - need -O for -Wall for uninitialized
   # bk001205 - took out -O to get assertions (NDEBUG)
   # bk001206 - MALLOC_CHECK in addition to ZONE_DEBUG
-  # TTimo 03/30/2001 temporary took out -Werror for initial merge  DEBUG_CFLAGS = $(BASE_CFLAGS) -g  -Wall -Wno-unused-but-set-variable
+  # TTimo 03/30/2001 temporary took out -Werror for initial merge
+  DEBUG_CFLAGS = $(BASE_CFLAGS) -g  -Wall -Wno-unused-but-set-variable
 DEBUG_CFLAGS += -DNO_MOUSEGRAB
 DEBUG_CFLAGS += -O
 #  DEBUG_CFLAGS=$(BASE_CFLAGS) -g  -Wall -O
@@ -192,6 +196,7 @@ DEBUG_CFLAGS += -O
 	  $(B)/$(PLATFORM)q3ded \
 	  $(B)/baseq3/cgame$(ARCH).$(SHLIBEXT) \
 	  $(B)/baseq3/qagame$(ARCH).$(SHLIBEXT) \
+	  $(B)/baseq3/ui$(ARCH).$(SHLIBEXT) \
 	  $(B)/missionpack/cgame$(ARCH).$(SHLIBEXT) \
 	  $(B)/missionpack/qagame$(ARCH).$(SHLIBEXT) \
 	  $(B)/missionpack/ui$(ARCH).$(SHLIBEXT) \
@@ -201,13 +206,6 @@ DEBUG_CFLAGS += -O
 #	  $(B)/missionpack/vm/qagame.qvm \
 #	  $(B)/missionpack/vm/cgame.qvm \
 #	  $(B)/missionpack/vm/ui.qvm
-
-# The baseq3 UI is not built from this tree: code/q3_ui/ui_syscalls.c was
-# never part of the release, and the ranking menus (ui_login.c, ui_signup.c,
-# ui_rankings.c, ui_rankstatus.c, ui_specifyleague.c) call trap_CL_UI_Rank*
-# entry points that neither ui_public.h nor cl_ui.c define. The shipped
-# uix86_64.so / ui.qvm is used instead. Re-add
-# $(B)/baseq3/ui$(ARCH).$(SHLIBEXT) here once those sources exist.
   endif
 
 ## $(B)/$(PLATFORM)q3static   \
@@ -365,10 +363,14 @@ default:build_debug
 debug: build_debug
 release: build_release
 
+# Create the output directories in a separate make invocation first: with -j,
+# a shared prerequisite would let compiles race ahead of makedirs on a fresh tree.
 build_debug:
+	@$(MAKE) makedirs B=$(BD)
 	$(MAKE)  targets B=$(BD) CFLAGS="$(DEBUG_CFLAGS)"
 
 build_release:
+	@$(MAKE) makedirs B=$(BR)
 	$(MAKE)  targets B=$(BR) CFLAGS="$(RELEASE_CFLAGS)"
 
 #Build both debug and release builds
@@ -1309,6 +1311,9 @@ $(B)/missionpack/game/q_shared.o : $(GDIR)/q_shared.c; $(DO_SHLIB_CC)      -DMIS
 ## BASEQ3 UI
 #############################################################################
 
+# The unfinished GRank menus (ui_login.c, ui_signup.c, ui_rankings.c,
+# ui_rankstatus.c, ui_specifyleague.c) are not part of the shipped baseq3 UI
+# module and are not built, matching q3_ui.sh.
 Q3UIOBJ = \
         $(B)/baseq3/ui/bg_misc.o \
         $(B)/baseq3/ui/ui_addbots.o \
@@ -1398,7 +1403,7 @@ $(B)/baseq3/ui/ui_spskill.o : $(Q3UIDIR)/ui_spskill.c; $(DO_SHLIB_CC)
 $(B)/baseq3/ui/ui_startserver.o : $(Q3UIDIR)/ui_startserver.c; $(DO_SHLIB_CC) 
 $(B)/baseq3/ui/ui_team.o : $(Q3UIDIR)/ui_team.c; $(DO_SHLIB_CC) 
 $(B)/baseq3/ui/ui_teamorders.o : $(Q3UIDIR)/ui_teamorders.c; $(DO_SHLIB_CC) 
-$(B)/baseq3/ui/ui_syscalls.o : $(Q3UIDIR)/ui_syscalls.c; $(DO_SHLIB_CC) 
+$(B)/baseq3/ui/ui_syscalls.o : $(UIDIR)/ui_syscalls.c; $(DO_SHLIB_CC)
 $(B)/baseq3/ui/ui_video.o : $(Q3UIDIR)/ui_video.c; $(DO_SHLIB_CC) 
 
 # bk001205 - these wre the only SHLIB compiles in 1.17
@@ -1955,7 +1960,7 @@ $(B)/q3static/ui_spskill.o : $(Q3UIDIR)/ui_spskill.c; $(DO_CC) -DQ3_STATIC
 $(B)/q3static/ui_startserver.o : $(Q3UIDIR)/ui_startserver.c; $(DO_CC) -DQ3_STATIC 
 $(B)/q3static/ui_team.o : $(Q3UIDIR)/ui_team.c; $(DO_CC) -DQ3_STATIC 
 $(B)/q3static/ui_teamorders.o : $(Q3UIDIR)/ui_teamorders.c; $(DO_CC) -DQ3_STATIC 
-$(B)/q3static/ui_syscalls.o : $(Q3UIDIR)/ui_syscalls.c; $(DO_CC) -DQ3_STATIC 
+$(B)/q3static/ui_syscalls.o : $(UIDIR)/ui_syscalls.c; $(DO_CC) -DQ3_STATIC
 $(B)/q3static/ui_video.o : $(Q3UIDIR)/ui_video.c; $(DO_CC) -DQ3_STATIC 
 
 
