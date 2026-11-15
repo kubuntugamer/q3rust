@@ -1800,6 +1800,8 @@ impl Client {
         let (width, height) = self.renderer.size();
         let aspect = width as f32 / height.max(1) as f32;
         let mvp = world::view_projection(&camera, aspect, fov);
+        // `tcGen environment` reflects about the eye, which moved this frame.
+        self.renderer.vk.set_view_origin(camera.origin);
 
         // The skybox first: it writes no depth, so the map draws over it.
         if let Some(sky) = world.sky.as_ref() {

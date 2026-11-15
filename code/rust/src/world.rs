@@ -20,7 +20,8 @@ use crate::bsp::{Bsp, BspFace, DrawVert, LIGHTMAP_SIZE, SURFACE_PATCH};
 use crate::items::{self, ItemMark};
 use crate::model::Md3Model;
 use crate::shader::{
-    GenFunc, Parser, ShaderScript, ShaderStage, ShaderTextIndex, TexMod, TextureMap, WaveForm,
+    GenFunc, Parser, ShaderScript, ShaderStage, ShaderTextIndex, TexCoordGen, TexMod, TextureMap,
+    WaveForm,
     CONTENTS_FOG, GLS_DSTBLEND_ONE, GLS_SRCBLEND_ONE,
 };
 use crate::texture;
@@ -230,6 +231,9 @@ pub struct Stage {
     /// The stage's `tcMod stretch`, which divides the texture coordinates by
     /// the wave's value each frame.
     pub stretch: Option<WaveForm>,
+    /// `tcGen environment`: the coordinates come from reflecting the view in
+    /// the surface normal rather than from the map's own st.
+    pub env: bool,
     pub lit: bool,
 }
 
@@ -257,15 +261,15 @@ impl Stage {
     }
 
     /// The deformation the vertex shader applies this frame:
-    /// `[amplitude, phase, frequency, seconds, cos, sin, stretch, 0]`.
+    /// `[amplitude, phase, frequency, seconds, rotation, stretch, env, 0]`,
+    /// with the rotation in radians.
     pub fn tc_mods(&self, seconds: f32) -> [f32; 8] {
         let turbs = self
             .turb
             .map_or([0.0; 3], |wave| [wave.amplitude, wave.phase, wave.frequency]);
-        let (cos, sin) = self.rotate.map_or((1.0, 0.0), |speed| {
-            let angle = (-speed * seconds).to_radians();
-            (angle.cos(), angle.sin())
-        });
+        let angle = self
+            .rotate
+            .map_or(0.0, |speed| (-speed * seconds).to_radians());
         let stretch = self.stretch.map_or(1.0, |wave| {
             let value = wave_value(&wave, seconds);
             // A wave through zero would turn the coordinates into infinities.
@@ -276,7 +280,14 @@ impl Stage {
             }
         });
         [
-            turbs[0], turbs[1], turbs[2], seconds, cos, sin, stretch, 0.0,
+            turbs[0],
+            turbs[1],
+            turbs[2],
+            seconds,
+            angle,
+            stretch,
+            if self.env { 1.0 } else { 0.0 },
+            0.0,
         ]
     }
 }
@@ -456,6 +467,10 @@ impl World {
                     vertexes[corner] = vertex3d(vertex, face, lightmaps);
                 }
                 if complete {
+                    let normal = triangle_normal(&vertexes);
+                    for vertex in &mut vertexes {
+                        vertex.normal = normal;
+                    }
                     batch.extend_from_slice(&vertexes);
                     drawn += 1;
                 } else {
@@ -540,6 +555,7 @@ impl World {
                     turb: spec.turb,
                     rotate: spec.rotate,
                     stretch: spec.stretch,
+                    env: spec.env,
                     lit: spec.lit,
                 });
             }
@@ -736,6 +752,7 @@ fn load_surfaces(
                         pos: vertex.position,
                         uv: vertex.tex_coords,
                         color: if lit { color } else { [255, 255, 255, 255] },
+                        normal: unit_normal(vertex.normal),
                     });
                 }
             }
@@ -873,6 +890,7 @@ impl SkyFace {
             pos: self.corner(origin, s, t),
             uv: [s * 0.5 + 0.5, t * 0.5 + 0.5],
             color: [255, 255, 255, 255],
+            normal: self.normal,
         };
         let (a, b, c, d) = (
             vertex(-1.0, -1.0),
@@ -1055,6 +1073,7 @@ struct StageSpec {
     turb: Option<WaveForm>,
     rotate: Option<f32>,
     stretch: Option<WaveForm>,
+    env: bool,
     lit: bool,
 }
 
@@ -1075,6 +1094,7 @@ fn stage_list(index: &ShaderTextIndex, name: &str) -> Vec<StageSpec> {
                 turb: stage_turbulence(&stage.bundle.tex_mods),
                 rotate: stage_rotation(&stage.bundle.tex_mods),
                 stretch: stage_stretch(&stage.bundle.tex_mods),
+                env: stage.bundle.tc_gen == TexCoordGen::EnvironmentMapped,
                 // Only the first pass carries the surface's lightmap.
                 lit: stages.is_empty(),
             });
@@ -1092,6 +1112,7 @@ fn stage_list(index: &ShaderTextIndex, name: &str) -> Vec<StageSpec> {
             turb: None,
             rotate: None,
             stretch: None,
+            env: false,
             lit: true,
         });
     }
@@ -1205,7 +1226,37 @@ fn vertex3d(vertex: &DrawVert, face: &BspFace, lightmaps: &[u8]) -> Vertex3D {
         pos: vertex.xyz,
         uv: vertex.st,
         color: lightmap_color(face, vertex, lightmaps),
+        // Patches carry a normal from the map; it is already unit length for
+        // the control grid but not after subdivision.
+        normal: unit_normal(vertex.normal),
     }
+}
+
+/// A unit-length normal, or straight up when the source has none.
+fn unit_normal(normal: [f32; 3]) -> [f32; 3] {
+    let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+    if length < 1e-6 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [
+            normal[0] / length,
+            normal[1] / length,
+            normal[2] / length,
+        ]
+    }
+}
+
+/// The normal of a triangle, facing the way its corners wind — the same
+/// normal `surf->plane` gives a planar surface in the renderer.
+fn triangle_normal(vertexes: &[Vertex3D; 3]) -> [f32; 3] {
+    let edge = |a: [f32; 3], b: [f32; 3]| [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let u = edge(vertexes[0].pos, vertexes[1].pos);
+    let v = edge(vertexes[0].pos, vertexes[2].pos);
+    unit_normal([
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ])
 }
 
 /// Samples the face's lightmap at this vertex, as `R_LoadVertexes` leaves it
@@ -1848,6 +1899,16 @@ mod tests {
     }
 
     #[test]
+    fn an_environment_mapped_stage_says_so() {
+        let script = "textures/shiny\n{\n {\n  map textures/shiny.tga\n  tcGen environment\n }\n}\n";
+        let stages = stage_list(&shader_index(&[script.to_string()]), "textures/shiny");
+        assert!(stages[0].env);
+        let plain = "textures/dull\n{\n {\n  map textures/dull.tga\n }\n}\n";
+        let stages = stage_list(&shader_index(&[plain.to_string()]), "textures/dull");
+        assert!(!stages[0].env);
+    }
+
+    #[test]
     fn an_animmap_stage_carries_every_frame_and_its_rate() {
         let script = "textures/screen\n{\n {\n  animMap 5 textures/a.tga textures/b.tga textures/c.tga\n }\n}\n";
         let stages = stage_list(&shader_index(&[script.to_string()]), "textures/screen");
@@ -1869,6 +1930,7 @@ mod tests {
             turb: None,
             rotate: None,
             stretch: None,
+            env: false,
             lit: true,
         };
         assert_eq!(stage.texture_index(0.0), 7);
@@ -1923,9 +1985,10 @@ mod tests {
             turb: None,
             rotate: None,
             stretch: None,
+            env: false,
             lit: true,
         };
-        assert_eq!(stage.tc_mods(2.5), [0.0, 0.0, 0.0, 2.5, 1.0, 0.0, 1.0, 0.0]);
+        assert_eq!(stage.tc_mods(2.5), [0.0, 0.0, 0.0, 2.5, 0.0, 1.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -1944,13 +2007,15 @@ mod tests {
                 phase: 0.0,
                 frequency: 0.0,
             }),
+            env: false,
             lit: true,
         };
         let tc = stage.tc_mods(1.0);
-        assert!(tc[4].abs() < 1e-6, "cos {}", tc[4]);
-        assert!((tc[5] + 1.0).abs() < 1e-6, "sin {}", tc[5]);
+        // A clockwise turn of 90 degrees a second for one second.
+        assert!((tc[4] + std::f32::consts::FRAC_PI_2).abs() < 1e-6, "{}", tc[4]);
         // A stretch of two halves the coordinates rather than doubling them.
-        assert!((tc[6] - 0.5).abs() < 1e-6, "stretch {}", tc[6]);
+        assert!((tc[5] - 0.5).abs() < 1e-6, "stretch {}", tc[5]);
+        assert_eq!(tc[6], 0.0);
     }
 
     #[test]

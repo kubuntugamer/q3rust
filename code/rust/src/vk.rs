@@ -70,6 +70,8 @@ pub struct Vulkan {
     world_capacity: usize,
     /// Bytes of the world buffer this frame has filled.
     world_used: usize,
+    /// The eye the environment map reflects about, set once per frame.
+    view_origin: [f32; 3],
     /// Buffers a growing frame replaced. Commands already recorded this frame
     /// still bind them, so they are released only after the next fence wait.
     retired_world_buffers: Vec<vk::Buffer>,
@@ -134,6 +136,8 @@ pub struct Vertex3D {
     pub pos: [f32; 3],
     pub uv: [f32; 2],
     pub color: [u8; 4],
+    /// Surface normal, which `tcGen environment` reflects the view in.
+    pub normal: [f32; 3],
 }
 
 /// A texture the renderer can draw with. It is owned by the renderer it was
@@ -160,7 +164,7 @@ const MAX_TEXTURES: u32 = 1024;
 
 /// The texture deformation of a stage with no `tcMod`: no turbulence, no
 /// rotation and a stretch of one.
-pub const NO_TC_MODS: [f32; 8] = [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0];
+pub const NO_TC_MODS: [f32; 8] = [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 
 /// How a world stage combines with the frame — `blendFunc` in a shader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -362,6 +366,7 @@ impl Vulkan {
                 world_memory: vk::DeviceMemory::null(),
                 world_mapped: std::ptr::null_mut(),
                 world_capacity: 0,
+                view_origin: [0.0; 3],
                 world_used: 0,
                 retired_world_buffers: Vec::new(),
                 retired_world_memory: Vec::new(),
@@ -1588,6 +1593,11 @@ impl Vulkan {
                     .binding(0)
                     .format(vk::Format::R8G8B8A8_UNORM)
                     .offset(20),
+                vk::VertexInputAttributeDescription::default()
+                    .location(3)
+                    .binding(0)
+                    .format(vk::Format::R32G32B32_SFLOAT)
+                    .offset(24),
             ];
             let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
                 .vertex_binding_descriptions(&bindings)
@@ -1779,6 +1789,12 @@ impl Vulkan {
         self.draw_world_with(kind, texture, vertices, mvp, uv, tc, lit)
     }
 
+    /// Sets the eye the environment-mapped stages reflect about. It moves
+    /// every frame, so it is set once rather than passed to every draw.
+    pub fn set_view_origin(&mut self, origin: [f32; 3]) {
+        self.view_origin = origin;
+    }
+
     fn pipeline_for(&self, kind: PipelineKind) -> vk::Pipeline {
         match kind {
             PipelineKind::Opaque => self.world_pipeline,
@@ -1848,10 +1864,8 @@ impl Vulkan {
         self.world_used += bytes;
 
         let command_buffer = self.command_buffers[image_index as usize];
-        // The view-projection, the stage's UV transform, the lit flag and the
-        // texture deformation. `stage_mode`'s x is 1 for a stage the lightmap
-        // must not tint; the last two vec4s hold the turbulence and the
-        // rotation/stretch, both applied per vertex.
+        // The view-projection, the stage's UV transform, its mode, its
+        // turbulence, and the eye the environment map reflects about.
         let mut constants = [0u8; 128];
         for (index, value) in mvp.iter().enumerate() {
             constants[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
@@ -1860,9 +1874,19 @@ impl Vulkan {
             let at = 64 + index * 4;
             constants[at..at + 4].copy_from_slice(&value.to_le_bytes());
         }
-        constants[80..84].copy_from_slice(&if lit { 0.0f32 } else { 1.0f32 }.to_le_bytes());
-        for (index, value) in tc.iter().enumerate() {
+        // `stage_mode`: x flips the lightmap off, y selects environment
+        // mapping, z is the rotation and w the stretch.
+        let mode = [if lit { 0.0f32 } else { 1.0 }, tc[6], tc[4], tc[5]];
+        for (index, value) in mode.iter().enumerate() {
+            let at = 80 + index * 4;
+            constants[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for (index, value) in tc[..4].iter().enumerate() {
             let at = 96 + index * 4;
+            constants[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for (index, value) in self.view_origin.iter().chain([0.0f32].iter()).enumerate() {
+            let at = 112 + index * 4;
             constants[at..at + 4].copy_from_slice(&value.to_le_bytes());
         }
         unsafe {

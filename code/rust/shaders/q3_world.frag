@@ -10,7 +10,7 @@ layout(push_constant) uniform Push {
     vec4 uv_transform;
     vec4 stage_mode;
     vec4 turbulence;
-    vec4 tc_mods;
+    vec4 camera;
 } push;
 
 layout(location = 0) in vec2 uv;

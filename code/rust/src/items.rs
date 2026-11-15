@@ -323,6 +323,7 @@ pub fn beam(from: [f32; 3], to: [f32; 3], width: f32, color: [u8; 4]) -> Vec<Ver
                 pos: corners[index],
                 uv: [0.5, 0.5],
                 color,
+                normal,
             });
         }
     }
@@ -363,6 +364,8 @@ fn push_corners(vertices: &mut Vec<Vertex3D>, min: [f32; 3], max: [f32; 3], colo
                 // The renderer's white texture, tinted by the vertex colour.
                 uv: [0.0, 0.0],
                 color,
+                // Boxes are never environment mapped, so one normal serves.
+                normal: [0.0, 0.0, 1.0],
             });
         }
     }
