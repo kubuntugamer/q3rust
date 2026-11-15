@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use q3rust::assets::Assets;
 use q3rust::bg_misc::{self, BG_NUM_ITEMS};
-use q3rust::bsp::Bsp;
+use q3rust::bsp::{next_token, Bsp};
 use q3rust::entities;
 use q3rust::model::Md3Model;
 use q3rust::shader::{Parser, ShaderScript, ShaderStage, ShaderTextIndex, TextureMap};
@@ -241,6 +241,11 @@ fn main() -> ExitCode {
         players.unresolved,
         players.broken
     );
+    println!(
+        "player animations: {} tables ({} rows), {} warnings, {} broken",
+        players.animation_tables, players.animation_rows, players.animation_warnings,
+        players.animation_broken
+    );
 
     // The shader scripts themselves: every stage that draws a file names an
     // image, and the renderer falls back to its default when that image is
@@ -260,7 +265,11 @@ fn main() -> ExitCode {
         println!("dangling shaders: {dangling} (pass --strict to fail on them)");
     }
 
-    if failed == 0 && players.broken == 0 && (!strict || dangling == 0) {
+    if failed == 0
+        && players.broken == 0
+        && players.animation_broken == 0
+        && (!strict || dangling == 0)
+    {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -278,6 +287,10 @@ struct PlayerModelAudit {
     skins: usize,
     unresolved: usize,
     broken: usize,
+    animation_tables: usize,
+    animation_rows: usize,
+    animation_warnings: usize,
+    animation_broken: usize,
 }
 
 /// Every `models/players/<model>/` that holds a `lower.md3` or an
@@ -318,6 +331,25 @@ fn audit_player_models(
 
         if assets.exists(&format!("{prefix}animation.cfg")) {
             audit.configs += 1;
+            let path = format!("{prefix}animation.cfg");
+            match assets
+                .read(&path)
+                .ok_or_else(|| format!("{path}: unreadable"))
+                .and_then(|bytes| parse_animation_cfg(&String::from_utf8_lossy(&bytes)))
+            {
+                Ok(table) => {
+                    audit.animation_tables += 1;
+                    audit.animation_rows += table.rows;
+                    for warning in table.warnings {
+                        eprintln!("{path}: {warning}");
+                        audit.animation_warnings += 1;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{path}: {e}");
+                    audit.animation_broken += 1;
+                }
+            }
         } else {
             eprintln!("{prefix}animation.cfg: missing");
             audit.broken += 1;
@@ -392,6 +424,90 @@ fn audit_player_models(
     }
 
     audit
+}
+
+/// One parsed animation table. `rows` counts the entries the file actually
+/// supplies; the loader synthesizes the six torso rows from `TORSO_GESTURE`
+/// when the file stops after the legs, as the stock files do.
+#[derive(Debug, Default)]
+struct AnimationTable {
+    rows: usize,
+    warnings: Vec<String>,
+}
+
+/// `CG_ParseAnimationFile`'s rules, without the side effects: optional
+/// parameters first, then the animation rows. A file is valid once it supplies
+/// every row through `TORSO_NEGATIVE`'s predecessor; the six torso rows after
+/// the legs may be omitted, and anything past the table is ignored.
+fn parse_animation_cfg(text: &str) -> Result<AnimationTable, String> {
+    // `bg_public.h`'s `animNumber_t`.
+    const MAX_ANIMATIONS: usize = 31;
+    const TORSO_GETFLAG: usize = 25;
+    const TORSO_NEGATIVE: usize = 30;
+
+    let mut tokens = Vec::new();
+    let mut at = 0;
+    while let Some(token) = next_token(text.as_bytes(), &mut at) {
+        tokens.push(token);
+    }
+
+    let mut table = AnimationTable::default();
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i].to_ascii_lowercase();
+        i += 1;
+        match token.as_str() {
+            "footsteps" => {
+                let Some(value) = tokens.get(i) else {
+                    break;
+                };
+                i += 1;
+                if !matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "default" | "normal" | "boot" | "flesh" | "mech" | "energy"
+                ) {
+                    table
+                        .warnings
+                        .push(format!("bad footsteps value '{value}'"));
+                }
+            }
+            "headoffset" => i = (i + 3).min(tokens.len()),
+            "sex" => {
+                if i < tokens.len() {
+                    i += 1;
+                }
+            }
+            "fixedlegs" | "fixedtorso" => {}
+            _ if token.as_bytes().first().is_some_and(u8::is_ascii_digit) => {
+                // Not an optional parameter: this is the first row, and the C
+                // puts the token back before parsing the table.
+                i -= 1;
+                break;
+            }
+            _ => table.warnings.push(format!("unknown token '{token}'")),
+        }
+    }
+
+    for animation in 0..MAX_ANIMATIONS {
+        if i >= tokens.len() {
+            if (TORSO_GETFLAG..=TORSO_NEGATIVE).contains(&animation) {
+                continue;
+            }
+            return Err(format!(
+                "only {animation} of {MAX_ANIMATIONS} animations before the file ended"
+            ));
+        }
+        i += 1; // firstFrame
+        for field in ["frame count", "loop frame count", "frame rate"] {
+            if i >= tokens.len() {
+                return Err(format!("animation {animation} has no {field}"));
+            }
+            i += 1;
+        }
+        table.rows += 1;
+    }
+
+    Ok(table)
 }
 
 /// `CommaParse`'s pairs from a `.skin` file: surface and shader separated by a
@@ -635,6 +751,38 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    fn animation_table(rows: usize) -> String {
+        let mut text = String::from("sex\tm\nfootsteps\tnormal\n\n");
+        for row in 0..rows {
+            text.push_str(&format!("{}\t10\t0\t20\t\t// row {row}\n", row * 10));
+        }
+        text
+    }
+
+    #[test]
+    fn animation_table_accepts_the_stock_shape() {
+        let table = parse_animation_cfg(&animation_table(25)).unwrap();
+        assert_eq!(table.rows, 25);
+        assert!(table.warnings.is_empty());
+    }
+
+    #[test]
+    fn animation_table_needs_every_leg_and_death_row() {
+        let err = parse_animation_cfg(&animation_table(24)).unwrap_err();
+        assert!(err.contains("24 of 31"), "{err}");
+    }
+
+    #[test]
+    fn animation_table_reports_the_c_warnings() {
+        let mut text = String::from("footsteps clank\nwibble\nsex f\n");
+        text.push_str(&animation_table(25));
+        let table = parse_animation_cfg(&text).unwrap();
+        assert_eq!(table.rows, 25);
+        assert_eq!(table.warnings.len(), 2);
+        assert!(table.warnings[0].contains("clank"));
+        assert!(table.warnings[1].contains("wibble"));
     }
 
     #[test]
