@@ -371,6 +371,7 @@ pub fn deform_vertices(
         match deform.deform {
             Deform::Wave => wave_deformation(&mut moved, deform, seconds),
             Deform::Move => move_deformation(&mut moved, deform, seconds),
+            Deform::Bulge => bulge_deformation(&mut moved, deform, seconds),
             _ => {}
         }
     }
@@ -388,6 +389,21 @@ fn wave_deformation(vertices: &mut [Vertex3D], deform: &DeformStage, seconds: f3
             wave.phase += (vertex.pos[0] + vertex.pos[1] + vertex.pos[2]) * deform.spread;
         }
         let scale = wave_value(&wave, seconds);
+        for axis in 0..3 {
+            vertex.pos[axis] += vertex.normal[axis] * scale;
+        }
+    }
+}
+
+/// `deformVertexes bulge`: a sine along the texture's own s, moving each
+/// vertex along its normal.
+fn bulge_deformation(vertices: &mut [Vertex3D], deform: &DeformStage, seconds: f32) {
+    let now = seconds * deform.bulge_speed * 0.001;
+    for vertex in vertices {
+        // `RB_CalcBulgeVertexes` addresses the sine table in turns of 2 pi.
+        let off = (1024.0 / std::f32::consts::TAU) * (vertex.uv[0] * deform.bulge_width + now);
+        let angle = std::f32::consts::TAU * (off as i32 & 1023) as f32 / 1024.0;
+        let scale = angle.sin() * deform.bulge_height;
         for axis in 0..3 {
             vertex.pos[axis] += vertex.normal[axis] * scale;
         }
@@ -1181,7 +1197,7 @@ fn shader_deforms(index: &ShaderTextIndex, name: &str) -> Vec<DeformStage> {
             script
                 .deforms
                 .iter()
-                .filter(|deform| matches!(deform.deform, Deform::Wave | Deform::Move))
+                .filter(|deform| matches!(deform.deform, Deform::Wave | Deform::Move | Deform::Bulge))
                 .cloned()
                 .collect()
         })
@@ -2311,6 +2327,31 @@ mod tests {
         // The unstretched wave is flat across the surface.
         let flat = deform_vertices(&vertices, &[deform], 0.0);
         assert_eq!(flat[0].pos[2], 3.0);
+    }
+
+    #[test]
+    fn a_bulge_deformation_sweeps_along_the_texture() {
+        let deform = DeformStage {
+            deform: Deform::Bulge,
+            move_vector: [0.0; 3],
+            wave: WaveForm::default(),
+            spread: 0.0,
+            bulge_width: 1.0,
+            bulge_height: 0.5,
+            bulge_speed: 0.0,
+        };
+        let vertex = |uv: f32| Vertex3D {
+            pos: [0.0; 3],
+            uv: [uv, 0.0],
+            color: [255, 255, 255, 255],
+            normal: [0.0, 0.0, 1.0],
+        };
+        // At s = 0 the sine has not left zero.
+        assert_eq!(deform_vertices(&[vertex(0.0)], &[deform.clone()], 0.0)[0].pos[2], 0.0);
+        // The sine turns once per unit of s, so s = pi/2 is a quarter turn
+        // and moves the vertex up by the full height.
+        let quarter = deform_vertices(&[vertex(std::f32::consts::FRAC_PI_2)], &[deform], 0.0);
+        assert!((quarter[0].pos[2] - 0.5).abs() < 1e-3, "{}", quarter[0].pos[2]);
     }
 
     #[test]
