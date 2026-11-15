@@ -1760,13 +1760,14 @@ impl Client {
         let across_scale = 0.70 / size[across].max(0.01);
         let up_scale = 0.70 / size[up].max(0.01);
 
-        // Column-major, mapping model axes to screen x (0.05..0.75) and y
-        // (-0.95..-0.25).
+        // Column-major, mapping model axes to screen x (0.17..0.87) and y
+        // (0.23..0.93). Vulkan's clip space has y pointing down, so the low
+        // box on screen is the positive y half.
         let mut fitted = [0.0f32; 16];
         fitted[across * 4] = across_scale;
         fitted[up * 4 + 1] = up_scale;
-        fitted[12] = 0.40 - across_scale * centre[across];
-        fitted[13] = -0.60 - up_scale * centre[up] + kick;
+        fitted[12] = 0.52 - across_scale * centre[across];
+        fitted[13] = 0.58 - up_scale * centre[up] + kick;
         fitted[14] = 0.0;
         fitted[15] = 1.0;
         fitted
@@ -2067,9 +2068,10 @@ impl Client {
             .iter()
             .find(|model| model.weapon == prediction.weapon())
         {
-            // The weapon dips for a moment after each shot.
+            // The weapon dips for a moment after each shot. Positive y is down
+            // in clip space, so the dip is a positive offset.
             let kick = if self.millis() < self.kick_until {
-                -0.05
+                0.05
             } else {
                 0.0
             };
@@ -2972,10 +2974,12 @@ mod tests {
         let fitted = Client::view_model_matrix(&model, 0.0);
         let near_left = on_screen(&fitted, [-40.0, -10.0, 0.0]);
         let far_right = on_screen(&fitted, [40.0, 10.0, 0.0]);
-        assert!((near_left[0] - 0.05).abs() < 1e-3, "{near_left:?}");
-        assert!((far_right[0] - 0.75).abs() < 1e-3, "{far_right:?}");
-        assert!((near_left[1] + 0.95).abs() < 1e-3, "{near_left:?}");
-        assert!((far_right[1] + 0.25).abs() < 1e-3, "{far_right:?}");
+        assert!((near_left[0] - 0.17).abs() < 1e-3, "{near_left:?}");
+        assert!((far_right[0] - 0.87).abs() < 1e-3, "{far_right:?}");
+        // Positive y is down in clip space, so the low box on screen is
+        // 0.23..0.93.
+        assert!((near_left[1] - 0.23).abs() < 1e-3, "{near_left:?}");
+        assert!((far_right[1] - 0.93).abs() < 1e-3, "{far_right:?}");
         // Flat, and at the near end, so the map never hides it.
         assert_eq!(near_left[2], 0.0);
         assert_eq!(far_right[2], 0.0);
