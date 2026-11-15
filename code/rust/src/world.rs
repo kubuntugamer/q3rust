@@ -298,32 +298,55 @@ pub struct Batch {
     pub first: usize,
     pub count: usize,
     pub stages: Vec<Stage>,
-    /// The shader's `deformVertexes wave`, applied to the whole batch before
-    /// it is drawn.
-    pub deform: Option<DeformStage>,
+    /// The shader's deformations that this renderer applies, in script order,
+    /// run over the whole batch before it is drawn.
+    pub deforms: Vec<DeformStage>,
 }
 
-/// `RB_CalcDeformVertexes` for `deformVertexes wave`. A vertex moves along
-/// its own normal by the wave's value, with the wave's phase advanced by the
-/// vertex's distance along the diagonal unless the frequency is zero.
-/// `spread` is already the C's `1/divisor`.
-pub fn deform_wave(vertices: &[Vertex3D], deform: &DeformStage, seconds: f32) -> Vec<Vertex3D> {
-    let mut moved = Vec::with_capacity(vertices.len());
+/// The batch's vertices after each of its deformations, as
+/// `RB_CalcDeformVertexes` would leave them.
+pub fn deform_vertices(
+    vertices: &[Vertex3D],
+    deforms: &[DeformStage],
+    seconds: f32,
+) -> Vec<Vertex3D> {
+    let mut moved = vertices.to_vec();
+    for deform in deforms {
+        match deform.deform {
+            Deform::Wave => wave_deformation(&mut moved, deform, seconds),
+            Deform::Move => move_deformation(&mut moved, deform, seconds),
+            _ => {}
+        }
+    }
+    moved
+}
+
+/// `deformVertexes wave`: a vertex moves along its own normal by the wave's
+/// value, with the wave's phase advanced by the vertex's distance along the
+/// diagonal unless the frequency is zero. `spread` is already the C's
+/// `1/divisor`.
+fn wave_deformation(vertices: &mut [Vertex3D], deform: &DeformStage, seconds: f32) {
     for vertex in vertices {
         let mut wave = deform.wave;
         if wave.frequency != 0.0 {
             wave.phase += (vertex.pos[0] + vertex.pos[1] + vertex.pos[2]) * deform.spread;
         }
         let scale = wave_value(&wave, seconds);
-        let mut vertex = *vertex;
-        vertex.pos = [
-            vertex.pos[0] + vertex.normal[0] * scale,
-            vertex.pos[1] + vertex.normal[1] * scale,
-            vertex.pos[2] + vertex.normal[2] * scale,
-        ];
-        moved.push(vertex);
+        for axis in 0..3 {
+            vertex.pos[axis] += vertex.normal[axis] * scale;
+        }
     }
-    moved
+}
+
+/// `deformVertexes move`: the whole surface slides along the move vector by
+/// the wave's value.
+fn move_deformation(vertices: &mut [Vertex3D], deform: &DeformStage, seconds: f32) {
+    let scale = wave_value(&deform.wave, seconds);
+    for vertex in vertices {
+        for axis in 0..3 {
+            vertex.pos[axis] += deform.move_vector[axis] * scale;
+        }
+    }
 }
 
 /// One surface of a pickup's model: the texture it names and its triangles in
@@ -586,7 +609,7 @@ impl World {
                 });
             }
 
-            let deform = wave_deform(&index, &name);
+            let deforms = shader_deforms(&index, &name);
             let first = world.vertices.len();
             let count = vertices.len();
             world.vertices.extend(vertices);
@@ -594,7 +617,7 @@ impl World {
                 first,
                 count,
                 stages,
-                deform,
+                deforms,
             });
         }
 
@@ -1062,16 +1085,19 @@ fn sky_outerbox(index: &ShaderTextIndex, shader_name: &str) -> Option<[String; 6
     shader_script(index, shader_name)?.sky?.outerbox
 }
 
-/// The shader's `deformVertexes wave`, if it has one. The other deformation
-/// kinds are not applied yet.
-fn wave_deform(index: &ShaderTextIndex, name: &str) -> Option<DeformStage> {
-    shader_script(index, name).and_then(|script| {
-        script
-            .deforms
-            .iter()
-            .find(|deform| deform.deform == Deform::Wave)
-            .cloned()
-    })
+/// The shader's deformations this renderer applies. The other kinds are not
+/// applied yet.
+fn shader_deforms(index: &ShaderTextIndex, name: &str) -> Vec<DeformStage> {
+    shader_script(index, name)
+        .map(|script| {
+            script
+                .deforms
+                .iter()
+                .filter(|deform| matches!(deform.deform, Deform::Wave | Deform::Move))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `EvalWaveForm`: the value a wave has at `seconds`, read from the same
@@ -2016,15 +2042,18 @@ mod tests {
     }
 
     #[test]
-    fn a_wave_deform_is_found_on_its_shader() {
-        let script = "textures/water\n{\n deformVertexes wave 100 sin 0 1.5 0 0.5\n {\n  map textures/water.tga\n }\n}\n";
-        let deform = wave_deform(&shader_index(&[script.to_string()]), "textures/water")
-            .expect("deformVertexes wave should reach the batch");
-        assert_eq!(deform.wave.amplitude, 1.5);
-        assert_eq!(deform.wave.frequency, 0.5);
-        assert!((deform.spread - 0.01).abs() < 1e-6, "{}", deform.spread);
+    fn the_batch_keeps_the_deforms_it_can_apply() {
+        let script = "textures/water\n{\n deformVertexes wave 100 sin 0 1.5 0 0.5\n deformVertexes move 0 0 4 sin 0 8 0 0.25\n {\n  map textures/water.tga\n }\n}\n";
+        let deforms = shader_deforms(&shader_index(&[script.to_string()]), "textures/water");
+        assert_eq!(deforms.len(), 2);
+        assert_eq!(deforms[0].deform, Deform::Wave);
+        assert_eq!(deforms[0].wave.amplitude, 1.5);
+        assert_eq!(deforms[0].wave.frequency, 0.5);
+        assert!((deforms[0].spread - 0.01).abs() < 1e-6, "{}", deforms[0].spread);
+        assert_eq!(deforms[1].deform, Deform::Move);
+        assert_eq!(deforms[1].move_vector[2], 4.0);
         let plain = "textures/still\n{\n {\n  map textures/still.tga\n }\n}\n";
-        assert!(wave_deform(&shader_index(&[plain.to_string()]), "textures/still").is_none());
+        assert!(shader_deforms(&shader_index(&[plain.to_string()]), "textures/still").is_empty());
     }
 
     #[test]
@@ -2050,12 +2079,40 @@ mod tests {
             color: [255, 255, 255, 255],
             normal: [0.0, 0.0, 1.0],
         }];
-        let moved = deform_wave(&vertices, &deform, 0.25);
+        let moved = deform_vertices(&vertices, &[deform.clone()], 0.25);
         assert!((moved[0].pos[2] - 4.0).abs() < 1e-5, "{}", moved[0].pos[2]);
         assert_eq!(moved[0].pos[0], 1.0);
         // The unstretched wave is flat across the surface.
-        let flat = deform_wave(&vertices, &deform, 0.0);
+        let flat = deform_vertices(&vertices, &[deform], 0.0);
         assert_eq!(flat[0].pos[2], 3.0);
+    }
+
+    #[test]
+    fn a_move_deformation_slides_the_whole_surface() {
+        let deform = DeformStage {
+            deform: Deform::Move,
+            move_vector: [0.0, 0.0, 2.0],
+            wave: WaveForm {
+                func: GenFunc::Sin,
+                base: 0.0,
+                amplitude: 1.0,
+                phase: 0.0,
+                frequency: 1.0,
+            },
+            spread: 0.0,
+            bulge_width: 0.0,
+            bulge_height: 0.0,
+            bulge_speed: 0.0,
+        };
+        let vertices = [Vertex3D {
+            pos: [1.0, 2.0, 3.0],
+            uv: [0.0, 0.0],
+            color: [255, 255, 255, 255],
+            normal: [0.0, 0.0, 1.0],
+        }];
+        let moved = deform_vertices(&vertices, &[deform], 0.25);
+        assert!((moved[0].pos[2] - 5.0).abs() < 1e-5, "{}", moved[0].pos[2]);
+        assert_eq!(moved[0].pos[0], 1.0);
     }
 
     #[test]

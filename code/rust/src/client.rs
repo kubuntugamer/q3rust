@@ -1812,15 +1812,14 @@ impl Client {
         let seconds = self.millis() as f32 / 1000.0;
         for batch in &world.batches {
             let source = &world.vertices[batch.first..batch.first + batch.count];
-            // A wave deformation moves the whole batch along its normals, so
-            // it is computed once and shared by every stage.
+            // Deformations move the whole batch, so they are computed once
+            // and shared by every stage.
             let moved;
-            let vertices = match batch.deform.as_ref() {
-                Some(deform) => {
-                    moved = world::deform_wave(source, deform, seconds);
-                    moved.as_slice()
-                }
-                None => source,
+            let vertices = if batch.deforms.is_empty() {
+                source
+            } else {
+                moved = world::deform_vertices(source, &batch.deforms, seconds);
+                moved.as_slice()
             };
             for stage in &batch.stages {
                 let (_, texture) = &world.textures()[stage.texture_index(seconds)];
