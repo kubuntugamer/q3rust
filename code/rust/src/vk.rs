@@ -158,6 +158,17 @@ pub enum BlendMode {
     Add,
 }
 
+/// Whether to split rendering from presentation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OffloadMode {
+    Off,
+    /// Only on the hybrid pair the renderer knows how to use: discrete render,
+    /// integrated display.
+    Auto,
+    /// Any pair of hardware devices.
+    Forced,
+}
+
 /// Which world pipeline to build. The vertex and fragment shaders are the same
 /// for all four; only depth and blending differ.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -180,17 +191,22 @@ impl Vulkan {
         unsafe {
             let surface_loader = ash::khr::surface::Instance::new(&entry, &instance);
 
-            // `Q3_OFFLOAD=1` renders on a headless device and presents the
-            // readback on the device that owns the window. Without a second
-            // device the normal single-device path is used.
-            let offload = std::env::var("Q3_OFFLOAD")
-                .map(|value| {
-                    !value.is_empty()
-                        && value != "0"
-                        && !value.eq_ignore_ascii_case("false")
-                })
-                .unwrap_or(false);
-            let (physical_device, queue_family, presenter) = if offload {
+            // Offload renders on a discrete GPU and presents the readback on
+            // the integrated one, which is the display in a hybrid setup. It is
+            // the default there, `Q3_OFFLOAD=0` turns it off and `Q3_OFFLOAD=1`
+            // forces it on any pair of hardware devices.
+            let mode = match std::env::var("Q3_OFFLOAD") {
+                Ok(value)
+                    if value.is_empty()
+                        || value == "0"
+                        || value.eq_ignore_ascii_case("false") =>
+                {
+                    OffloadMode::Off
+                }
+                Ok(_) => OffloadMode::Forced,
+                Err(_) => OffloadMode::Auto,
+            };
+            let (physical_device, queue_family, presenter) = if mode != OffloadMode::Off {
                 match pick_render_device(&instance, None) {
                     Some((render, render_family)) => match pick_present_device(
                         &instance,
@@ -198,23 +214,39 @@ impl Vulkan {
                         surface,
                         Some(render),
                     ) {
-                        Ok((display, display_family)) => match Presenter::new(
-                            &instance,
-                            &surface_loader,
-                            surface,
-                            display,
-                            display_family,
-                            width,
-                            height,
-                        ) {
-                            Ok(presenter) => (render, render_family, Some(presenter)),
-                            Err(e) => {
-                                eprintln!("offload disabled: {e}");
+                        Ok((display, display_family)) => {
+                            let render_properties =
+                                instance.get_physical_device_properties(render);
+                            let display_properties =
+                                instance.get_physical_device_properties(display);
+                            let hybrid = render_properties.device_type
+                                == vk::PhysicalDeviceType::DISCRETE_GPU
+                                && display_properties.device_type
+                                    == vk::PhysicalDeviceType::INTEGRATED_GPU;
+                            if mode == OffloadMode::Auto && !hybrid {
                                 let (device, family) =
                                     pick_device(&instance, &surface_loader, surface)?;
                                 (device, family, None)
+                            } else {
+                                match Presenter::new(
+                                    &instance,
+                                    &surface_loader,
+                                    surface,
+                                    display,
+                                    display_family,
+                                    width,
+                                    height,
+                                ) {
+                                    Ok(presenter) => (render, render_family, Some(presenter)),
+                                    Err(e) => {
+                                        eprintln!("offload disabled: {e}");
+                                        let (device, family) =
+                                            pick_device(&instance, &surface_loader, surface)?;
+                                        (device, family, None)
+                                    }
+                                }
                             }
-                        },
+                        }
                         Err(_) => {
                             let (device, family) =
                                 pick_device(&instance, &surface_loader, surface)?;

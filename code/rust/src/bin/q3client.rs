@@ -1,8 +1,8 @@
 //! The engine's entry point: a Rust `main` over the Rust client.
 //!
 //! SDL owns the window, the event queue and the audio device; Vulkan draws.
-//! `Q3_OFFLOAD=1` renders on a headless device and presents that frame through
-//! the device that owns the window, when both are available.
+//! On a hybrid GPU the scene is rendered on the discrete device and presented
+//! through the integrated one; `Q3_OFFLOAD=0` turns that off.
 
 use q3rust::client::Client;
 
