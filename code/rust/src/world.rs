@@ -23,7 +23,7 @@ use crate::shader::{
     AlphaGen, ColorGen, Deform, DeformStage, GenFunc, Parser, ShaderScript, ShaderSort,
     ShaderStage, ShaderTextIndex, TexCoordGen, TexMod, TextureMap, WaveForm,
     GLS_DEPTHMASK_TRUE,
-    CONTENTS_FOG, GLS_DSTBLEND_ONE, GLS_SRCBLEND_ONE,
+    CONTENTS_FOG, GLS_DSTBLEND_ONE, GLS_DSTBLEND_ZERO, GLS_SRCBLEND_DST_COLOR, GLS_SRCBLEND_ONE,
 };
 use crate::texture;
 use crate::vk::{BlendMode, Texture, Vertex3D, Vulkan};
@@ -1339,15 +1339,29 @@ struct StageSpec {
 /// an implicit one: its own name is the image, drawn lit and opaque.
 fn stage_list(index: &ShaderTextIndex, name: &str) -> Vec<StageSpec> {
     let mut stages = Vec::new();
+    // The lightmap is baked into the vertex colour, so the stage that pairs
+    // with it is drawn as one lit pass rather than modulated a second time.
+    let mut after_lightmap = false;
     if let Some(script) = shader_script(index, name) {
         for stage in script.stages.iter().filter(|stage| stage.active) {
             let Some((images, anim_speed)) = stage_images(stage) else {
+                after_lightmap = stage.bundle.map == Some(TextureMap::Lightmap);
                 continue;
             };
+            // `blendFunc GL_DST_COLOR GL_ZERO` after a lightmap stage is the
+            // pair the C's multitexture path draws in one pass.
+            let mut blend = blend_mode(stage.state_bits);
+            if after_lightmap
+                && stage.state_bits & 0xff
+                    == GLS_SRCBLEND_DST_COLOR | GLS_DSTBLEND_ZERO
+            {
+                blend = BlendMode::Opaque;
+            }
+            after_lightmap = false;
             stages.push(StageSpec {
                 images: images.to_vec(),
                 anim_speed,
-                blend: blend_mode(stage.state_bits),
+                blend,
                 uv: stage_transform(&stage.bundle.tex_mods),
                 turb: stage_turbulence(&stage.bundle.tex_mods),
                 rotate: stage_rotation(&stage.bundle.tex_mods),
@@ -2294,6 +2308,25 @@ mod tests {
             batch_sort(&index, "textures/grate", &stages),
             ShaderSort::SEE_THROUGH.0
         );
+    }
+
+    #[test]
+    fn the_stage_paired_with_a_lightmap_stage_draws_opaque() {
+        // The stock wall shader: lightmap, then the diffuse texture modulated
+        // by it. The lightmap is in the vertex colour, so the second stage is
+        // one lit, opaque pass rather than a second multiply.
+        let lit = "textures/wall\n{\n {\n  map $lightmap\n  rgbGen identity\n }\n\
+                    {\n  map textures/wall.tga\n  blendFunc GL_DST_COLOR GL_ZERO\n  rgbGen identity\n }\n}\n";
+        let stages = stage_list(&shader_index(&[lit.to_string()]), "textures/wall");
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].blend, BlendMode::Opaque);
+        assert!(stages[0].lit);
+
+        // Away from a lightmap stage the same blend is a real modulation and
+        // stays a blend.
+        let decal = "textures/decal\n{\n {\n  map textures/decal.tga\n  blendFunc GL_DST_COLOR GL_ZERO\n }\n}\n";
+        let stages = stage_list(&shader_index(&[decal.to_string()]), "textures/decal");
+        assert_eq!(stages[0].blend, BlendMode::Blend);
     }
 
     #[test]
