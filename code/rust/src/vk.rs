@@ -69,6 +69,12 @@ pub struct Vulkan {
     world_capacity: usize,
     /// Bytes of the world buffer this frame has filled.
     world_used: usize,
+    /// Buffers a growing frame replaced. Commands already recorded this frame
+    /// still bind them, so they are released only after the next fence wait.
+    retired_world_buffers: Vec<vk::Buffer>,
+    retired_world_memory: Vec<vk::DeviceMemory>,
+    retired_vertex_buffers: Vec<vk::Buffer>,
+    retired_vertex_memory: Vec<vk::DeviceMemory>,
 }
 
 /// The mapping the 2D vertex shader applies to engine pixels.
@@ -226,6 +232,10 @@ impl Vulkan {
                 world_mapped: std::ptr::null_mut(),
                 world_capacity: 0,
                 world_used: 0,
+                retired_world_buffers: Vec::new(),
+                retired_world_memory: Vec::new(),
+                retired_vertex_buffers: Vec::new(),
+                retired_vertex_memory: Vec::new(),
             };
 
             vk.create_swapchain(vk::SwapchainKHR::null())?;
@@ -266,6 +276,7 @@ impl Vulkan {
             self.device
                 .wait_for_fences(&[self.in_flight], true, u64::MAX)
                 .map_err(|e| format!("waiting for the frame fence: {e}"))?;
+            self.release_retired();
 
             let (image_index, _suboptimal) = match self.swapchain_loader.acquire_next_image(
                 self.swapchain,
@@ -1049,10 +1060,10 @@ impl Vulkan {
                 self.device.unmap_memory(self.world_memory);
             }
             if self.world_buffer != vk::Buffer::null() {
-                self.device.destroy_buffer(self.world_buffer, None);
+                self.retired_world_buffers.push(self.world_buffer);
             }
             if self.world_memory != vk::DeviceMemory::null() {
-                self.device.free_memory(self.world_memory, None);
+                self.retired_world_memory.push(self.world_memory);
             }
 
             self.world_buffer = buffer;
@@ -1843,10 +1854,10 @@ impl Vulkan {
                 self.device.unmap_memory(self.vertex_memory);
             }
             if self.vertex_buffer != vk::Buffer::null() {
-                self.device.destroy_buffer(self.vertex_buffer, None);
+                self.retired_vertex_buffers.push(self.vertex_buffer);
             }
             if self.vertex_memory != vk::DeviceMemory::null() {
-                self.device.free_memory(self.vertex_memory, None);
+                self.retired_vertex_memory.push(self.vertex_memory);
             }
 
             self.vertex_buffer = buffer;
@@ -2000,10 +2011,32 @@ fn pick_device(
     }
 }
 
+impl Vulkan {
+    /// Frees the buffers replaced by an earlier frame's growth. The frame fence
+    /// has been waited on, so no recorded or in-flight command binds them.
+    fn release_retired(&mut self) {
+        unsafe {
+            for buffer in self.retired_world_buffers.drain(..) {
+                self.device.destroy_buffer(buffer, None);
+            }
+            for memory in self.retired_world_memory.drain(..) {
+                self.device.free_memory(memory, None);
+            }
+            for buffer in self.retired_vertex_buffers.drain(..) {
+                self.device.destroy_buffer(buffer, None);
+            }
+            for memory in self.retired_vertex_memory.drain(..) {
+                self.device.free_memory(memory, None);
+            }
+        }
+    }
+}
+
 impl Drop for Vulkan {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            self.release_retired();
             self.destroy_swapchain_objects();
             if self.pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(self.pipeline, None);
