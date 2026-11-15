@@ -239,7 +239,33 @@ pub struct Stage {
     pub rgb: Option<WaveForm>,
     /// `alphaGen wave`: the stage's alpha pulses with this wave.
     pub alpha: Option<WaveForm>,
+    /// `tcMod transform`: a fixed matrix and offset over the coordinates.
+    pub transform: Option<TexTransform>,
     pub lit: bool,
+}
+
+/// `tcMod transform`: `st' = matrix * st + translate`, in the C's field order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TexTransform {
+    pub matrix: [[f32; 2]; 2],
+    pub translate: [f32; 2],
+}
+
+/// The stage's coordinates after `tcMod transform`, which is fixed, so it is
+/// applied once per frame to the batch's copy.
+pub fn transform_texcoords(vertices: &[Vertex3D], transform: &TexTransform) -> Vec<Vertex3D> {
+    vertices
+        .iter()
+        .map(|vertex| {
+            let [s, t] = vertex.uv;
+            let mut moved = *vertex;
+            moved.uv = [
+                s * transform.matrix[0][0] + t * transform.matrix[1][0] + transform.translate[0],
+                s * transform.matrix[0][1] + t * transform.matrix[1][1] + transform.translate[1],
+            ];
+            moved
+        })
+        .collect()
 }
 
 /// An `animMap`: the images it cycles through and how fast, mirroring
@@ -634,6 +660,7 @@ impl World {
                     env: spec.env,
                     rgb: spec.rgb,
                     alpha: spec.alpha,
+                    transform: spec.transform,
                     lit: spec.lit,
                 });
             }
@@ -1171,6 +1198,7 @@ struct StageSpec {
     env: bool,
     rgb: Option<WaveForm>,
     alpha: Option<WaveForm>,
+    transform: Option<TexTransform>,
     lit: bool,
 }
 
@@ -1194,6 +1222,7 @@ fn stage_list(index: &ShaderTextIndex, name: &str) -> Vec<StageSpec> {
                 env: stage.bundle.tc_gen == TexCoordGen::EnvironmentMapped,
                 rgb: (stage.rgb_gen == ColorGen::Waveform).then_some(stage.rgb_wave),
                 alpha: (stage.alpha_gen == AlphaGen::Waveform).then_some(stage.alpha_wave),
+                transform: stage_tex_transform(&stage.bundle.tex_mods),
                 // Only the first pass carries the surface's lightmap.
                 lit: stages.is_empty(),
             });
@@ -1214,6 +1243,7 @@ fn stage_list(index: &ShaderTextIndex, name: &str) -> Vec<StageSpec> {
             env: false,
             rgb: None,
             alpha: None,
+            transform: None,
             lit: true,
         });
     }
@@ -1241,6 +1271,18 @@ fn stage_rotation(tex_mods: &[TexMod]) -> Option<f32> {
         }
     }
     turned.then_some(speed)
+}
+
+/// The stage's `tcMod transform`, if it has one. A fixed transform applies to
+/// the coordinates once and does not need the clock.
+fn stage_tex_transform(tex_mods: &[TexMod]) -> Option<TexTransform> {
+    tex_mods.iter().find_map(|tex_mod| match tex_mod {
+        TexMod::Transform { matrix, translate } => Some(TexTransform {
+            matrix: *matrix,
+            translate: *translate,
+        }),
+        _ => None,
+    })
 }
 
 /// The first `tcMod stretch` on a stage, for the same reason as turbulence.
@@ -2034,6 +2076,7 @@ mod tests {
             env: false,
             rgb: None,
             alpha: None,
+            transform: None,
             lit: true,
         };
         assert_eq!(stage.texture_index(0.0), 7);
@@ -2076,6 +2119,32 @@ mod tests {
         close(wave_value(&wave(GenFunc::Triangle), 0.25), 3.0);
         close(wave_value(&wave(GenFunc::Sawtooth), 0.5), 2.0);
         close(wave_value(&wave(GenFunc::InverseSawtooth), 0.25), 2.5);
+    }
+
+    #[test]
+    fn a_transform_texmod_reaches_its_stage() {
+        let script = "textures/turned\n{\n {\n  map textures/turned.tga\n  tcMod transform 0 1 1 0 0.5 0.25\n }\n}\n";
+        let stages = stage_list(&shader_index(&[script.to_string()]), "textures/turned");
+        let transform = stages[0].transform.expect("tcMod transform should reach the stage");
+        assert_eq!(transform.translate, [0.5, 0.25]);
+        assert_eq!(transform.matrix, [[0.0, 1.0], [1.0, 0.0]]);
+    }
+
+    #[test]
+    fn a_transform_swaps_and_offsets_the_coordinates() {
+        let transform = TexTransform {
+            matrix: [[0.0, 1.0], [1.0, 0.0]],
+            translate: [0.5, 0.0],
+        };
+        let vertices = [Vertex3D {
+            pos: [0.0; 3],
+            uv: [0.25, 0.5],
+            color: [255, 255, 255, 255],
+            normal: [0.0, 0.0, 1.0],
+        }];
+        let moved = transform_texcoords(&vertices, &transform);
+        assert!((moved[0].uv[0] - 1.0).abs() < 1e-6, "{}", moved[0].uv[0]);
+        assert!((moved[0].uv[1] - 0.25).abs() < 1e-6, "{}", moved[0].uv[1]);
     }
 
     #[test]
@@ -2212,6 +2281,7 @@ mod tests {
             env: false,
             rgb: None,
             alpha: None,
+            transform: None,
             lit: true,
         };
         assert_eq!(stage.tc_mods(2.5), [0.0, 0.0, 0.0, 2.5, 0.0, 1.0, 0.0, 0.0]);
@@ -2236,6 +2306,7 @@ mod tests {
             env: false,
             rgb: None,
             alpha: None,
+            transform: None,
             lit: true,
         };
         let tc = stage.tc_mods(1.0);

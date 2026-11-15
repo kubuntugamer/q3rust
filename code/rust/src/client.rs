@@ -1843,6 +1843,15 @@ impl Client {
                 } else {
                     vertices
                 };
+                // `tcMod transform` rewrites the coordinates for this stage.
+                let transformed;
+                let stage_vertices = match stage.transform.as_ref() {
+                    Some(transform) => {
+                        transformed = world::transform_texcoords(stage_vertices, transform);
+                        transformed.as_slice()
+                    }
+                    None => stage_vertices,
+                };
                 // The stage's deformation is animated here, since only the
                 // clock changes between frames.
                 self.renderer.vk.draw_stage(
