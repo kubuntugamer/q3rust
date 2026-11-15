@@ -1811,7 +1811,17 @@ impl Client {
         // Scrolling, turbulence, rotation and stretch all need the clock.
         let seconds = self.millis() as f32 / 1000.0;
         for batch in &world.batches {
-            let vertices = &world.vertices[batch.first..batch.first + batch.count];
+            let source = &world.vertices[batch.first..batch.first + batch.count];
+            // A wave deformation moves the whole batch along its normals, so
+            // it is computed once and shared by every stage.
+            let moved;
+            let vertices = match batch.deform.as_ref() {
+                Some(deform) => {
+                    moved = world::deform_wave(source, deform, seconds);
+                    moved.as_slice()
+                }
+                None => source,
+            };
             for stage in &batch.stages {
                 let (_, texture) = &world.textures()[stage.texture_index(seconds)];
                 let uv = [
