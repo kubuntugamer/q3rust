@@ -81,6 +81,17 @@ pub struct Vulkan {
     /// The render device's colour target in offload mode.
     color_image: vk::Image,
     color_memory: vk::DeviceMemory,
+    /// The target is a DMA-BUF the presenting device imports, rather than an
+    /// image copied through host memory.
+    zero_copy: bool,
+    /// The linear image the finished frame is copied into for export.
+    export_image: vk::Image,
+    export_memory: vk::DeviceMemory,
+    export_ready: bool,
+    /// The exported DMA-BUF handle, owned until the target is rebuilt.
+    dmabuf_fd: i32,
+    /// Both devices offer the external-memory extensions.
+    external_memory: bool,
     readback_buffer: vk::Buffer,
     readback_memory: vk::DeviceMemory,
     readback_mapped: *mut u8,
@@ -267,8 +278,24 @@ impl Vulkan {
             let queue_info = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family)
                 .queue_priorities(&priorities)];
+            let external_memory = presenter.is_some()
+                && device_supports(
+                    &instance,
+                    physical_device,
+                    ash::khr::external_memory_fd::NAME,
+                )
+                && device_supports(
+                    &instance,
+                    physical_device,
+                    ash::ext::external_memory_dma_buf::NAME,
+                );
             let device_extensions: Vec<*const std::ffi::c_char> = if presenter.is_none() {
                 vec![ash::khr::swapchain::NAME.as_ptr()]
+            } else if external_memory {
+                vec![
+                    ash::khr::external_memory_fd::NAME.as_ptr(),
+                    ash::ext::external_memory_dma_buf::NAME.as_ptr(),
+                ]
             } else {
                 Vec::new()
             };
@@ -339,6 +366,12 @@ impl Vulkan {
                 presenter,
                 color_image: vk::Image::null(),
                 color_memory: vk::DeviceMemory::null(),
+                zero_copy: false,
+                export_image: vk::Image::null(),
+                export_memory: vk::DeviceMemory::null(),
+                export_ready: false,
+                dmabuf_fd: -1,
+                external_memory,
                 readback_buffer: vk::Buffer::null(),
                 readback_memory: vk::DeviceMemory::null(),
                 readback_mapped: std::ptr::null_mut(),
@@ -489,7 +522,100 @@ impl Vulkan {
             let command_buffer = self.command_buffers[image_index as usize];
             self.device.cmd_end_render_pass(command_buffer);
 
-            if self.presenter.is_some() {
+            if self.zero_copy {
+                let range = vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(1);
+                let (src_stage, src_access) = if self.export_ready {
+                    (
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::AccessFlags::TRANSFER_READ,
+                    )
+                } else {
+                    (
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::AccessFlags::NONE,
+                    )
+                };
+                let to_export = vk::ImageMemoryBarrier::default()
+                    .old_layout(if self.export_ready {
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                    } else {
+                        vk::ImageLayout::UNDEFINED
+                    })
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(self.export_image)
+                    .subresource_range(range)
+                    .src_access_mask(src_access)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+                self.device.cmd_pipeline_barrier(
+                    command_buffer,
+                    src_stage,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_export],
+                );
+
+                let copy = vk::ImageCopy::default()
+                    .src_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(0)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .dst_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(0)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .src_offset(vk::Offset3D::default())
+                    .dst_offset(vk::Offset3D::default())
+                    .extent(vk::Extent3D {
+                        width: self.extent.width,
+                        height: self.extent.height,
+                        depth: 1,
+                    });
+                self.device.cmd_copy_image(
+                    command_buffer,
+                    self.color_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    self.export_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[copy],
+                );
+
+                let to_present = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(self.export_image)
+                    .subresource_range(range)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                self.device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_present],
+                );
+                self.export_ready = true;
+            }
+
+            if self.presenter.is_some() && !self.zero_copy {
                 // The render pass leaves the image in TRANSFER_SRC_OPTIMAL, so
                 // the copy needs no barrier of its own.
                 let region = vk::BufferImageCopy::default()
@@ -531,9 +657,16 @@ impl Vulkan {
                 self.device
                     .wait_for_fences(&[self.in_flight], true, u64::MAX)
                     .map_err(|e| format!("waiting for the offload frame: {e}"))?;
-                let pixels = std::slice::from_raw_parts(self.readback_mapped, self.readback_size);
                 if let Some(presenter) = self.presenter.as_mut() {
-                    presenter.present(pixels)?;
+                    if self.zero_copy {
+                        presenter.present_dmabuf(self.format, self.extent)?;
+                    } else {
+                        let pixels = std::slice::from_raw_parts(
+                            self.readback_mapped,
+                            self.readback_size,
+                        );
+                        presenter.present(pixels)?;
+                    }
                 }
                 return Ok(());
             }
@@ -627,9 +760,31 @@ impl Vulkan {
         }
     }
 
-    /// The offload render device's colour target: one image the render pass
-    /// draws into and the frame is copied out of.
+    /// The offload render device's colour target, and the DMA-BUF export of
+    /// it when the presenting device can import one.
     fn create_color_target(&mut self) -> Result<(), String> {
+        self.create_plain_target()?;
+        if self.external_memory
+            && self.presenter.is_some()
+            && self.format == vk::Format::B8G8R8A8_SRGB
+        {
+            match self.create_export_target() {
+                Ok(()) => {
+                    self.zero_copy = true;
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("zero-copy offload unavailable: {e}");
+                    self.destroy_export_target();
+                }
+            }
+        }
+        self.zero_copy = false;
+        self.create_readback()
+    }
+
+    /// The render target: an optimal image the render pass draws into.
+    fn create_plain_target(&mut self) -> Result<(), String> {
         unsafe {
             let image_info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
@@ -692,8 +847,128 @@ impl Vulkan {
             self.color_memory = memory;
             self.images = vec![image];
             self.image_views = vec![view];
+            Ok(())
         }
-        self.create_readback()
+    }
+
+    /// The export half of the zero-copy path: a linear image the finished frame
+    /// is copied into, exported as a DMA-BUF and imported by the presenter.
+    /// Rendering directly into a linear image is not portable, so the format
+    /// and usage here are transfer-only.
+    fn create_export_target(&mut self) -> Result<(), String> {
+        unsafe {
+            let mut external = vk::ExternalMemoryImageCreateInfo::default()
+                .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+            let image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(self.format)
+                .extent(vk::Extent3D {
+                    width: self.extent.width.max(1),
+                    height: self.extent.height.max(1),
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::LINEAR)
+                .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .push_next(&mut external);
+            let image = self
+                .device
+                .create_image(&image_info, None)
+                .map_err(|e| format!("creating the exported colour image: {e}"))?;
+            let requirements = self.device.get_image_memory_requirements(image);
+            // The presenting device may be an integrated GPU or even a CPU
+            // rasteriser, so the export must live in memory both can address.
+            let memory_type = self
+                .find_memory_type(
+                    requirements.memory_type_bits,
+                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                )
+                .or_else(|_| {
+                    self.find_memory_type(
+                        requirements.memory_type_bits,
+                        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    )
+                })?;
+            let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+            let mut export = vk::ExportMemoryAllocateInfo::default()
+                .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_type)
+                .push_next(&mut export)
+                .push_next(&mut dedicated);
+            let memory = match self.device.allocate_memory(&alloc, None) {
+                Ok(memory) => memory,
+                Err(e) => {
+                    self.device.destroy_image(image, None);
+                    return Err(format!("allocating the exported colour image: {e}"));
+                }
+            };
+            if let Err(e) = self.device.bind_image_memory(image, memory, 0) {
+                self.device.destroy_image(image, None);
+                self.device.free_memory(memory, None);
+                return Err(format!("binding the exported colour image: {e}"));
+            }
+
+            let fd_api = ash::khr::external_memory_fd::Device::new(&self.instance, &self.device);
+            let fd = match fd_api.get_memory_fd(
+                &vk::MemoryGetFdInfoKHR::default()
+                    .memory(memory)
+                    .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
+            ) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    self.device.destroy_image(image, None);
+                    self.device.free_memory(memory, None);
+                    return Err(format!("exporting the colour image: {e}"));
+                }
+            };
+
+            let imported = match self.presenter.as_mut() {
+                Some(presenter) => presenter.attach_dmabuf(fd, self.format, self.extent),
+                None => Err("no presenting device".to_string()),
+            };
+            if let Err(e) = imported {
+                libc::close(fd);
+                self.device.destroy_image(image, None);
+                self.device.free_memory(memory, None);
+                return Err(e);
+            }
+
+            self.export_image = image;
+            self.export_memory = memory;
+            self.export_ready = false;
+            self.dmabuf_fd = fd;
+            Ok(())
+        }
+    }
+
+    /// Releases the export image and drops the presenter's import of it.
+    fn destroy_export_target(&mut self) {
+        unsafe {
+            self.export_ready = false;
+            // Close our handle first: the import owns its own reference, and
+            // the presenting driver may have closed a descriptor it was given.
+            if self.dmabuf_fd >= 0 {
+                libc::close(self.dmabuf_fd);
+                self.dmabuf_fd = -1;
+            }
+            if let Some(presenter) = self.presenter.as_mut() {
+                presenter.detach_dmabuf();
+            }
+            if self.export_image != vk::Image::null() {
+                self.device.destroy_image(self.export_image, None);
+                self.export_image = vk::Image::null();
+            }
+            if self.export_memory != vk::DeviceMemory::null() {
+                self.device.free_memory(self.export_memory, None);
+                self.export_memory = vk::DeviceMemory::null();
+            }
+        }
     }
 
     /// A host-visible buffer the offload frame is copied into before it is
@@ -749,6 +1024,8 @@ impl Vulkan {
     /// Releases the offscreen colour image and the readback buffer.
     fn destroy_color_target(&mut self) {
         unsafe {
+            self.zero_copy = false;
+            self.destroy_export_target();
             if !self.readback_mapped.is_null() {
                 self.device.unmap_memory(self.readback_memory);
                 self.readback_mapped = std::ptr::null_mut();
@@ -2347,6 +2624,14 @@ struct Presenter {
     staging_memory: vk::DeviceMemory,
     staging_mapped: *mut u8,
     staging_size: usize,
+    /// The render device's colour target, imported over a DMA-BUF.
+    dmabuf_image: vk::Image,
+    dmabuf_memory: vk::DeviceMemory,
+    dmabuf_format: vk::Format,
+    dmabuf_extent: vk::Extent2D,
+    /// The imported image has been transitioned to TRANSFER_SRC_OPTIMAL once.
+    dmabuf_ready: bool,
+    dmabuf_loader: Option<ash::khr::external_memory_fd::Device>,
     device_name: String,
     surface_loader: ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
@@ -2369,16 +2654,34 @@ impl Presenter {
             let queue_info = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family)
                 .queue_priorities(&priorities)];
-            let extensions = [ash::khr::swapchain::NAME.as_ptr()];
+            let external_memory = device_supports(
+                instance,
+                physical_device,
+                ash::khr::external_memory_fd::NAME,
+            ) && device_supports(
+                instance,
+                physical_device,
+                ash::ext::external_memory_dma_buf::NAME,
+            );
+            let mut extension_names = vec![ash::khr::swapchain::NAME.as_ptr()];
+            if external_memory {
+                extension_names.push(ash::khr::external_memory_fd::NAME.as_ptr());
+                extension_names.push(ash::ext::external_memory_dma_buf::NAME.as_ptr());
+            }
             let device_info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_info)
-                .enabled_extension_names(&extensions);
+                .enabled_extension_names(&extension_names);
             let device = instance
                 .create_device(physical_device, &device_info, None)
                 .map_err(|e| format!("creating the presenting device: {e}"))?;
             let queue = device.get_device_queue(queue_family, 0);
             let swapchain_loader = ash::khr::swapchain::Device::new(instance, &device);
 
+            let dmabuf_loader = if external_memory {
+                Some(ash::khr::external_memory_fd::Device::new(instance, &device))
+            } else {
+                None
+            };
             let properties = instance.get_physical_device_properties(physical_device);
             let memory = instance.get_physical_device_memory_properties(physical_device);
             let host_memory_type = memory
@@ -2409,6 +2712,12 @@ impl Presenter {
                 staging_memory: vk::DeviceMemory::null(),
                 staging_mapped: std::ptr::null_mut(),
                 staging_size: 0,
+                dmabuf_image: vk::Image::null(),
+                dmabuf_memory: vk::DeviceMemory::null(),
+                dmabuf_format: vk::Format::UNDEFINED,
+                dmabuf_extent: vk::Extent2D::default(),
+                dmabuf_ready: false,
+                dmabuf_loader,
                 device_name: CStr::from_ptr(properties.device_name.as_ptr())
                     .to_string_lossy()
                     .into_owned(),
@@ -2607,6 +2916,311 @@ impl Presenter {
         }
     }
 
+    /// Imports the render device's DMA-BUF as a linear image this device can
+    /// copy into its swapchain. Replaces any earlier import.
+    fn attach_dmabuf(
+        &mut self,
+        fd: i32,
+        format: vk::Format,
+        extent: vk::Extent2D,
+    ) -> Result<(), String> {
+        unsafe {
+            if self.dmabuf_loader.is_none() {
+                return Err("the presenting device has no external-memory support".into());
+            }
+            self.detach_dmabuf();
+            let loader = self
+                .dmabuf_loader
+                .as_ref()
+                .expect("checked external-memory support");
+
+            let mut properties = vk::MemoryFdPropertiesKHR::default();
+            loader
+                .get_memory_fd_properties(
+                    vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                    fd,
+                    &mut properties,
+                )
+                .map_err(|e| format!("querying the DMA-BUF memory: {e}"))?;
+
+            let mut external = vk::ExternalMemoryImageCreateInfo::default()
+                .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+            let info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(vk::Extent3D {
+                    width: extent.width.max(1),
+                    height: extent.height.max(1),
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::LINEAR)
+                .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .push_next(&mut external);
+            let image = self
+                .device
+                .create_image(&info, None)
+                .map_err(|e| format!("creating the imported colour image: {e}"))?;
+            let requirements = self.device.get_image_memory_requirements(image);
+            let Some(index) = (0..32).find(|index| {
+                requirements.memory_type_bits & properties.memory_type_bits & (1 << index) != 0
+            }) else {
+                self.device.destroy_image(image, None);
+                return Err("the import has no compatible memory type".into());
+            };
+            let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(image);
+            let mut import = vk::ImportMemoryFdInfoKHR::default()
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+                .fd(fd);
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(index)
+                .push_next(&mut import)
+                .push_next(&mut dedicated);
+            let memory = match self.device.allocate_memory(&alloc, None) {
+                Ok(memory) => memory,
+                Err(e) => {
+                    self.device.destroy_image(image, None);
+                    return Err(format!("importing the DMA-BUF: {e}"));
+                }
+            };
+            if let Err(e) = self.device.bind_image_memory(image, memory, 0) {
+                self.device.destroy_image(image, None);
+                self.device.free_memory(memory, None);
+                return Err(format!("binding the imported colour image: {e}"));
+            }
+
+            self.dmabuf_image = image;
+            self.dmabuf_memory = memory;
+            self.dmabuf_format = format;
+            self.dmabuf_extent = extent;
+            self.dmabuf_ready = false;
+            Ok(())
+        }
+    }
+
+    /// Releases the imported colour image. The caller must not present with it
+    /// afterwards; the next attach replaces it.
+    fn detach_dmabuf(&mut self) {
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            if self.dmabuf_image != vk::Image::null() {
+                self.device.destroy_image(self.dmabuf_image, None);
+                self.dmabuf_image = vk::Image::null();
+            }
+            if self.dmabuf_memory != vk::DeviceMemory::null() {
+                self.device.free_memory(self.dmabuf_memory, None);
+                self.dmabuf_memory = vk::DeviceMemory::null();
+            }
+            self.dmabuf_ready = false;
+        }
+    }
+
+    /// Copies the imported render target into the swapchain and presents it.
+    /// The imported image is not written on this device, so it is left in
+    /// TRANSFER_SRC_OPTIMAL for the next frame.
+    fn present_dmabuf(
+        &mut self,
+        format: vk::Format,
+        extent: vk::Extent2D,
+    ) -> Result<(), String> {
+        unsafe {
+            if self.dmabuf_image == vk::Image::null() {
+                return Err("the presenting device has no imported frame".into());
+            }
+            if format != self.dmabuf_format || extent != self.dmabuf_extent {
+                return Err(format!(
+                    "the imported frame is {}x{}, not {}x{}",
+                    self.dmabuf_extent.width,
+                    self.dmabuf_extent.height,
+                    extent.width,
+                    extent.height
+                ));
+            }
+            self.device
+                .wait_for_fences(&[self.in_flight], true, u64::MAX)
+                .map_err(|e| format!("waiting for the presenting fence: {e}"))?;
+            let (image_index, _suboptimal) = match self.swapchain_loader.acquire_next_image(
+                self.swapchain,
+                u64::MAX,
+                self.image_available,
+                vk::Fence::null(),
+            ) {
+                Ok(value) => value,
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    self.recreate(self.extent.width, self.extent.height)?;
+                    return Ok(());
+                }
+                Err(e) => return Err(format!("acquiring a presenting image: {e}")),
+            };
+
+            self.device
+                .reset_fences(&[self.in_flight])
+                .map_err(|e| format!("resetting the presenting fence: {e}"))?;
+            self.device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| format!("resetting the presenting command buffer: {e}"))?;
+            self.device
+                .begin_command_buffer(
+                    self.command_buffer,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(|e| format!("beginning the presenting command buffer: {e}"))?;
+
+            let range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1);
+
+            let (from, from_stage, from_access) = if self.dmabuf_ready {
+                (
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::AccessFlags::TRANSFER_READ,
+                )
+            } else {
+                (
+                    vk::ImageLayout::UNDEFINED,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::AccessFlags::NONE,
+                )
+            };
+            let imported = vk::ImageMemoryBarrier::default()
+                .old_layout(from)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(self.dmabuf_image)
+                .subresource_range(range)
+                .src_access_mask(from_access)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            self.device.cmd_pipeline_barrier(
+                self.command_buffer,
+                from_stage,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[imported],
+            );
+
+            let image = self.images[image_index as usize];
+            let to_transfer = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(range)
+                .src_access_mask(vk::AccessFlags::NONE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            self.device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_transfer],
+            );
+
+            let copy = vk::ImageCopy::default()
+                .src_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .dst_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .src_offset(vk::Offset3D::default())
+                .dst_offset(vk::Offset3D::default())
+                .extent(vk::Extent3D {
+                    width: self.extent.width,
+                    height: self.extent.height,
+                    depth: 1,
+                });
+            self.device.cmd_copy_image(
+                self.command_buffer,
+                self.dmabuf_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[copy],
+            );
+
+            let to_present = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(range)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::NONE);
+            self.device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present],
+            );
+            self.device
+                .end_command_buffer(self.command_buffer)
+                .map_err(|e| format!("ending the presenting command buffer: {e}"))?;
+
+            let wait = [self.image_available];
+            let stages = [vk::PipelineStageFlags::TRANSFER];
+            let signal = [self.render_finished[image_index as usize]];
+            let command_buffers = [self.command_buffer];
+            let submit = vk::SubmitInfo::default()
+                .wait_semaphores(&wait)
+                .wait_dst_stage_mask(&stages)
+                .command_buffers(&command_buffers)
+                .signal_semaphores(&signal);
+            self.device
+                .queue_submit(self.queue, &[submit], self.in_flight)
+                .map_err(|e| format!("submitting the presenting frame: {e}"))?;
+
+            let swapchains = [self.swapchain];
+            let image_indices = [image_index];
+            let present = vk::PresentInfoKHR::default()
+                .wait_semaphores(&signal)
+                .swapchains(&swapchains)
+                .image_indices(&image_indices);
+            match self.swapchain_loader.queue_present(self.queue, &present) {
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    self.recreate(self.extent.width, self.extent.height)?;
+                }
+                Err(e) => return Err(format!("presenting the offload frame: {e}")),
+                Ok(_) => {}
+            }
+            self.dmabuf_ready = true;
+
+            // The render device will draw the next frame into the same image,
+            // so the copy must finish before this returns.
+            self.device
+                .wait_for_fences(&[self.in_flight], true, u64::MAX)
+                .map_err(|e| format!("waiting for the presenting copy: {e}"))?;
+            Ok(())
+        }
+    }
+
     fn present(&mut self, pixels: &[u8]) -> Result<(), String> {
         unsafe {
             self.device
@@ -2759,6 +3373,12 @@ impl Drop for Presenter {
             if !self.staging_mapped.is_null() {
                 self.device.unmap_memory(self.staging_memory);
             }
+            if self.dmabuf_image != vk::Image::null() {
+                self.device.destroy_image(self.dmabuf_image, None);
+            }
+            if self.dmabuf_memory != vk::DeviceMemory::null() {
+                self.device.free_memory(self.dmabuf_memory, None);
+            }
             if self.staging_buffer != vk::Buffer::null() {
                 self.device.destroy_buffer(self.staging_buffer, None);
             }
@@ -2783,6 +3403,22 @@ impl Drop for Presenter {
             self.device.destroy_device(None);
         }
     }
+}
+
+/// Whether a physical device advertises a device extension.
+unsafe fn device_supports(
+    instance: &Instance,
+    physical_device: vk::PhysicalDevice,
+    name: &CStr,
+) -> bool {
+    instance
+        .enumerate_device_extension_properties(physical_device)
+        .map(|extensions| {
+            extensions
+                .iter()
+                .any(|extension| CStr::from_ptr(extension.extension_name.as_ptr()) == name)
+        })
+        .unwrap_or(false)
 }
 
 /// `VkSurfaceCapabilitiesKHR`'s format, extent and present mode choice, shared
