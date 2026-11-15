@@ -1739,48 +1739,6 @@ impl Client {
         Ok(true)
     }
 
-    /// Fits a held weapon's mesh into a box low on the right of the screen.
-    ///
-    /// The longest axis of the model runs across the screen and the next
-    /// longest up it, so a mesh of any units and any orientation fills the same
-    /// box. Depth is flat and at the near end, so the weapon draws over the
-    /// map. The box is this client's own choice: the cgame that holds the real
-    /// view-model offsets is not in this tree.
-    fn view_model_matrix(model: &world::ViewModel, kick: f32) -> [f32; 16] {
-        let size = [
-            model.maxs[0] - model.mins[0],
-            model.maxs[1] - model.mins[1],
-            model.maxs[2] - model.mins[2],
-        ];
-        let centre = [
-            (model.mins[0] + model.maxs[0]) * 0.5,
-            (model.mins[1] + model.maxs[1]) * 0.5,
-            (model.mins[2] + model.maxs[2]) * 0.5,
-        ];
-
-        let mut axes = [0usize, 1, 2];
-        axes.sort_by(|a, b| {
-            size[*b]
-                .partial_cmp(&size[*a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let (across, up) = (axes[0], axes[1]);
-        let across_scale = 0.70 / size[across].max(0.01);
-        let up_scale = 0.70 / size[up].max(0.01);
-
-        // Column-major, mapping model axes to screen x (0.17..0.87) and y
-        // (0.23..0.93). Vulkan's clip space has y pointing down, so the low
-        // box on screen is the positive y half.
-        let mut fitted = [0.0f32; 16];
-        fitted[across * 4] = across_scale;
-        fitted[up * 4 + 1] = up_scale;
-        fitted[12] = 0.52 - across_scale * centre[across];
-        fitted[13] = 0.58 - up_scale * centre[up] + kick;
-        fitted[14] = 0.0;
-        fitted[15] = 1.0;
-        fitted
-    }
-
     /// Draws the map under the console, through the depth-tested world
     /// pipeline. The camera sits at the predicted origin at eye height.
     fn draw_world(&mut self) -> Result<(), String> {
@@ -2082,32 +2040,49 @@ impl Client {
             }
         }
 
-        // The weapon in hand. There are no view models in this installation, so
-        // the third-person mesh is fitted to a box low on the right instead.
+        // The weapon in hand: the first-person arms at the eye and the gun
+        // hanging from their `tag_weapon`, as the cgame draws them.
         if let Some(model) = world
             .view_models
             .iter()
             .find(|model| model.weapon == prediction.weapon())
         {
-            // The weapon dips for a moment after each shot. Positive y is down
-            // in clip space, so the dip is a positive offset.
-            let kick = if self.millis() < self.kick_until {
-                0.05
-            } else {
-                0.0
-            };
-            let fitted = Self::view_model_matrix(model, kick);
-            for surface in &model.surfaces {
-                let (_, texture) = &world.textures()[surface.texture];
-                self.renderer.vk.draw_stage(
-                    texture,
-                    &surface.vertices,
-                    &fitted,
-                    [1.0, 1.0, 0.0, 0.0],
-                    NO_TC_MODS,
-                    BlendMode::Opaque,
-                    surface.lit,
-                )?;
+            let projection = world::projection(aspect, fov);
+            let (mut hands, mut weapon) = world::view_model_mvp(&projection, model.tag.as_ref());
+            let mut barrel = world::on_tag(&weapon, model.barrel_tag.as_ref());
+            // The eye sits inside the gun's own bounds, so the rig is pushed
+            // forward until the body clears the near plane, the job the
+            // cgame's `cg_gun` offsets do.
+            let gun_offset = [20.0, -4.0, 0.0];
+            hands = world::offset_model(&hands, gun_offset);
+            weapon = world::offset_model(&weapon, gun_offset);
+            barrel = world::offset_model(&barrel, gun_offset);
+            // The weapon dips for a moment after each shot.
+            if self.millis() < self.kick_until {
+                hands = world::lower_view(&hands, 2.5);
+                weapon = world::lower_view(&weapon, 2.5);
+                barrel = world::lower_view(&barrel, 2.5);
+            }
+            // The map has already written depth; clearing it here keeps the
+            // gun out of the walls it is held against.
+            self.renderer.vk.clear_depth();
+            for (matrix, surfaces) in [
+                (&hands, &model.hand),
+                (&weapon, &model.surfaces),
+                (&barrel, &model.barrel),
+            ] {
+                for surface in surfaces {
+                    let (_, texture) = &world.textures()[surface.texture];
+                    self.renderer.vk.draw_stage(
+                        texture,
+                        &surface.vertices,
+                        matrix,
+                        [1.0, 1.0, 0.0, 0.0],
+                        NO_TC_MODS,
+                        BlendMode::Opaque,
+                        surface.lit,
+                    )?;
+                }
             }
         }
         Ok(())
@@ -2966,44 +2941,6 @@ impl Client {
         }
         renderer.shutdown();
         QUIT_REQUESTED.store(false, Ordering::SeqCst);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Where a model-space point lands on the screen through a fitted matrix.
-    fn on_screen(m: &[f32; 16], p: [f32; 3]) -> [f32; 3] {
-        [
-            m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12],
-            m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13],
-            m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14],
-        ]
-    }
-
-    #[test]
-    fn a_held_weapon_fits_the_screen_box() {
-        // A mesh long on x, as the weapon models are: the long axis runs across
-        // the screen and the next longest up it.
-        let model = world::ViewModel {
-            weapon: 2,
-            surfaces: Vec::new(),
-            mins: [-40.0, -10.0, -5.0],
-            maxs: [40.0, 10.0, 5.0],
-        };
-        let fitted = Client::view_model_matrix(&model, 0.0);
-        let near_left = on_screen(&fitted, [-40.0, -10.0, 0.0]);
-        let far_right = on_screen(&fitted, [40.0, 10.0, 0.0]);
-        assert!((near_left[0] - 0.17).abs() < 1e-3, "{near_left:?}");
-        assert!((far_right[0] - 0.87).abs() < 1e-3, "{far_right:?}");
-        // Positive y is down in clip space, so the low box on screen is
-        // 0.23..0.93.
-        assert!((near_left[1] - 0.23).abs() < 1e-3, "{near_left:?}");
-        assert!((far_right[1] - 0.93).abs() < 1e-3, "{far_right:?}");
-        // Flat, and at the near end, so the map never hides it.
-        assert_eq!(near_left[2], 0.0);
-        assert_eq!(far_right[2], 0.0);
     }
 }
 

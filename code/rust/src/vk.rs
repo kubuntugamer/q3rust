@@ -1789,6 +1789,58 @@ impl Vulkan {
         self.draw_world_with(kind, texture, vertices, mvp, uv, tc, lit)
     }
 
+    /// Clears the frame's depth buffer, so the first-person weapon is never
+    /// cut by the map. This is what `RF_DEPTHHACK` buys the C renderer; the
+    /// weapon still depth-sorts against itself.
+    pub fn clear_depth(&mut self) {
+        let Some(image_index) = self.current_image else {
+            return;
+        };
+        let command_buffer = self.command_buffers[image_index as usize];
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+            .base_mip_level(0)
+            .level_count(1)
+            .base_array_layer(0)
+            .layer_count(1);
+        let barrier = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+            .image(self.depth_image)
+            .subresource_range(range)
+            .src_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE);
+        let attachment = vk::ClearAttachment::default()
+            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+            .color_attachment(1)
+            .clear_value(vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            });
+        let rect = vk::ClearRect::default()
+            .rect(vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: self.extent,
+            })
+            .base_array_layer(0)
+            .layer_count(1);
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+            self.device
+                .cmd_clear_attachments(command_buffer, &[attachment], &[rect]);
+        }
+    }
+
     /// Sets the eye the environment-mapped stages reflect about. It moves
     /// every frame, so it is set once rather than passed to every draw.
     pub fn set_view_origin(&mut self, origin: [f32; 3]) {

@@ -507,12 +507,26 @@ pub struct ItemModel {
     pub surfaces: Vec<ItemSurface>,
 }
 
-/// A weapon held in view, with its own bounds so the client can fit it to the
-/// screen without knowing each mesh's units.
+/// Where a hand model's `tag_weapon` hangs the gun: a point and a basis in
+/// the hand's model space.
+pub struct TagPlacement {
+    pub origin: [f32; 3],
+    /// Rows of the tag's rotation, as an MD3 stores them.
+    pub axis: [[f32; 3]; 3],
+}
+
+/// A weapon held in view: the first-person hands and the gun they hold.
 pub struct ViewModel {
     /// The weapon number this mesh belongs to.
     pub weapon: i32,
+    /// The hands mesh, drawn at the eye.
+    pub hand: Vec<ItemSurface>,
+    /// The gun's place in the hand, from `tag_weapon`.
+    pub tag: Option<TagPlacement>,
     pub surfaces: Vec<ItemSurface>,
+    /// The spinning barrel, hung from the gun's `tag_barrel`.
+    pub barrel: Vec<ItemSurface>,
+    pub barrel_tag: Option<TagPlacement>,
     pub mins: [f32; 3],
     pub maxs: [f32; 3],
 }
@@ -879,6 +893,21 @@ const WEAPON_MODELS: [(i32, &str); 9] = [
     (crate::bg_pmove::WP_BFG, "models/weapons2/bfg/bfg.md3"),
 ];
 
+/// Reads one tag out of an md3, as the placement a child model hangs from.
+fn tag_placement(assets: &Assets, path: &str, name: &str) -> Option<TagPlacement> {
+    let bytes = assets.read(path)?;
+    let model = Md3Model::load(&bytes).ok()?;
+    let tag = model.tag(0, name)?;
+    Some(TagPlacement {
+        origin: [tag.origin[0], tag.origin[1], tag.origin[2]],
+        axis: [
+            [tag.axis[0][0], tag.axis[0][1], tag.axis[0][2]],
+            [tag.axis[1][0], tag.axis[1][1], tag.axis[1][2]],
+            [tag.axis[2][0], tag.axis[2][1], tag.axis[2][2]],
+        ],
+    })
+}
+
 fn load_view_models(
     vk: &mut Vulkan,
     assets: &Assets,
@@ -890,6 +919,16 @@ fn load_view_models(
         else {
             continue;
         };
+        // The first-person arms ship beside the gun, with the gun hanging
+        // from their `tag_weapon`.
+        let hand_path = path.replace(".md3", "_hand.md3");
+        let hand = load_surfaces(vk, assets, &hand_path, [255, 255, 255, 255], textures)
+            .unwrap_or_default();
+        let barrel_path = path.replace(".md3", "_barrel.md3");
+        let barrel = load_surfaces(vk, assets, &barrel_path, [255, 255, 255, 255], textures)
+            .unwrap_or_default();
+        let barrel_tag = tag_placement(assets, path, "tag_barrel");
+        let tag = tag_placement(assets, &hand_path, "tag_weapon");
         let mut mins = [f32::MAX; 3];
         let mut maxs = [f32::MIN; 3];
         for surface in &surfaces {
@@ -902,7 +941,11 @@ fn load_view_models(
         }
         models.push(ViewModel {
             weapon,
+            hand,
+            tag,
             surfaces,
+            barrel,
+            barrel_tag,
             mins,
             maxs,
         });
@@ -1012,6 +1055,64 @@ pub fn place(mvp: &[f32; 16], origin: [f32; 3], yaw: f32) -> [f32; 16] {
             + mvp[8 + row] * origin[2];
     }
     placed
+}
+
+/// MD3 model space (x forward, y left, z up) taken to the renderer's view
+/// space (x right, y up, z back), which is where the first-person weapon
+/// lives. The view looks down -z, as the projection expects.
+fn model_to_view() -> [f32; 16] {
+    [
+        0.0, 0.0, -1.0, 0.0, // model +x is forward, the view's -z
+        -1.0, 0.0, 0.0, 0.0, // model +y is left, the view's -x
+        0.0, 1.0, 0.0, 0.0, // model +z is up
+        0.0, 0.0, 0.0, 1.0,
+    ]
+}
+
+/// The clip matrices for the weapon in hand: the hands at the eye, and the
+/// gun hanging from their `tag_weapon`. Both are in view space, so they need
+/// only the projection.
+pub fn view_model_mvp(
+    projection: &[f32; 16],
+    tag: Option<&TagPlacement>,
+) -> ([f32; 16], [f32; 16]) {
+    let hands = multiply(projection, &model_to_view());
+    let weapon = on_tag(&hands, tag);
+    (hands, weapon)
+}
+
+/// Places a model on an MD3 tag of its parent: `out = origin + axis[0]*x +
+/// axis[1]*y + axis[2]*z`, the way the renderer composes a tag.
+pub fn on_tag(parent: &[f32; 16], tag: Option<&TagPlacement>) -> [f32; 16] {
+    let Some(tag) = tag else {
+        return *parent;
+    };
+    let placed = [
+        tag.axis[0][0], tag.axis[0][1], tag.axis[0][2], 0.0,
+        tag.axis[1][0], tag.axis[1][1], tag.axis[1][2], 0.0,
+        tag.axis[2][0], tag.axis[2][1], tag.axis[2][2], 0.0,
+        tag.origin[0], tag.origin[1], tag.origin[2], 1.0,
+    ];
+    multiply(parent, &placed)
+}
+
+/// Moves a placed matrix by `offset` in the model's own frame: +x forward,
+/// +y left, +z up. Used to push the gun forward and to dip it after a shot.
+pub fn offset_model(mvp: &[f32; 16], offset: [f32; 3]) -> [f32; 16] {
+    let mut moved = *mvp;
+    for row in 0..4 {
+        moved[12 + row] += mvp[row] * offset[0]
+            + mvp[4 + row] * offset[1]
+            + mvp[8 + row] * offset[2];
+    }
+    moved
+}
+
+/// Drops the weapon by `distance` units, for the dip after a shot. The
+/// offset is in model space, so it stays screen-down whatever the eye is
+/// looking at.
+pub fn lower_view(mvp: &[f32; 16], distance: f32) -> [f32; 16] {
+    offset_model(mvp, [0.0, 0.0, -distance])
 }
 
 /// The camera matrix with a model's world origin folded in, so one static set
@@ -2308,6 +2409,44 @@ mod tests {
             batch_sort(&index, "textures/grate", &stages),
             ShaderSort::SEE_THROUGH.0
         );
+    }
+
+    #[test]
+    fn the_weapon_hangs_from_the_hand_tag() {
+        let projection = projection(4.0 / 3.0, 90.0);
+        let tag = TagPlacement {
+            origin: [10.0, 0.0, 0.0],
+            axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        };
+        let (hands, weapon) = view_model_mvp(&projection, Some(&tag));
+        let clip = |matrix: &[f32; 16], point: [f32; 3]| {
+            let mut out = [0.0f32; 4];
+            for row in 0..4 {
+                out[row] = matrix[row] * point[0]
+                    + matrix[4 + row] * point[1]
+                    + matrix[8 + row] * point[2]
+                    + matrix[12 + row];
+            }
+            out
+        };
+
+        // The hand's forward axis points into the screen and lands dead
+        // centre; its up axis goes up the screen (clip y is negative).
+        let forward = clip(&hands, [20.0, 0.0, 0.0]);
+        assert!(forward[3] > 0.0, "{forward:?}");
+        assert!(forward[0].abs() < 1e-5, "{forward:?}");
+        assert!(forward[1].abs() < 1e-5, "{forward:?}");
+        let up = clip(&hands, [20.0, 0.0, 5.0]);
+        assert!(up[1] < 0.0, "{up:?}");
+
+        // The gun's own origin sits at the tag, so both land on the same
+        // pixel while the gun's forward is ten units deeper.
+        let at_tag = clip(&weapon, [0.0, 0.0, 0.0]);
+        let on_hand = clip(&hands, [10.0, 0.0, 0.0]);
+        for axis in 0..4 {
+            assert!((at_tag[axis] - on_hand[axis]).abs() < 1e-4, "{at_tag:?}");
+        }
+        assert!((clip(&weapon, [10.0, 0.0, 0.0])[3] - 20.0).abs() < 1e-4);
     }
 
     #[test]
