@@ -20,7 +20,7 @@ use crate::bsp::{Bsp, BspFace, DrawVert, LIGHTMAP_SIZE, SURFACE_PATCH};
 use crate::items::{self, ItemMark};
 use crate::model::Md3Model;
 use crate::shader::{
-    Parser, ShaderScript, ShaderStage, ShaderTextIndex, TexMod, TextureMap, WaveForm,
+    GenFunc, Parser, ShaderScript, ShaderStage, ShaderTextIndex, TexMod, TextureMap, WaveForm,
     CONTENTS_FOG, GLS_DSTBLEND_ONE, GLS_SRCBLEND_ONE,
 };
 use crate::texture;
@@ -221,7 +221,39 @@ pub struct Stage {
     pub uv: [f32; 4],
     /// The stage's `tcMod turb`, applied in the vertex shader each frame.
     pub turb: Option<WaveForm>,
+    /// The stage's `tcMod rotate` speeds added together, in degrees per
+    /// second and clockwise positive.
+    pub rotate: Option<f32>,
+    /// The stage's `tcMod stretch`, which divides the texture coordinates by
+    /// the wave's value each frame.
+    pub stretch: Option<WaveForm>,
     pub lit: bool,
+}
+
+impl Stage {
+    /// The deformation the vertex shader applies this frame:
+    /// `[amplitude, phase, frequency, seconds, cos, sin, stretch, 0]`.
+    pub fn tc_mods(&self, seconds: f32) -> [f32; 8] {
+        let turbs = self
+            .turb
+            .map_or([0.0; 3], |wave| [wave.amplitude, wave.phase, wave.frequency]);
+        let (cos, sin) = self.rotate.map_or((1.0, 0.0), |speed| {
+            let angle = (-speed * seconds).to_radians();
+            (angle.cos(), angle.sin())
+        });
+        let stretch = self.stretch.map_or(1.0, |wave| {
+            let value = wave_value(&wave, seconds);
+            // A wave through zero would turn the coordinates into infinities.
+            if value.abs() < 1e-4 {
+                1.0
+            } else {
+                1.0 / value
+            }
+        });
+        [
+            turbs[0], turbs[1], turbs[2], seconds, cos, sin, stretch, 0.0,
+        ]
+    }
 }
 
 /// One drawable run of triangles sharing a shader, drawn once per stage.
@@ -466,6 +498,8 @@ impl World {
                     blend: spec.blend,
                     uv: spec.uv,
                     turb: spec.turb,
+                    rotate: spec.rotate,
+                    stretch: spec.stretch,
                     lit: spec.lit,
                 });
             }
@@ -942,6 +976,32 @@ fn sky_outerbox(index: &ShaderTextIndex, shader_name: &str) -> Option<[String; 6
     shader_script(index, shader_name)?.sky?.outerbox
 }
 
+/// `EvalWaveForm`: the value a wave has at `seconds`, read from the same
+/// quantised tables `tr.sinTable` and its siblings hold.
+pub fn wave_value(wave: &WaveForm, seconds: f32) -> f32 {
+    /// `FUNCTABLE_SIZE`; the mask is one less.
+    const SIZE: i32 = 1024;
+    let angle = wave.phase + seconds * wave.frequency;
+    // `myftol` truncates toward zero, then the table index wraps.
+    let index = (angle * SIZE as f32) as i32 & (SIZE - 1);
+    let turn = std::f32::consts::TAU * index as f32 / SIZE as f32;
+    let value = match wave.func {
+        GenFunc::Sin => turn.sin(),
+        GenFunc::Square => {
+            if turn.sin() >= 0.0 {
+                1.0
+            } else {
+                -1.0
+            }
+        }
+        GenFunc::Triangle => turn.sin().asin() * (2.0 / std::f32::consts::PI),
+        GenFunc::Sawtooth => index as f32 / SIZE as f32,
+        GenFunc::InverseSawtooth => 1.0 - index as f32 / SIZE as f32,
+        GenFunc::None | GenFunc::Noise => 0.0,
+    };
+    wave.base + value * wave.amplitude
+}
+
 /// `MAX_STAGES`: how many stage passes one batch may draw.
 const MAX_STAGES: usize = 4;
 
@@ -951,6 +1011,8 @@ struct StageSpec {
     blend: BlendMode,
     uv: [f32; 4],
     turb: Option<WaveForm>,
+    rotate: Option<f32>,
+    stretch: Option<WaveForm>,
     lit: bool,
 }
 
@@ -968,6 +1030,8 @@ fn stage_list(index: &ShaderTextIndex, name: &str) -> Vec<StageSpec> {
                 blend: blend_mode(stage.state_bits),
                 uv: stage_transform(&stage.bundle.tex_mods),
                 turb: stage_turbulence(&stage.bundle.tex_mods),
+                rotate: stage_rotation(&stage.bundle.tex_mods),
+                stretch: stage_stretch(&stage.bundle.tex_mods),
                 // Only the first pass carries the surface's lightmap.
                 lit: stages.is_empty(),
             });
@@ -982,6 +1046,8 @@ fn stage_list(index: &ShaderTextIndex, name: &str) -> Vec<StageSpec> {
             blend: BlendMode::Opaque,
             uv: [1.0, 1.0, 0.0, 0.0],
             turb: None,
+            rotate: None,
+            stretch: None,
             lit: true,
         });
     }
@@ -994,6 +1060,27 @@ fn stage_list(index: &ShaderTextIndex, name: &str) -> Vec<StageSpec> {
 fn stage_turbulence(tex_mods: &[TexMod]) -> Option<WaveForm> {
     tex_mods.iter().find_map(|tex_mod| match tex_mod {
         TexMod::Turbulent { wave } => Some(*wave),
+        _ => None,
+    })
+}
+
+/// The `tcMod rotate` speeds on a stage added together, clockwise positive.
+fn stage_rotation(tex_mods: &[TexMod]) -> Option<f32> {
+    let mut speed = 0.0;
+    let mut turned = false;
+    for tex_mod in tex_mods {
+        if let TexMod::Rotate { speed: degrees } = tex_mod {
+            speed += degrees;
+            turned = true;
+        }
+    }
+    turned.then_some(speed)
+}
+
+/// The first `tcMod stretch` on a stage, for the same reason as turbulence.
+fn stage_stretch(tex_mods: &[TexMod]) -> Option<WaveForm> {
+    tex_mods.iter().find_map(|tex_mod| match tex_mod {
+        TexMod::Stretch { wave } => Some(*wave),
         _ => None,
     })
 }
@@ -1022,9 +1109,9 @@ fn blend_mode(state_bits: u32) -> BlendMode {
     }
 }
 
-/// The stage's static texture-coordinate transform: scale and per-second
-/// scroll. Rotation and stretch need the clock per vertex and are not applied
-/// yet; turbulence is, in the vertex shader.
+/// The stage's constant texture-coordinate transform: scale and per-second
+/// scroll. Rotation, stretch and turbulence need the clock per vertex and are
+/// applied in the vertex shader.
 fn stage_transform(tex_mods: &[TexMod]) -> [f32; 4] {
     let mut scale = [1.0f32, 1.0];
     let mut scroll = [0.0f32, 0.0];
@@ -1713,6 +1800,73 @@ mod tests {
         let wave = stages[0].turb.expect("tcMod turb should reach the stage");
         assert!((wave.amplitude - 0.2).abs() < 1e-6, "{}", wave.amplitude);
         assert!((wave.frequency - 9.0).abs() < 1e-6, "{}", wave.frequency);
+    }
+
+    #[test]
+    fn a_rotating_and_stretching_stage_carries_both() {
+        let script = "textures/ring\n{\n {\n  map textures/ring.tga\n  tcMod rotate 90\n  tcMod stretch sin 2 1 0 0\n }\n}\n";
+        let stages = stage_list(&shader_index(&[script.to_string()]), "textures/ring");
+        assert_eq!(stages[0].rotate, Some(90.0));
+        let stretch = stages[0].stretch.expect("tcMod stretch should reach the stage");
+        assert_eq!(stretch.base, 2.0);
+        assert_eq!(stretch.amplitude, 1.0);
+        assert_eq!(stretch.frequency, 0.0);
+    }
+
+    #[test]
+    fn a_wave_follows_its_function_and_amplitude() {
+        let wave = |func| WaveForm {
+            func,
+            base: 1.0,
+            amplitude: 2.0,
+            phase: 0.0,
+            frequency: 1.0,
+        };
+        let close = |value: f32, want: f32| assert!((value - want).abs() < 1e-5, "{value}");
+        close(wave_value(&wave(GenFunc::Sin), 0.25), 3.0);
+        close(wave_value(&wave(GenFunc::Square), 0.25), 3.0);
+        close(wave_value(&wave(GenFunc::Square), 0.75), -1.0);
+        close(wave_value(&wave(GenFunc::Triangle), 0.25), 3.0);
+        close(wave_value(&wave(GenFunc::Sawtooth), 0.5), 2.0);
+        close(wave_value(&wave(GenFunc::InverseSawtooth), 0.25), 2.5);
+    }
+
+    #[test]
+    fn a_stage_without_texmods_deforms_nothing() {
+        let stage = Stage {
+            texture: 0,
+            blend: BlendMode::Opaque,
+            uv: [1.0, 1.0, 0.0, 0.0],
+            turb: None,
+            rotate: None,
+            stretch: None,
+            lit: true,
+        };
+        assert_eq!(stage.tc_mods(2.5), [0.0, 0.0, 0.0, 2.5, 1.0, 0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn rotation_turns_clockwise_and_stretch_inverts_its_wave() {
+        let stage = Stage {
+            texture: 0,
+            blend: BlendMode::Opaque,
+            uv: [1.0, 1.0, 0.0, 0.0],
+            turb: None,
+            rotate: Some(90.0),
+            stretch: Some(WaveForm {
+                func: GenFunc::Sin,
+                base: 2.0,
+                amplitude: 0.0,
+                phase: 0.0,
+                frequency: 0.0,
+            }),
+            lit: true,
+        };
+        let tc = stage.tc_mods(1.0);
+        assert!(tc[4].abs() < 1e-6, "cos {}", tc[4]);
+        assert!((tc[5] + 1.0).abs() < 1e-6, "sin {}", tc[5]);
+        // A stretch of two halves the coordinates rather than doubling them.
+        assert!((tc[6] - 0.5).abs() < 1e-6, "stretch {}", tc[6]);
     }
 
     #[test]

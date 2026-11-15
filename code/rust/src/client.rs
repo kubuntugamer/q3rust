@@ -38,7 +38,7 @@ use crate::items::{self, ItemField};
 use crate::prediction::{Input, Prediction, DODGE_PUSH_FAR, DODGE_PUSH_NEAR};
 use crate::targets::TargetField;
 use crate::texture;
-use crate::vk::{BlendMode, Texture, Vertex2D, Vulkan};
+use crate::vk::{BlendMode, Texture, Vertex2D, Vulkan, NO_TC_MODS};
 use crate::wav;
 use crate::world::{self, Camera, World};
 
@@ -1806,7 +1806,7 @@ impl Client {
             sky.draw(&mut self.renderer.vk, &camera, &mvp)?;
         }
 
-        // A scrolling texmod is the one part of a stage that needs the clock.
+        // Scrolling, turbulence, rotation and stretch all need the clock.
         let seconds = self.millis() as f32 / 1000.0;
         for batch in &world.batches {
             let vertices = &world.vertices[batch.first..batch.first + batch.count];
@@ -1818,17 +1818,14 @@ impl Client {
                     stage.uv[2] * seconds,
                     stage.uv[3] * seconds,
                 ];
-                // The turbulent wave is animated here, since only the clock
-                // changes between frames.
-                let turb = stage.turb.map_or([0.0; 4], |wave| {
-                    [wave.amplitude, wave.phase, wave.frequency, seconds]
-                });
+                // The stage's deformation is animated here, since only the
+                // clock changes between frames.
                 self.renderer.vk.draw_stage(
                     texture,
                     vertices,
                     &mvp,
                     uv,
-                    turb,
+                    stage.tc_mods(seconds),
                     stage.blend,
                     stage.lit,
                 )?;
@@ -1843,7 +1840,7 @@ impl Client {
                 &mark,
                 &mvp,
                 [1.0, 1.0, 0.0, 0.0],
-                [0.0; 4],
+                NO_TC_MODS,
                 BlendMode::Opaque,
                 true,
             )?;
@@ -1867,7 +1864,7 @@ impl Client {
                 &glow,
                 &mvp,
                 [1.0, 1.0, 0.0, 0.0],
-                [0.0; 4],
+                NO_TC_MODS,
                 BlendMode::Add,
                 false,
             )?;
@@ -1883,7 +1880,7 @@ impl Client {
                     &line,
                     &mvp,
                     [1.0, 1.0, 0.0, 0.0],
-                    [0.0; 4],
+                    NO_TC_MODS,
                     BlendMode::Add,
                     false,
                 )?;
@@ -1898,7 +1895,7 @@ impl Client {
                 &shot,
                 &mvp,
                 [1.0, 1.0, 0.0, 0.0],
-                [0.0; 4],
+                NO_TC_MODS,
                 BlendMode::Opaque,
                 true,
             )?;
@@ -1913,7 +1910,7 @@ impl Client {
                     &posts,
                     &mvp,
                     [1.0, 1.0, 0.0, 0.0],
-                    [0.0; 4],
+                    NO_TC_MODS,
                     BlendMode::Opaque,
                     true,
                 )?;
@@ -1937,7 +1934,7 @@ impl Client {
                                 &surface.vertices,
                                 &placed,
                                 [1.0, 1.0, 0.0, 0.0],
-                                [0.0; 4],
+                                NO_TC_MODS,
                                 BlendMode::Opaque,
                                 surface.lit,
                             )?;
@@ -1957,7 +1954,7 @@ impl Client {
                 &flying,
                 &mvp,
                 [1.0, 1.0, 0.0, 0.0],
-                [0.0; 4],
+                NO_TC_MODS,
                 BlendMode::Opaque,
                 true,
             )?;
@@ -1976,7 +1973,7 @@ impl Client {
                         field.vertices(),
                         &mvp,
                         [1.0, 1.0, 0.0, 0.0],
-                        [0.0; 4],
+                        NO_TC_MODS,
                         BlendMode::Opaque,
                         true,
                     )?;
@@ -2010,7 +2007,7 @@ impl Client {
                             &surface.vertices,
                             &placed,
                             [1.0, 1.0, 0.0, 0.0],
-                            [0.0; 4],
+                            NO_TC_MODS,
                             BlendMode::Opaque,
                             surface.lit,
                         )?;
@@ -2040,7 +2037,7 @@ impl Client {
                     &surface.vertices,
                     &fitted,
                     [1.0, 1.0, 0.0, 0.0],
-                    [0.0; 4],
+                    NO_TC_MODS,
                     BlendMode::Opaque,
                     surface.lit,
                 )?;

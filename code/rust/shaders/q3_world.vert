@@ -15,6 +15,8 @@ layout(push_constant) uniform Push {
     vec4 stage_mode;
     // `x` amplitude, `y` phase, `z` frequency, `w` seconds.
     vec4 turbulence;
+    // `x` cosine and `y` sine of the rotation, `z` the stretch scale.
+    vec4 tc_mods;
 } push;
 
 layout(location = 0) out vec2 uv;
@@ -22,6 +24,17 @@ layout(location = 1) out vec4 color;
 
 void main() {
     vec2 st = in_uv * push.uv_transform.xy + push.uv_transform.zw;
+    // `RB_CalcStretchTexCoords` and `RB_CalcRotateTexCoords` both turn the
+    // coordinates about the middle of the texture.
+    if (push.tc_mods.z != 1.0) {
+        st = (st - vec2(0.5)) * push.tc_mods.z + vec2(0.5);
+    }
+    if (push.tc_mods.x != 1.0 || push.tc_mods.y != 0.0) {
+        vec2 centred = st - vec2(0.5);
+        st = vec2(centred.x * push.tc_mods.x - centred.y * push.tc_mods.y,
+                  centred.x * push.tc_mods.y + centred.y * push.tc_mods.x)
+            + vec2(0.5);
+    }
     if (push.turbulence.x != 0.0) {
         // `RB_CalcTurbulentTexCoords`: one turn over the C's sine table,
         // addressed in 1/1024 of a world unit along each axis.
