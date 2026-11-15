@@ -329,24 +329,26 @@ fn audit_player_models(
         }
         audit.models += 1;
 
-        if assets.exists(&format!("{prefix}animation.cfg")) {
+        let config_path = format!("{prefix}animation.cfg");
+        let mut animation: Option<AnimationTable> = None;
+        if assets.exists(&config_path) {
             audit.configs += 1;
-            let path = format!("{prefix}animation.cfg");
             match assets
-                .read(&path)
-                .ok_or_else(|| format!("{path}: unreadable"))
+                .read(&config_path)
+                .ok_or_else(|| format!("{config_path}: unreadable"))
                 .and_then(|bytes| parse_animation_cfg(&String::from_utf8_lossy(&bytes)))
             {
                 Ok(table) => {
                     audit.animation_tables += 1;
-                    audit.animation_rows += table.rows;
-                    for warning in table.warnings {
-                        eprintln!("{path}: {warning}");
+                    audit.animation_rows += table.supplied;
+                    for warning in &table.warnings {
+                        eprintln!("{config_path}: {warning}");
                         audit.animation_warnings += 1;
                     }
+                    animation = Some(table);
                 }
                 Err(e) => {
-                    eprintln!("{path}: {e}");
+                    eprintln!("{config_path}: {e}");
                     audit.animation_broken += 1;
                 }
             }
@@ -363,6 +365,8 @@ fn audit_player_models(
 
         let mut parts = assets.files(&prefix, ".md3");
         parts.sort();
+        let mut lower_frames = None;
+        let mut upper_frames = None;
         for part in parts {
             let Some(bytes) = assets.read(&part) else {
                 eprintln!("{part}: unreadable");
@@ -372,6 +376,11 @@ fn audit_player_models(
             match Md3Model::load(&bytes) {
                 Ok(model) => {
                     audit.parts += 1;
+                    if part == format!("{prefix}lower.md3") {
+                        lower_frames = Some(model.frames.len());
+                    } else if part == format!("{prefix}upper.md3") {
+                        upper_frames = Some(model.frames.len());
+                    }
                     for surface in &model.surfaces {
                         for shader in &surface.shaders {
                             // An empty name asks for the default shader, which
@@ -396,6 +405,16 @@ fn audit_player_models(
                     audit.broken += 1;
                 }
             }
+        }
+
+        if let Some(table) = &animation {
+            check_animation_frames(
+                &config_path,
+                table,
+                lower_frames,
+                upper_frames,
+                &mut audit,
+            );
         }
 
         let mut skins = assets.files(&prefix, ".skin");
@@ -426,12 +445,21 @@ fn audit_player_models(
     audit
 }
 
-/// One parsed animation table. `rows` counts the entries the file actually
-/// supplies; the loader synthesizes the six torso rows from `TORSO_GESTURE`
-/// when the file stops after the legs, as the stock files do.
+/// One animation row after the loader's leg adjustment.
+#[derive(Debug, Clone, Copy, Default)]
+struct AnimationSpan {
+    first_frame: i32,
+    num_frames: u32,
+}
+
+/// A parsed animation table. `rows` has all `MAX_ANIMATIONS` entries the
+/// loader uses, including the six torso rows synthesized from `TORSO_GESTURE`
+/// when the file stops after the legs, as the stock files do; `supplied`
+/// counts only the rows the file itself carried.
 #[derive(Debug, Default)]
 struct AnimationTable {
-    rows: usize,
+    rows: Vec<AnimationSpan>,
+    supplied: usize,
     warnings: Vec<String>,
 }
 
@@ -488,26 +516,109 @@ fn parse_animation_cfg(text: &str) -> Result<AnimationTable, String> {
         }
     }
 
+    const TORSO_GESTURE: usize = 6;
+    const LEGS_WALKCR: usize = 13;
     for animation in 0..MAX_ANIMATIONS {
         if i >= tokens.len() {
             if (TORSO_GETFLAG..=TORSO_NEGATIVE).contains(&animation) {
+                table.rows.push(table.rows[TORSO_GESTURE]);
                 continue;
             }
             return Err(format!(
                 "only {animation} of {MAX_ANIMATIONS} animations before the file ended"
             ));
         }
-        i += 1; // firstFrame
-        for field in ["frame count", "loop frame count", "frame rate"] {
+        let first_frame = atoi(&tokens[i]);
+        i += 1;
+        let mut values = [0i32; 3];
+        for (field, value) in ["frame count", "loop frame count", "frame rate"]
+            .iter()
+            .zip(values.iter_mut())
+        {
             if i >= tokens.len() {
                 return Err(format!("animation {animation} has no {field}"));
             }
+            *value = atoi(&tokens[i]);
             i += 1;
         }
-        table.rows += 1;
+        table.rows.push(AnimationSpan {
+            first_frame,
+            num_frames: values[0].unsigned_abs(),
+        });
+        table.supplied += 1;
+    }
+
+    // `LEGS_WALKCR` and the leg rows after it skip the upper-body-only frames
+    // at the start of the lower model.
+    let skip = table.rows[LEGS_WALKCR].first_frame - table.rows[TORSO_GESTURE].first_frame;
+    for row in &mut table.rows[LEGS_WALKCR..TORSO_GETFLAG] {
+        row.first_frame -= skip;
     }
 
     Ok(table)
+}
+
+/// `atoi`: an optional sign and leading decimal digits, 0 when there are none.
+fn atoi(token: &str) -> i32 {
+    let bytes = token.as_bytes();
+    let mut end = 0;
+    if matches!(bytes.first(), Some(b'+' | b'-')) {
+        end = 1;
+    }
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    token[..end].parse().unwrap_or(0)
+}
+
+/// The last frame the legs and torso animations reach. A `BOTH_*` animation is
+/// played by both parts; the torso rows run from `TORSO_GESTURE` on, the legs
+/// from `LEGS_WALKCR` through `LEGS_TURN`.
+fn animation_frame_extents(table: &AnimationTable) -> (Option<i32>, Option<i32>) {
+    let (mut legs, mut torso): (Option<i32>, Option<i32>) = (None, None);
+    for (animation, row) in table.rows.iter().enumerate() {
+        if row.num_frames == 0 {
+            continue;
+        }
+        let last = row.first_frame + row.num_frames as i32 - 1;
+        let (legs_anim, torso_anim) = match animation {
+            0..=5 => (true, true),
+            6..=12 | 25..=30 => (false, true),
+            13..=24 => (true, false),
+            _ => continue,
+        };
+        if legs_anim {
+            legs = Some(legs.map_or(last, |frame| frame.max(last)));
+        }
+        if torso_anim {
+            torso = Some(torso.map_or(last, |frame| frame.max(last)));
+        }
+    }
+    (legs, torso)
+}
+
+/// `R_AddMD3Surfaces` clamps a frame past the model's frame count to zero, so a
+/// table that reaches too far leaves that animation frozen on its first frame.
+fn check_animation_frames(
+    path: &str,
+    table: &AnimationTable,
+    lower_frames: Option<usize>,
+    upper_frames: Option<usize>,
+    audit: &mut PlayerModelAudit,
+) {
+    let (legs, torso) = animation_frame_extents(table);
+    if let (Some(last), Some(frames)) = (legs, lower_frames) {
+        if last >= frames as i32 {
+            eprintln!("{path}: leg animations reach frame {last} but lower.md3 has {frames}");
+            audit.animation_broken += 1;
+        }
+    }
+    if let (Some(last), Some(frames)) = (torso, upper_frames) {
+        if last >= frames as i32 {
+            eprintln!("{path}: torso animations reach frame {last} but upper.md3 has {frames}");
+            audit.animation_broken += 1;
+        }
+    }
 }
 
 /// `CommaParse`'s pairs from a `.skin` file: surface and shader separated by a
@@ -764,7 +875,8 @@ mod tests {
     #[test]
     fn animation_table_accepts_the_stock_shape() {
         let table = parse_animation_cfg(&animation_table(25)).unwrap();
-        assert_eq!(table.rows, 25);
+        assert_eq!(table.supplied, 25);
+        assert_eq!(table.rows.len(), 31);
         assert!(table.warnings.is_empty());
     }
 
@@ -775,11 +887,32 @@ mod tests {
     }
 
     #[test]
+    fn leg_rows_skip_the_upper_body_frames() {
+        let mut text = String::from("sex m\n");
+        for row in 0..25 {
+            let (first, frames) = match row {
+                6 => (90, 1),
+                13 => (153, 1),
+                15 => (140, 10),
+                _ => (0, 1),
+            };
+            text.push_str(&format!("{first}\t{frames}\t0\t20\n"));
+        }
+        let table = parse_animation_cfg(&text).unwrap();
+        let (legs, torso) = animation_frame_extents(&table);
+        // `LEGS_WALKCR` is 153 and the gesture starts at 90, so row 15's
+        // 140 becomes 77 and its ten frames end at 86, under `LEGS_WALKCR`'s
+        // adjusted 90.
+        assert_eq!(legs, Some(90));
+        assert_eq!(torso, Some(90));
+    }
+
+    #[test]
     fn animation_table_reports_the_c_warnings() {
         let mut text = String::from("footsteps clank\nwibble\nsex f\n");
         text.push_str(&animation_table(25));
         let table = parse_animation_cfg(&text).unwrap();
-        assert_eq!(table.rows, 25);
+        assert_eq!(table.supplied, 25);
         assert_eq!(table.warnings.len(), 2);
         assert!(table.warnings[0].contains("clank"));
         assert!(table.warnings[1].contains("wibble"));
