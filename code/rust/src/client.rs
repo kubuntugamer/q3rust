@@ -12,6 +12,7 @@
 //! when no Wayland compositor answers, but the desktops this targets no longer
 //! ship an X11 session, so the fallback is refused instead of quietly used.
 
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1308,7 +1309,9 @@ impl Client {
         if let (Some(bytes), Some(assets)) = (map_bytes.as_deref(), assets.as_ref()) {
             match World::build(&mut renderer.vk, assets, bytes) {
                 Ok(built) => {
-                    println!(
+                    // Report only; a closed pipe must not take the run down.
+                    let _ = writeln!(
+                        std::io::stdout(),
                         "world: {} surfaces, {} triangles, {} textures, {} shaders without art, {} items, {} item models",
                         built.drawn,
                         built.vertices.len() / 3,
@@ -1385,7 +1388,7 @@ impl Client {
         // Also on stdout: the in-game console is not visible to a logged or
         // automated run, and the renderer line carries the offload transfer
         // mode.
-        println!("renderer: Vulkan, {}", renderer.device_name());
+        let _ = writeln!(std::io::stdout(), "renderer: Vulkan, {}", renderer.device_name());
         let mut banner = format!(
             "Quake III Arena - Rust client {}\nrenderer: Vulkan, {}\n{audio_line}\n{data_line}\
              \n{display_line}\n",

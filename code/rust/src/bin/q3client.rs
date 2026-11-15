@@ -4,6 +4,8 @@
 //! On a hybrid GPU the scene is rendered on the discrete device and presented
 //! through the integrated one; `Q3_OFFLOAD=0` turns that off.
 
+use std::io::Write;
+
 use q3rust::client::Client;
 
 const DEFAULT_WIDTH: u32 = 1024;
@@ -39,7 +41,9 @@ fn main() {
         }
     }
 
-    println!(
+    // A pipe reader can close before the run ends; that is not a failure.
+    let _ = writeln!(
+        std::io::stdout(),
         "stopped after {} frames, {} ms",
         client.frames(),
         client.millis()
