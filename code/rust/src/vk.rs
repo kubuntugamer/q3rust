@@ -867,14 +867,15 @@ impl Vulkan {
     /// and usage here are transfer-only.
     fn create_export_target(&mut self) -> Result<(), String> {
         unsafe {
+            let export_extent = linear_export_extent(self.extent);
             let mut external = vk::ExternalMemoryImageCreateInfo::default()
                 .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
             let image_info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(self.format)
                 .extent(vk::Extent3D {
-                    width: self.extent.width.max(1),
-                    height: self.extent.height.max(1),
+                    width: export_extent.width,
+                    height: export_extent.height,
                     depth: 1,
                 })
                 .mip_levels(1)
@@ -938,8 +939,17 @@ impl Vulkan {
                 }
             };
 
+            let sub = vk::ImageSubresource {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                array_layer: 0,
+            };
+            let layout = self.device.get_image_subresource_layout(image, sub);
+
             let imported = match self.presenter.as_mut() {
-                Some(presenter) => presenter.attach_dmabuf(fd, self.format, self.extent),
+                Some(presenter) => {
+                    presenter.attach_dmabuf(fd, self.format, self.extent, layout.row_pitch)
+                }
                 None => Err("no presenting device".to_string()),
             };
             if let Err(e) = imported {
@@ -2933,6 +2943,7 @@ impl Presenter {
         fd: i32,
         format: vk::Format,
         extent: vk::Extent2D,
+        row_pitch: u64,
     ) -> Result<(), String> {
         unsafe {
             if self.dmabuf_loader.is_none() {
@@ -2953,14 +2964,15 @@ impl Presenter {
                 )
                 .map_err(|e| format!("querying the DMA-BUF memory: {e}"))?;
 
+            let import_extent = linear_export_extent(extent);
             let mut external = vk::ExternalMemoryImageCreateInfo::default()
                 .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
             let info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(format)
                 .extent(vk::Extent3D {
-                    width: extent.width.max(1),
-                    height: extent.height.max(1),
+                    width: import_extent.width,
+                    height: import_extent.height,
                     depth: 1,
                 })
                 .mip_levels(1)
@@ -3002,6 +3014,21 @@ impl Presenter {
                 self.device.destroy_image(image, None);
                 self.device.free_memory(memory, None);
                 return Err(format!("binding the imported colour image: {e}"));
+            }
+
+            let sub = vk::ImageSubresource {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                array_layer: 0,
+            };
+            let layout = self.device.get_image_subresource_layout(image, sub);
+            if layout.row_pitch != row_pitch {
+                self.device.destroy_image(image, None);
+                self.device.free_memory(memory, None);
+                return Err(format!(
+                    "the imported row pitch {} does not match the exported {}",
+                    layout.row_pitch, row_pitch
+                ));
             }
 
             self.dmabuf_image = image;
@@ -3434,6 +3461,19 @@ unsafe fn device_supports(
                 .any(|extension| CStr::from_ptr(extension.extension_name.as_ptr()) == name)
         })
         .unwrap_or(false)
+}
+
+/// The size a linear export image is created at. Drivers pad a linear row to
+/// their own pitch alignment (NVIDIA 64 bytes, RADV 256), and a DMA-BUF import
+/// has no way to pass the exporter's pitch along, so the import assumes its own.
+/// Widening the image to a multiple of 64 pixels (256 bytes at four bytes per
+/// pixel) makes both compute the same pitch; the padding columns are never
+/// copied, and the presenter still reads only the real extent.
+fn linear_export_extent(extent: vk::Extent2D) -> vk::Extent2D {
+    vk::Extent2D {
+        width: (extent.width.max(1) + 63) & !63,
+        height: extent.height.max(1),
+    }
 }
 
 /// `VkSurfaceCapabilitiesKHR`'s format, extent and present mode choice, shared
