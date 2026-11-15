@@ -20,8 +20,9 @@ use crate::bsp::{Bsp, BspFace, DrawVert, LIGHTMAP_SIZE, SURFACE_PATCH};
 use crate::items::{self, ItemMark};
 use crate::model::Md3Model;
 use crate::shader::{
-    AlphaGen, ColorGen, Deform, DeformStage, GenFunc, Parser, ShaderScript, ShaderStage,
-    ShaderTextIndex, TexCoordGen, TexMod, TextureMap, WaveForm,
+    AlphaGen, ColorGen, Deform, DeformStage, GenFunc, Parser, ShaderScript, ShaderSort,
+    ShaderStage, ShaderTextIndex, TexCoordGen, TexMod, TextureMap, WaveForm,
+    GLS_DEPTHMASK_TRUE,
     CONTENTS_FOG, GLS_DSTBLEND_ONE, GLS_SRCBLEND_ONE,
 };
 use crate::texture;
@@ -332,6 +333,8 @@ pub struct Batch {
     /// The shader's deformations that this renderer applies, in script order,
     /// run over the whole batch before it is drawn.
     pub deforms: Vec<DeformStage>,
+    /// `shader.sort`: opaque batches first, then decals, then blends.
+    pub sort: i32,
 }
 
 /// `rgbGen wave` and `alphaGen wave`: the colour a stage draws with, taken
@@ -617,8 +620,9 @@ impl World {
 
             // One draw per stage, so a shader's detail, blend and additive
             // passes land on the same triangles in the script's order.
+            let specs = stage_list(&index, &name);
             let mut stages = Vec::new();
-            for spec in stage_list(&index, &name) {
+            for spec in &specs {
                 let mut frames = Vec::with_capacity(spec.images.len());
                 for image in &spec.images {
                     let texture = match cache.get(image) {
@@ -666,6 +670,7 @@ impl World {
             }
 
             let deforms = shader_deforms(&index, &name);
+            let sort = batch_sort(&index, &name, &specs);
             let first = world.vertices.len();
             let count = vertices.len();
             world.vertices.extend(vertices);
@@ -674,11 +679,16 @@ impl World {
                 count,
                 stages,
                 deforms,
+                sort,
             });
         }
 
         // The pickups, read from the same entity lump `audit_bsp` counts, and
         // the models they draw with.
+        // Opaque batches first, then decals and blends, as `R_SortDrawSurfs`
+        // orders them; the build order breaks ties, keeping it deterministic.
+        world.batches.sort_by_key(|batch| batch.sort);
+
         world.items = items::item_marks(bsp.entities());
         world.item_models = load_item_models(vk, assets, &world.items, &mut world.textures)?;
         // A thrown grenade has a mesh in the paks: the ammo pickup is the
@@ -1141,6 +1151,28 @@ fn sky_outerbox(index: &ShaderTextIndex, shader_name: &str) -> Option<[String; 6
     shader_script(index, shader_name)?.sky?.outerbox
 }
 
+/// The sort key `FinishShader` gives a shader: an explicit `sort` wins,
+/// otherwise the first stage's blending decides between see-through and
+/// blended, and an opaque shader sorts as opaque.
+fn batch_sort(index: &ShaderTextIndex, name: &str, stages: &[StageSpec]) -> i32 {
+    let explicit = shader_script(index, name)
+        .map(|script| script.sort.0)
+        .filter(|sort| *sort != 0);
+    if let Some(sort) = explicit {
+        return sort;
+    }
+    match stages.first() {
+        Some(first) if first.blend != BlendMode::Opaque => {
+            if first.depth_mask {
+                ShaderSort::SEE_THROUGH.0
+            } else {
+                ShaderSort::BLEND0.0
+            }
+        }
+        _ => ShaderSort::OPAQUE.0,
+    }
+}
+
 /// The shader's deformations this renderer applies. The other kinds are not
 /// applied yet.
 fn shader_deforms(index: &ShaderTextIndex, name: &str) -> Vec<DeformStage> {
@@ -1199,6 +1231,8 @@ struct StageSpec {
     rgb: Option<WaveForm>,
     alpha: Option<WaveForm>,
     transform: Option<TexTransform>,
+    /// `GLS_DEPTHMASK_TRUE`: the stage writes depth.
+    depth_mask: bool,
     lit: bool,
 }
 
@@ -1223,6 +1257,7 @@ fn stage_list(index: &ShaderTextIndex, name: &str) -> Vec<StageSpec> {
                 rgb: (stage.rgb_gen == ColorGen::Waveform).then_some(stage.rgb_wave),
                 alpha: (stage.alpha_gen == AlphaGen::Waveform).then_some(stage.alpha_wave),
                 transform: stage_tex_transform(&stage.bundle.tex_mods),
+                depth_mask: stage.state_bits & GLS_DEPTHMASK_TRUE != 0,
                 // Only the first pass carries the surface's lightmap.
                 lit: stages.is_empty(),
             });
@@ -1244,6 +1279,7 @@ fn stage_list(index: &ShaderTextIndex, name: &str) -> Vec<StageSpec> {
             rgb: None,
             alpha: None,
             transform: None,
+            depth_mask: true,
             lit: true,
         });
     }
@@ -2119,6 +2155,43 @@ mod tests {
         close(wave_value(&wave(GenFunc::Triangle), 0.25), 3.0);
         close(wave_value(&wave(GenFunc::Sawtooth), 0.5), 2.0);
         close(wave_value(&wave(GenFunc::InverseSawtooth), 0.25), 2.5);
+    }
+
+    #[test]
+    fn a_blended_shader_sorts_behind_opaque_geometry() {
+        let opaque = "textures/plain\n{\n {\n  map textures/plain.tga\n }\n}\n";
+        let index = shader_index(&[opaque.to_string()]);
+        let stages = stage_list(&index, "textures/plain");
+        assert_eq!(batch_sort(&index, "textures/plain", &stages), ShaderSort::OPAQUE.0);
+
+        // A blended stage clears its depth mask, so it lands in the blend
+        // sorts; saying `depthWrite` keeps the mask and makes it see-through.
+        let blended = "textures/glow\n{\n {\n  map textures/glow.tga\n  blendFunc add\n }\n}\n";
+        let index = shader_index(&[blended.to_string()]);
+        let stages = stage_list(&index, "textures/glow");
+        assert_eq!(
+            batch_sort(&index, "textures/glow", &stages),
+            ShaderSort::BLEND0.0
+        );
+
+        let written = "textures/grate\n{\n {\n  map textures/grate.tga\n  blendFunc blend\n  depthWrite\n }\n}\n";
+        let index = shader_index(&[written.to_string()]);
+        let stages = stage_list(&index, "textures/grate");
+        assert_eq!(
+            batch_sort(&index, "textures/grate", &stages),
+            ShaderSort::SEE_THROUGH.0
+        );
+    }
+
+    #[test]
+    fn an_explicit_sort_wins_over_the_blend_default() {
+        let script = "textures/glow\n{\n sort additive\n {\n  map textures/glow.tga\n  blendFunc add\n }\n}\n";
+        let index = shader_index(&[script.to_string()]);
+        let stages = stage_list(&index, "textures/glow");
+        assert_eq!(
+            batch_sort(&index, "textures/glow", &stages),
+            ShaderSort::BLEND1.0
+        );
     }
 
     #[test]
