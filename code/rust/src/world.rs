@@ -12,7 +12,7 @@
 //! per vertex instead of per texel, which is invisible at the scale the stock
 //! lightmaps are built at.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::assets::Assets;
 use crate::bg_misc;
@@ -20,8 +20,8 @@ use crate::bsp::{Bsp, BspFace, DrawVert, LIGHTMAP_SIZE, SURFACE_PATCH};
 use crate::items::{self, ItemMark};
 use crate::model::Md3Model;
 use crate::shader::{
-    Parser, ShaderScript, ShaderStage, ShaderTextIndex, TexMod, TextureMap, GLS_DSTBLEND_ONE,
-    GLS_SRCBLEND_ONE,
+    Parser, ShaderScript, ShaderStage, ShaderTextIndex, TexMod, TextureMap, CONTENTS_FOG,
+    GLS_DSTBLEND_ONE, GLS_SRCBLEND_ONE,
 };
 use crate::texture;
 use crate::vk::{BlendMode, Texture, Vertex3D, Vulkan};
@@ -304,6 +304,27 @@ impl World {
             (shader.surface_flags & SURF_SKY != 0).then(|| shader.name.clone())
         });
 
+        // The shader scripts decide which surfaces are drawn without a
+        // texture: a sky face is replaced by the skybox and a fog volume is a
+        // pass this renderer does not have. Their shaders ship no stage, so
+        // falling back to the shader name as an image would paint the checker.
+        // A sky whose box could not be loaded keeps drawing its surface, since
+        // the install may still have an image for the shader's name.
+        let scripts = shader_scripts(assets);
+        let index = shader_index(&scripts);
+        let sky = sky_name
+            .as_deref()
+            .and_then(|name| Sky::load(vk, assets, name, &index).ok().flatten());
+        let sky_loaded = sky.is_some();
+        let untextured: HashSet<usize> = textures
+            .iter()
+            .enumerate()
+            .filter(|(_, texture)| {
+                has_no_texture(&index, &texture.name, texture.surface_flags, sky_loaded)
+            })
+            .map(|(at, _)| at)
+            .collect();
+
         let mut by_shader: HashMap<usize, Vec<Vertex3D>> = HashMap::new();
         let mut drawn = 0usize;
         let mut skipped = 0usize;
@@ -314,6 +335,10 @@ impl World {
                     skipped += 1;
                     continue;
                 }
+            }
+            if untextured.contains(&face.shader) {
+                skipped += 1;
+                continue;
             }
 
             let Some(face_verts) = verts.get(face.first_vert..face.first_vert + face.num_verts)
@@ -387,7 +412,7 @@ impl World {
             item_models: Vec::new(),
             grenade: None,
             view_models: Vec::new(),
-            sky: None,
+            sky,
             textures: Vec::new(),
             faces: faces.len(),
             drawn,
@@ -401,8 +426,6 @@ impl World {
         shaders.sort_unstable();
         let mut cache: HashMap<String, usize> = HashMap::new();
         let checker = checker_texture(vk)?;
-        let scripts = shader_scripts(assets);
-        let index = shader_index(&scripts);
 
         for shader in shaders {
             let Some(vertices) = by_shader.remove(&shader) else {
@@ -470,10 +493,6 @@ impl World {
         world.grenade = grenade;
         let view_models = load_view_models(vk, assets, &mut world.textures);
         world.view_models = view_models;
-
-        world.sky = sky_name
-            .as_deref()
-            .and_then(|name| Sky::load(vk, assets, name, &index).ok().flatten());
 
         Ok(world)
     }
@@ -895,6 +914,24 @@ fn shader_script(index: &ShaderTextIndex, shader_name: &str) -> Option<ShaderScr
     let mut parser = Parser::new(text);
     parser.parse_shader(&mut script).ok()?;
     Some(script)
+}
+
+/// Whether a surface is drawn without a texture of its own: the six-face
+/// skybox replaces a sky surface when it loaded, and a fog volume is drawn by
+/// a fog pass this renderer does not have yet. Those scripts carry no stage at
+/// all, so the name must not be loaded as if it were an image — that is what
+/// the checker fallback is for, and the stock maps have both kinds.
+fn has_no_texture(
+    index: &ShaderTextIndex,
+    shader_name: &str,
+    surface_flags: u32,
+    sky_loaded: bool,
+) -> bool {
+    if sky_loaded && surface_flags & SURF_SKY != 0 {
+        return true;
+    }
+    shader_script(index, shader_name)
+        .is_some_and(|script| script.content_flags & CONTENTS_FOG != 0)
 }
 
 /// The six outer face names `skyParms` names, if the shader has a sky.
@@ -1650,6 +1687,21 @@ mod tests {
         assert!(sky_outerbox(&shader_index(&[script.to_string()]), "textures/stone").is_none());
         // A name that is not in the scripts at all is equally absent.
         assert!(sky_outerbox(&shader_index(&[script.to_string()]), "textures/other").is_none());
+    }
+
+    #[test]
+    fn sky_and_fog_surfaces_are_not_loadable_as_images() {
+        let index = shader_index(&[
+            "textures/sfx/fog_test\n{\n surfaceparm fog\n fogparms ( .5 .5 .5 ) 100\n}\n".to_string(),
+            "textures/stone\n{ { map textures/stone.tga } }\n".to_string(),
+        ]);
+        assert!(has_no_texture(&index, "textures/sfx/fog_test", 0, false));
+        assert!(has_no_texture(&index, "textures/skies/any", SURF_SKY, true));
+        // A sky whose box did not load keeps its surface.
+        assert!(!has_no_texture(&index, "textures/skies/any", SURF_SKY, false));
+        assert!(!has_no_texture(&index, "textures/stone", 0, false));
+        // A map that names an image directly has no script and still draws it.
+        assert!(!has_no_texture(&index, "textures/base/floor", 0, false));
     }
 
     #[test]
