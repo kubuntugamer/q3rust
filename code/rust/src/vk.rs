@@ -409,13 +409,11 @@ impl Vulkan {
                 .to_string_lossy()
                 .into_owned()
         };
-        match self.presenter.as_ref() {
-            Some(presenter) => format!(
-                "{render} (offload; presenting on {})",
-                presenter.device_name
-            ),
-            None => render,
-        }
+        renderer_line(
+            &render,
+            self.presenter.as_ref().map(|p| p.device_name.as_str()),
+            self.zero_copy,
+        )
     }
 
     /// Starts a frame: acquires a swapchain image, opens the render pass and
@@ -3463,6 +3461,19 @@ unsafe fn device_supports(
         .unwrap_or(false)
 }
 
+/// The console's renderer line: the drawing device, plus how an offload frame
+/// reaches the presenting device. A failed export or import leaves the readback
+/// path in place, and the line says so rather than claiming zero-copy.
+fn renderer_line(render: &str, presenter: Option<&str>, zero_copy: bool) -> String {
+    match presenter {
+        Some(presenter) => {
+            let transfer = if zero_copy { "zero-copy" } else { "readback" };
+            format!("{render} (offload, {transfer}; presenting on {presenter})")
+        }
+        None => render.to_string(),
+    }
+}
+
 /// The size a linear export image is created at. Drivers pad a linear row to
 /// their own pitch alignment (NVIDIA 64 bytes, RADV 256), and a DMA-BUF import
 /// has no way to pass the exporter's pitch along, so the import assumes its own.
@@ -3743,5 +3754,23 @@ impl Drop for Vulkan {
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::renderer_line;
+
+    #[test]
+    fn the_renderer_line_names_the_offload_transfer() {
+        assert_eq!(
+            renderer_line("NVIDIA GeForce RTX 5050", Some("RADV RAPHAEL"), true),
+            "NVIDIA GeForce RTX 5050 (offload, zero-copy; presenting on RADV RAPHAEL)"
+        );
+        assert_eq!(
+            renderer_line("NVIDIA GeForce RTX 5050", Some("RADV RAPHAEL"), false),
+            "NVIDIA GeForce RTX 5050 (offload, readback; presenting on RADV RAPHAEL)"
+        );
+        assert_eq!(renderer_line("llvmpipe", None, false), "llvmpipe");
     }
 }
