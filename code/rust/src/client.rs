@@ -1811,7 +1811,7 @@ impl Client {
         for batch in &world.batches {
             let vertices = &world.vertices[batch.first..batch.first + batch.count];
             for stage in &batch.stages {
-                let (_, texture) = &world.textures()[stage.texture];
+                let (_, texture) = &world.textures()[stage.texture_index(seconds)];
                 let uv = [
                     stage.uv[0],
                     stage.uv[1],

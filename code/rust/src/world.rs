@@ -213,9 +213,12 @@ pub const DEFAULT_FOV: f32 = 90.0;
 /// One stage of a shader batch: the image it draws, how it blends, and how its
 /// texture coordinates move. `lit` is true for the pass the baked lightmap
 /// tints; detail and additive passes carry their own colour.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Stage {
+    /// The first frame; also the only frame unless `anim` is set.
     pub texture: usize,
+    /// The frames of an `animMap`, cycled at `speed` frames per second.
+    pub anim: Option<Anim>,
     pub blend: BlendMode,
     /// `[scale_s, scale_t, scroll_s, scroll_t]`. Scroll is per second.
     pub uv: [f32; 4],
@@ -230,7 +233,29 @@ pub struct Stage {
     pub lit: bool,
 }
 
+/// An `animMap`: the images it cycles through and how fast, mirroring
+/// `imageAnimationSpeed` and `numImageAnimations`.
+#[derive(Clone, Debug)]
+pub struct Anim {
+    pub speed: f32,
+    /// Indices into [`World::textures`], in script order.
+    pub frames: Vec<usize>,
+}
+
 impl Stage {
+    /// The frame the stage shows at `seconds`: one step per `1/speed`
+    /// seconds, wrapping around, exactly as `R_BindAnimatedImage` counts.
+    pub fn texture_index(&self, seconds: f32) -> usize {
+        let Some(anim) = self.anim.as_ref() else {
+            return self.texture;
+        };
+        if anim.frames.is_empty() {
+            return self.texture;
+        }
+        let index = (seconds * anim.speed) as usize % anim.frames.len();
+        anim.frames[index]
+    }
+
     /// The deformation the vertex shader applies this frame:
     /// `[amplitude, phase, frequency, seconds, cos, sin, stretch, 0]`.
     pub fn tc_mods(&self, seconds: f32) -> [f32; 8] {
@@ -477,24 +502,39 @@ impl World {
             // passes land on the same triangles in the script's order.
             let mut stages = Vec::new();
             for spec in stage_list(&index, &name) {
-                let texture = match cache.get(&spec.image) {
-                    Some(index) => *index,
-                    None => {
-                        let loaded = match load_texture(vk, assets, &spec.image) {
-                            Ok(texture) => texture,
-                            Err(_) => {
-                                world.missing.push(spec.image.clone());
-                                vk.create_repeating_texture(64, 64, &checker.1)?
-                            }
-                        };
-                        let at = world.textures.len();
-                        world.textures.push((spec.image, loaded));
-                        cache.insert(world.textures[at].0.clone(), at);
-                        at
-                    }
+                let mut frames = Vec::with_capacity(spec.images.len());
+                for image in &spec.images {
+                    let texture = match cache.get(image) {
+                        Some(index) => *index,
+                        None => {
+                            let loaded = match load_texture(vk, assets, image) {
+                                Ok(texture) => texture,
+                                Err(_) => {
+                                    world.missing.push(image.clone());
+                                    vk.create_repeating_texture(64, 64, &checker.1)?
+                                }
+                            };
+                            let at = world.textures.len();
+                            world.textures.push((image.clone(), loaded));
+                            cache.insert(world.textures[at].0.clone(), at);
+                            at
+                        }
+                    };
+                    frames.push(texture);
+                }
+                let texture = frames[0];
+                // A single image is not an animation, as in `R_BindAnimatedImage`.
+                let anim = if frames.len() > 1 {
+                    spec.anim_speed.map(|speed| Anim {
+                        speed,
+                        frames: frames.clone(),
+                    })
+                } else {
+                    None
                 };
                 stages.push(Stage {
                     texture,
+                    anim,
                     blend: spec.blend,
                     uv: spec.uv,
                     turb: spec.turb,
@@ -1007,7 +1047,9 @@ const MAX_STAGES: usize = 4;
 
 /// A stage before its texture is uploaded.
 struct StageSpec {
-    image: String,
+    /// The first image, and every later `animMap` frame.
+    images: Vec<String>,
+    anim_speed: Option<f32>,
     blend: BlendMode,
     uv: [f32; 4],
     turb: Option<WaveForm>,
@@ -1022,11 +1064,12 @@ fn stage_list(index: &ShaderTextIndex, name: &str) -> Vec<StageSpec> {
     let mut stages = Vec::new();
     if let Some(script) = shader_script(index, name) {
         for stage in script.stages.iter().filter(|stage| stage.active) {
-            let Some(image) = stage_image(stage) else {
+            let Some((images, anim_speed)) = stage_images(stage) else {
                 continue;
             };
             stages.push(StageSpec {
-                image: image.to_string(),
+                images: images.to_vec(),
+                anim_speed,
                 blend: blend_mode(stage.state_bits),
                 uv: stage_transform(&stage.bundle.tex_mods),
                 turb: stage_turbulence(&stage.bundle.tex_mods),
@@ -1042,7 +1085,8 @@ fn stage_list(index: &ShaderTextIndex, name: &str) -> Vec<StageSpec> {
     }
     if stages.is_empty() {
         stages.push(StageSpec {
-            image: name.to_string(),
+            images: vec![name.to_string()],
+            anim_speed: None,
             blend: BlendMode::Opaque,
             uv: [1.0, 1.0, 0.0, 0.0],
             turb: None,
@@ -1085,12 +1129,13 @@ fn stage_stretch(tex_mods: &[TexMod]) -> Option<WaveForm> {
     })
 }
 
-/// The image a stage draws with. The lightmap is already in the vertex colour
-/// and a video map has no texture to upload, so both leave the stage out.
-fn stage_image(stage: &ShaderStage) -> Option<&str> {
+/// The image a stage draws with, plus the frame rate when it is an `animMap`.
+/// The lightmap is already in the vertex colour and a video map has no texture
+/// to upload, so both leave the stage out.
+fn stage_images(stage: &ShaderStage) -> Option<(&[String], Option<f32>)> {
     match stage.bundle.map.as_ref()? {
-        TextureMap::File { name, .. } => Some(name.as_str()),
-        TextureMap::Anim { frames, .. } => frames.first().map(String::as_str),
+        TextureMap::File { name, .. } => Some((std::slice::from_ref(name), None)),
+        TextureMap::Anim { speed, frames } => Some((frames.as_slice(), Some(*speed))),
         TextureMap::WhiteImage | TextureMap::Lightmap | TextureMap::Video(_) => None,
     }
 }
@@ -1700,7 +1745,7 @@ mod tests {
         let index = shader_index(&[script.to_string()]);
         let stages = stage_list(&index, "textures/test");
         assert_eq!(stages.len(), 2);
-        assert_eq!(stages[0].image, "textures/test1.tga");
+        assert_eq!(stages[0].images[0], "textures/test1.tga");
         assert_eq!(stages[0].blend, BlendMode::Opaque);
         assert!(stages[0].lit);
         assert_eq!(stages[1].blend, BlendMode::Add);
@@ -1712,7 +1757,7 @@ mod tests {
         let index = shader_index(&[String::new()]);
         let stages = stage_list(&index, "textures/base_wall/foo");
         assert_eq!(stages.len(), 1);
-        assert_eq!(stages[0].image, "textures/base_wall/foo");
+        assert_eq!(stages[0].images[0], "textures/base_wall/foo");
         assert_eq!(stages[0].blend, BlendMode::Opaque);
         assert_eq!(stages[0].uv, [1.0, 1.0, 0.0, 0.0]);
     }
@@ -1803,6 +1848,43 @@ mod tests {
     }
 
     #[test]
+    fn an_animmap_stage_carries_every_frame_and_its_rate() {
+        let script = "textures/screen\n{\n {\n  animMap 5 textures/a.tga textures/b.tga textures/c.tga\n }\n}\n";
+        let stages = stage_list(&shader_index(&[script.to_string()]), "textures/screen");
+        assert_eq!(stages[0].images.len(), 3);
+        assert_eq!(stages[0].images[2], "textures/c.tga");
+        assert_eq!(stages[0].anim_speed, Some(5.0));
+    }
+
+    #[test]
+    fn an_animated_stage_steps_a_frame_each_period_and_wraps() {
+        let stage = Stage {
+            texture: 7,
+            anim: Some(Anim {
+                speed: 2.0,
+                frames: vec![7, 8, 9],
+            }),
+            blend: BlendMode::Opaque,
+            uv: [1.0, 1.0, 0.0, 0.0],
+            turb: None,
+            rotate: None,
+            stretch: None,
+            lit: true,
+        };
+        assert_eq!(stage.texture_index(0.0), 7);
+        assert_eq!(stage.texture_index(0.6), 8);
+        assert_eq!(stage.texture_index(1.0), 9);
+        assert_eq!(stage.texture_index(1.5), 7);
+    }
+
+    #[test]
+    fn a_stage_with_one_frame_does_not_animate() {
+        let script = "textures/static\n{\n {\n  animMap 5 textures/only.tga\n }\n}\n";
+        let stages = stage_list(&shader_index(&[script.to_string()]), "textures/static");
+        assert_eq!(stages[0].images.len(), 1);
+    }
+
+    #[test]
     fn a_rotating_and_stretching_stage_carries_both() {
         let script = "textures/ring\n{\n {\n  map textures/ring.tga\n  tcMod rotate 90\n  tcMod stretch sin 2 1 0 0\n }\n}\n";
         let stages = stage_list(&shader_index(&[script.to_string()]), "textures/ring");
@@ -1835,6 +1917,7 @@ mod tests {
     fn a_stage_without_texmods_deforms_nothing() {
         let stage = Stage {
             texture: 0,
+            anim: None,
             blend: BlendMode::Opaque,
             uv: [1.0, 1.0, 0.0, 0.0],
             turb: None,
@@ -1849,6 +1932,7 @@ mod tests {
     fn rotation_turns_clockwise_and_stretch_inverts_its_wave() {
         let stage = Stage {
             texture: 0,
+            anim: None,
             blend: BlendMode::Opaque,
             uv: [1.0, 1.0, 0.0, 0.0],
             turb: None,
