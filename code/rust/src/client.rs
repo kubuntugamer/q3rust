@@ -1829,16 +1829,31 @@ impl Client {
                     stage.uv[2] * seconds,
                     stage.uv[3] * seconds,
                 ];
+                // A pulsing rgbGen or alphaGen re-colours the batch for this
+                // stage only.
+                let tinted;
+                let stage_vertices = if stage.rgb.is_some() || stage.alpha.is_some() {
+                    tinted = world::wave_colors(
+                        vertices,
+                        stage.rgb.as_ref(),
+                        stage.alpha.as_ref(),
+                        seconds,
+                    );
+                    tinted.as_slice()
+                } else {
+                    vertices
+                };
                 // The stage's deformation is animated here, since only the
                 // clock changes between frames.
                 self.renderer.vk.draw_stage(
                     texture,
-                    vertices,
+                    stage_vertices,
                     &mvp,
                     uv,
                     stage.tc_mods(seconds),
                     stage.blend,
-                    stage.lit,
+                    // A wave colour replaces the lightmap in the vertex colour.
+                    stage.lit || stage.rgb.is_some(),
                 )?;
             }
         }

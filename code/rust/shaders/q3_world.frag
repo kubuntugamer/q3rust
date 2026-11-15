@@ -23,6 +23,8 @@ void main() {
     if (texel.a < 0.01) {
         discard;
     }
+    // A lit stage multiplies by the lightmap (or by an rgbGen wave's colour);
+    // the vertex alpha carries alphaGen and leaves the texel's own alpha be.
     vec3 tint = mix(color.rgb, vec3(1.0), push.stage_mode.x);
-    out_color = vec4(texel.rgb * tint, texel.a);
+    out_color = vec4(texel.rgb * tint, texel.a * color.a);
 }

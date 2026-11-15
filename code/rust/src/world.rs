@@ -20,8 +20,8 @@ use crate::bsp::{Bsp, BspFace, DrawVert, LIGHTMAP_SIZE, SURFACE_PATCH};
 use crate::items::{self, ItemMark};
 use crate::model::Md3Model;
 use crate::shader::{
-    Deform, DeformStage, GenFunc, Parser, ShaderScript, ShaderStage, ShaderTextIndex, TexCoordGen,
-    TexMod, TextureMap, WaveForm,
+    AlphaGen, ColorGen, Deform, DeformStage, GenFunc, Parser, ShaderScript, ShaderStage,
+    ShaderTextIndex, TexCoordGen, TexMod, TextureMap, WaveForm,
     CONTENTS_FOG, GLS_DSTBLEND_ONE, GLS_SRCBLEND_ONE,
 };
 use crate::texture;
@@ -234,6 +234,11 @@ pub struct Stage {
     /// `tcGen environment`: the coordinates come from reflecting the view in
     /// the surface normal rather than from the map's own st.
     pub env: bool,
+    /// `rgbGen wave`: the stage's colour pulses with this wave instead of
+    /// using the lightmap.
+    pub rgb: Option<WaveForm>,
+    /// `alphaGen wave`: the stage's alpha pulses with this wave.
+    pub alpha: Option<WaveForm>,
     pub lit: bool,
 }
 
@@ -301,6 +306,28 @@ pub struct Batch {
     /// The shader's deformations that this renderer applies, in script order,
     /// run over the whole batch before it is drawn.
     pub deforms: Vec<DeformStage>,
+}
+
+/// `rgbGen wave` and `alphaGen wave`: the colour a stage draws with, taken
+/// from the waves' clamped values. The alpha rides in the vertex colour and
+/// the fragment shader multiplies the texel by it.
+pub fn wave_colors(
+    vertices: &[Vertex3D],
+    rgb: Option<&WaveForm>,
+    alpha: Option<&WaveForm>,
+    seconds: f32,
+) -> Vec<Vertex3D> {
+    let mut tinted = vertices.to_vec();
+    for vertex in &mut tinted {
+        if let Some(wave) = rgb {
+            let value = (255.0 * wave_value(wave, seconds).clamp(0.0, 1.0)).round() as u8;
+            vertex.color = [value, value, value, vertex.color[3]];
+        }
+        if let Some(wave) = alpha {
+            vertex.color[3] = (255.0 * wave_value(wave, seconds).clamp(0.0, 1.0)).round() as u8;
+        }
+    }
+    tinted
 }
 
 /// The batch's vertices after each of its deformations, as
@@ -605,6 +632,8 @@ impl World {
                     rotate: spec.rotate,
                     stretch: spec.stretch,
                     env: spec.env,
+                    rgb: spec.rgb,
+                    alpha: spec.alpha,
                     lit: spec.lit,
                 });
             }
@@ -1140,6 +1169,8 @@ struct StageSpec {
     rotate: Option<f32>,
     stretch: Option<WaveForm>,
     env: bool,
+    rgb: Option<WaveForm>,
+    alpha: Option<WaveForm>,
     lit: bool,
 }
 
@@ -1161,6 +1192,8 @@ fn stage_list(index: &ShaderTextIndex, name: &str) -> Vec<StageSpec> {
                 rotate: stage_rotation(&stage.bundle.tex_mods),
                 stretch: stage_stretch(&stage.bundle.tex_mods),
                 env: stage.bundle.tc_gen == TexCoordGen::EnvironmentMapped,
+                rgb: (stage.rgb_gen == ColorGen::Waveform).then_some(stage.rgb_wave),
+                alpha: (stage.alpha_gen == AlphaGen::Waveform).then_some(stage.alpha_wave),
                 // Only the first pass carries the surface's lightmap.
                 lit: stages.is_empty(),
             });
@@ -1179,6 +1212,8 @@ fn stage_list(index: &ShaderTextIndex, name: &str) -> Vec<StageSpec> {
             rotate: None,
             stretch: None,
             env: false,
+            rgb: None,
+            alpha: None,
             lit: true,
         });
     }
@@ -1997,6 +2032,8 @@ mod tests {
             rotate: None,
             stretch: None,
             env: false,
+            rgb: None,
+            alpha: None,
             lit: true,
         };
         assert_eq!(stage.texture_index(0.0), 7);
@@ -2039,6 +2076,53 @@ mod tests {
         close(wave_value(&wave(GenFunc::Triangle), 0.25), 3.0);
         close(wave_value(&wave(GenFunc::Sawtooth), 0.5), 2.0);
         close(wave_value(&wave(GenFunc::InverseSawtooth), 0.25), 2.5);
+    }
+
+    #[test]
+    fn a_wave_colour_and_alpha_reach_their_stage() {
+        let script = "textures/glow\n{\n {\n  map textures/glow.tga\n  blendFunc add\n  rgbGen wave sin 0.5 0.5 0 1\n  alphaGen wave sin 0 1 0 1\n }\n}\n";
+        let stages = stage_list(&shader_index(&[script.to_string()]), "textures/glow");
+        let rgb = stages[0].rgb.expect("rgbGen wave should reach the stage");
+        assert_eq!(rgb.base, 0.5);
+        assert_eq!(rgb.amplitude, 0.5);
+        let alpha = stages[0].alpha.expect("alphaGen wave should reach the stage");
+        assert_eq!(alpha.amplitude, 1.0);
+        let plain = "textures/dull\n{\n {\n  map textures/dull.tga\n }\n}\n";
+        let stages = stage_list(&shader_index(&[plain.to_string()]), "textures/dull");
+        assert!(stages[0].rgb.is_none() && stages[0].alpha.is_none());
+    }
+
+    #[test]
+    fn a_wave_colour_pulses_and_clamps() {
+        let vertices = [Vertex3D {
+            pos: [0.0; 3],
+            uv: [0.0, 0.0],
+            color: [9, 9, 9, 255],
+            normal: [0.0, 0.0, 1.0],
+        }];
+        // A wave peaking at 2.0 clamps to full brightness; at its trough the
+        // stage goes black.
+        let bright = WaveForm {
+            func: GenFunc::Sin,
+            base: 1.0,
+            amplitude: 1.0,
+            phase: 0.0,
+            frequency: 1.0,
+        };
+        let lit = wave_colors(&vertices, Some(&bright), None, 0.25);
+        assert_eq!(lit[0].color, [255, 255, 255, 255]);
+        let dark = wave_colors(&vertices, Some(&bright), None, 0.75);
+        assert_eq!(dark[0].color, [0, 0, 0, 255]);
+        // A half alpha halves the vertex alpha and leaves the colour alone.
+        let half = WaveForm {
+            func: GenFunc::Sin,
+            base: 0.5,
+            amplitude: 0.0,
+            phase: 0.0,
+            frequency: 1.0,
+        };
+        let faded = wave_colors(&vertices, None, Some(&half), 0.0);
+        assert_eq!(faded[0].color, [9, 9, 9, 128]);
     }
 
     #[test]
@@ -2126,6 +2210,8 @@ mod tests {
             rotate: None,
             stretch: None,
             env: false,
+            rgb: None,
+            alpha: None,
             lit: true,
         };
         assert_eq!(stage.tc_mods(2.5), [0.0, 0.0, 0.0, 2.5, 0.0, 1.0, 0.0, 0.0]);
@@ -2148,6 +2234,8 @@ mod tests {
                 frequency: 0.0,
             }),
             env: false,
+            rgb: None,
+            alpha: None,
             lit: true,
         };
         let tc = stage.tc_mods(1.0);
