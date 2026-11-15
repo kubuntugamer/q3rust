@@ -23,6 +23,7 @@ pub struct Vulkan {
     physical_device: vk::PhysicalDevice,
     device: Device,
     queue: vk::Queue,
+    queue_family: u32,
     swapchain_loader: ash::khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
     format: vk::Format,
@@ -75,6 +76,15 @@ pub struct Vulkan {
     retired_world_memory: Vec<vk::DeviceMemory>,
     retired_vertex_buffers: Vec<vk::Buffer>,
     retired_vertex_memory: Vec<vk::DeviceMemory>,
+    /// Set when rendering happens on one device and presentation on another.
+    presenter: Option<Presenter>,
+    /// The render device's colour target in offload mode.
+    color_image: vk::Image,
+    color_memory: vk::DeviceMemory,
+    readback_buffer: vk::Buffer,
+    readback_memory: vk::DeviceMemory,
+    readback_mapped: *mut u8,
+    readback_size: usize,
 }
 
 /// The mapping the 2D vertex shader applies to engine pixels.
@@ -170,13 +180,66 @@ impl Vulkan {
         unsafe {
             let surface_loader = ash::khr::surface::Instance::new(&entry, &instance);
 
-            let (physical_device, queue_family) = pick_device(&instance, &surface_loader, surface)?;
+            // `Q3_OFFLOAD=1` renders on a headless device and presents the
+            // readback on the device that owns the window. Without a second
+            // device the normal single-device path is used.
+            let offload = std::env::var("Q3_OFFLOAD")
+                .map(|value| {
+                    !value.is_empty()
+                        && value != "0"
+                        && !value.eq_ignore_ascii_case("false")
+                })
+                .unwrap_or(false);
+            let (physical_device, queue_family, presenter) = if offload {
+                match pick_render_device(&instance, None) {
+                    Some((render, render_family)) => match pick_present_device(
+                        &instance,
+                        &surface_loader,
+                        surface,
+                        Some(render),
+                    ) {
+                        Ok((display, display_family)) => match Presenter::new(
+                            &instance,
+                            &surface_loader,
+                            surface,
+                            display,
+                            display_family,
+                            width,
+                            height,
+                        ) {
+                            Ok(presenter) => (render, render_family, Some(presenter)),
+                            Err(e) => {
+                                eprintln!("offload disabled: {e}");
+                                let (device, family) =
+                                    pick_device(&instance, &surface_loader, surface)?;
+                                (device, family, None)
+                            }
+                        },
+                        Err(_) => {
+                            let (device, family) =
+                                pick_device(&instance, &surface_loader, surface)?;
+                            (device, family, None)
+                        }
+                    },
+                    None => {
+                        let (device, family) = pick_device(&instance, &surface_loader, surface)?;
+                        (device, family, None)
+                    }
+                }
+            } else {
+                let (device, family) = pick_device(&instance, &surface_loader, surface)?;
+                (device, family, None)
+            };
 
             let priorities = [1.0f32];
             let queue_info = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family)
                 .queue_priorities(&priorities)];
-            let device_extensions = [ash::khr::swapchain::NAME.as_ptr()];
+            let device_extensions: Vec<*const std::ffi::c_char> = if presenter.is_none() {
+                vec![ash::khr::swapchain::NAME.as_ptr()]
+            } else {
+                Vec::new()
+            };
             let device_info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_info)
                 .enabled_extension_names(&device_extensions);
@@ -194,10 +257,15 @@ impl Vulkan {
                 physical_device,
                 device,
                 queue,
+                queue_family,
                 swapchain_loader,
                 swapchain: vk::SwapchainKHR::null(),
-                format: vk::Format::UNDEFINED,
-                extent: vk::Extent2D { width, height },
+                format: presenter
+                    .as_ref()
+                    .map_or(vk::Format::UNDEFINED, |presenter| presenter.format),
+                extent: presenter
+                    .as_ref()
+                    .map_or(vk::Extent2D { width, height }, |presenter| presenter.extent),
                 images: Vec::new(),
                 image_views: Vec::new(),
                 render_pass: vk::RenderPass::null(),
@@ -236,9 +304,20 @@ impl Vulkan {
                 retired_world_memory: Vec::new(),
                 retired_vertex_buffers: Vec::new(),
                 retired_vertex_memory: Vec::new(),
+                presenter,
+                color_image: vk::Image::null(),
+                color_memory: vk::DeviceMemory::null(),
+                readback_buffer: vk::Buffer::null(),
+                readback_memory: vk::DeviceMemory::null(),
+                readback_mapped: std::ptr::null_mut(),
+                readback_size: 0,
             };
 
-            vk.create_swapchain(vk::SwapchainKHR::null())?;
+            if vk.presenter.is_some() {
+                vk.create_color_target()?;
+            } else {
+                vk.create_swapchain(vk::SwapchainKHR::null())?;
+            }
             vk.create_render_pass()?;
             vk.create_depth_resources()?;
             vk.create_framebuffers()?;
@@ -257,13 +336,20 @@ impl Vulkan {
 
     /// Name of the physical device in use, for the console's renderer line.
     pub fn device_name(&self) -> String {
-        unsafe {
+        let render = unsafe {
             let properties = self
                 .instance
                 .get_physical_device_properties(self.physical_device);
             std::ffi::CStr::from_ptr(properties.device_name.as_ptr())
                 .to_string_lossy()
                 .into_owned()
+        };
+        match self.presenter.as_ref() {
+            Some(presenter) => format!(
+                "{render} (offload; presenting on {})",
+                presenter.device_name
+            ),
+            None => render,
         }
     }
 
@@ -278,23 +364,32 @@ impl Vulkan {
                 .map_err(|e| format!("waiting for the frame fence: {e}"))?;
             self.release_retired();
 
-            let (image_index, _suboptimal) = match self.swapchain_loader.acquire_next_image(
-                self.swapchain,
-                u64::MAX,
-                self.image_available,
-                vk::Fence::null(),
-            ) {
-                Ok(value) => value,
-                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                    self.recreate()?;
-                    return Ok(false);
-                }
-                Err(e) => return Err(format!("acquiring a swapchain image: {e}")),
+            let image_index = if self.presenter.is_some() {
+                // The offload target is a single owned image; there is no
+                // swapchain to acquire from.
+                self.device
+                    .reset_fences(&[self.in_flight])
+                    .map_err(|e| format!("resetting the frame fence: {e}"))?;
+                0
+            } else {
+                let (image_index, _suboptimal) = match self.swapchain_loader.acquire_next_image(
+                    self.swapchain,
+                    u64::MAX,
+                    self.image_available,
+                    vk::Fence::null(),
+                ) {
+                    Ok(value) => value,
+                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                        self.recreate()?;
+                        return Ok(false);
+                    }
+                    Err(e) => return Err(format!("acquiring a swapchain image: {e}")),
+                };
+                self.device
+                    .reset_fences(&[self.in_flight])
+                    .map_err(|e| format!("resetting the frame fence: {e}"))?;
+                image_index
             };
-
-            self.device
-                .reset_fences(&[self.in_flight])
-                .map_err(|e| format!("resetting the frame fence: {e}"))?;
 
             let command_buffer = self.command_buffers[image_index as usize];
             self.device
@@ -361,9 +456,55 @@ impl Vulkan {
         unsafe {
             let command_buffer = self.command_buffers[image_index as usize];
             self.device.cmd_end_render_pass(command_buffer);
+
+            if self.presenter.is_some() {
+                // The render pass leaves the image in TRANSFER_SRC_OPTIMAL, so
+                // the copy needs no barrier of its own.
+                let region = vk::BufferImageCopy::default()
+                    .buffer_offset(0)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(0)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .image_offset(vk::Offset3D::default())
+                    .image_extent(vk::Extent3D {
+                        width: self.extent.width,
+                        height: self.extent.height,
+                        depth: 1,
+                    });
+                self.device.cmd_copy_image_to_buffer(
+                    command_buffer,
+                    self.images[0],
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    self.readback_buffer,
+                    &[region],
+                );
+            }
+
             self.device
                 .end_command_buffer(command_buffer)
                 .map_err(|e| format!("ending the command buffer: {e}"))?;
+
+            if self.presenter.is_some() {
+                let command_buffers = [command_buffer];
+                let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
+                self.device
+                    .queue_submit(self.queue, &[submit], self.in_flight)
+                    .map_err(|e| format!("submitting the frame: {e}"))?;
+                self.device
+                    .wait_for_fences(&[self.in_flight], true, u64::MAX)
+                    .map_err(|e| format!("waiting for the offload frame: {e}"))?;
+                let pixels = std::slice::from_raw_parts(self.readback_mapped, self.readback_size);
+                if let Some(presenter) = self.presenter.as_mut() {
+                    presenter.present(pixels)?;
+                }
+                return Ok(());
+            }
 
             let wait_semaphores = [self.image_available];
             let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
@@ -407,12 +548,197 @@ impl Vulkan {
     /// Replaces the swapchain after the window changed size. A zero-sized
     /// window is ignored: there is nothing to present until it comes back.
     pub fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
-        if width == 0 || height == 0 || (width == self.extent.width && height == self.extent.height)
+        if width == 0
+            || height == 0
+            || (width == self.extent.width && height == self.extent.height)
         {
             return Ok(());
         }
+        if self.presenter.is_some() {
+            return self.recreate_offload(width, height);
+        }
         self.extent = vk::Extent2D { width, height };
         self.recreate()
+    }
+
+    /// Resizes both halves of an offload pair. The presenting swapchain is
+    /// rebuilt first because its format is what the render target must match.
+    fn recreate_offload(&mut self, width: u32, height: u32) -> Result<(), String> {
+        unsafe {
+            let (format, extent) = {
+                let presenter = self.presenter.as_mut().expect("offload presenter");
+                presenter.recreate(width, height)?;
+                (presenter.format, presenter.extent)
+            };
+            self.format = format;
+            self.extent = extent;
+
+            self.device
+                .device_wait_idle()
+                .map_err(|e| format!("waiting for the render device: {e}"))?;
+            self.destroy_swapchain_objects();
+            self.destroy_color_target();
+            self.destroy_pipelines();
+            if self.render_pass != vk::RenderPass::null() {
+                self.device.destroy_render_pass(self.render_pass, None);
+                self.render_pass = vk::RenderPass::null();
+            }
+
+            self.create_color_target()?;
+            self.create_render_pass()?;
+            self.create_depth_resources()?;
+            self.create_pipeline()?;
+            self.create_framebuffers()?;
+            self.create_command_pool()?;
+            self.create_sync()?;
+            Ok(())
+        }
+    }
+
+    /// The offload render device's colour target: one image the render pass
+    /// draws into and the frame is copied out of.
+    fn create_color_target(&mut self) -> Result<(), String> {
+        unsafe {
+            let image_info = vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(self.format)
+                .extent(vk::Extent3D {
+                    width: self.extent.width.max(1),
+                    height: self.extent.height.max(1),
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            let image = self
+                .device
+                .create_image(&image_info, None)
+                .map_err(|e| format!("creating the offscreen colour image: {e}"))?;
+            let requirements = self.device.get_image_memory_requirements(image);
+            let memory_type = self.find_memory_type(
+                requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )?;
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_type);
+            let memory = self
+                .device
+                .allocate_memory(&alloc, None)
+                .map_err(|e| format!("allocating the offscreen colour image: {e}"))?;
+            if let Err(e) = self.device.bind_image_memory(image, memory, 0) {
+                self.device.destroy_image(image, None);
+                self.device.free_memory(memory, None);
+                return Err(format!("binding the offscreen colour image: {e}"));
+            }
+
+            let range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1);
+            let view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(self.format)
+                .subresource_range(range);
+            let view = match self.device.create_image_view(&view_info, None) {
+                Ok(view) => view,
+                Err(e) => {
+                    self.device.destroy_image(image, None);
+                    self.device.free_memory(memory, None);
+                    return Err(format!("creating the offscreen colour view: {e}"));
+                }
+            };
+
+            self.color_image = image;
+            self.color_memory = memory;
+            self.images = vec![image];
+            self.image_views = vec![view];
+        }
+        self.create_readback()
+    }
+
+    /// A host-visible buffer the offload frame is copied into before it is
+    /// handed to the presenting device.
+    fn create_readback(&mut self) -> Result<(), String> {
+        unsafe {
+            let size = self.extent.width as usize * self.extent.height as usize * 4;
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(size as vk::DeviceSize)
+                .usage(vk::BufferUsageFlags::TRANSFER_DST)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = self
+                .device
+                .create_buffer(&buffer_info, None)
+                .map_err(|e| format!("creating the readback buffer: {e}"))?;
+            let requirements = self.device.get_buffer_memory_requirements(buffer);
+            let memory_type = self.find_memory_type(
+                requirements.memory_type_bits,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            let alloc = vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_type);
+            let memory = self
+                .device
+                .allocate_memory(&alloc, None)
+                .map_err(|e| format!("allocating the readback buffer: {e}"))?;
+            if let Err(e) = self.device.bind_buffer_memory(buffer, memory, 0) {
+                self.device.destroy_buffer(buffer, None);
+                self.device.free_memory(memory, None);
+                return Err(format!("binding the readback buffer: {e}"));
+            }
+            let mapped = match self
+                .device
+                .map_memory(memory, 0, size as vk::DeviceSize, vk::MemoryMapFlags::empty())
+            {
+                Ok(mapped) => mapped as *mut u8,
+                Err(e) => {
+                    self.device.destroy_buffer(buffer, None);
+                    self.device.free_memory(memory, None);
+                    return Err(format!("mapping the readback buffer: {e}"));
+                }
+            };
+
+            self.readback_buffer = buffer;
+            self.readback_memory = memory;
+            self.readback_mapped = mapped;
+            self.readback_size = size;
+            Ok(())
+        }
+    }
+
+    /// Releases the offscreen colour image and the readback buffer.
+    fn destroy_color_target(&mut self) {
+        unsafe {
+            if !self.readback_mapped.is_null() {
+                self.device.unmap_memory(self.readback_memory);
+                self.readback_mapped = std::ptr::null_mut();
+            }
+            if self.readback_buffer != vk::Buffer::null() {
+                self.device.destroy_buffer(self.readback_buffer, None);
+                self.readback_buffer = vk::Buffer::null();
+            }
+            if self.readback_memory != vk::DeviceMemory::null() {
+                self.device.free_memory(self.readback_memory, None);
+                self.readback_memory = vk::DeviceMemory::null();
+            }
+            if self.color_image != vk::Image::null() {
+                self.device.destroy_image(self.color_image, None);
+                self.color_image = vk::Image::null();
+            }
+            if self.color_memory != vk::DeviceMemory::null() {
+                self.device.free_memory(self.color_memory, None);
+                self.color_memory = vk::DeviceMemory::null();
+            }
+            self.readback_size = 0;
+        }
     }
 
     fn create_swapchain(&mut self, old: vk::SwapchainKHR) -> Result<(), String> {
@@ -568,7 +894,13 @@ impl Vulkan {
                 .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
                 .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
                 .initial_layout(vk::ImageLayout::UNDEFINED)
-                .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+                .final_layout(if self.presenter.is_some() {
+                    // Offscreen frames are copied out; swapchain frames are
+                    // presented directly.
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+                } else {
+                    vk::ImageLayout::PRESENT_SRC_KHR
+                });
 
             // The world needs a depth buffer to sort its triangles; the 2D
             // pass simply leaves depth testing off.
@@ -651,18 +983,20 @@ impl Vulkan {
 
     fn create_sync(&mut self) -> Result<(), String> {
         unsafe {
-            let semaphore_info = vk::SemaphoreCreateInfo::default();
-            self.image_available = self
-                .device
-                .create_semaphore(&semaphore_info, None)
-                .map_err(|e| format!("creating the image-available semaphore: {e}"))?;
-            self.render_finished = (0..self.images.len())
-                .map(|_| {
-                    self.device
-                        .create_semaphore(&semaphore_info, None)
-                        .map_err(|e| format!("creating a render-finished semaphore: {e}"))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
+            if self.presenter.is_none() {
+                let semaphore_info = vk::SemaphoreCreateInfo::default();
+                self.image_available = self
+                    .device
+                    .create_semaphore(&semaphore_info, None)
+                    .map_err(|e| format!("creating the image-available semaphore: {e}"))?;
+                self.render_finished = (0..self.images.len())
+                    .map(|_| {
+                        self.device
+                            .create_semaphore(&semaphore_info, None)
+                            .map_err(|e| format!("creating a render-finished semaphore: {e}"))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+            }
 
             let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
             self.in_flight = self
@@ -695,13 +1029,10 @@ impl Vulkan {
             self.create_swapchain(old)?;
 
             // The new surface may pick a different format, so the render
-            // pass, its pipeline and its framebuffers are rebuilt from scratch.
+            // pass, its pipelines and its framebuffers are rebuilt from scratch.
             if self.render_pass != vk::RenderPass::null() {
-                // The pipeline references the render pass it was built for.
-                if self.pipeline != vk::Pipeline::null() {
-                    self.device.destroy_pipeline(self.pipeline, None);
-                    self.pipeline = vk::Pipeline::null();
-                }
+                // Every pipeline references the render pass it was built for.
+                self.destroy_pipelines();
                 self.device.destroy_render_pass(self.render_pass, None);
                 self.render_pass = vk::RenderPass::null();
             }
@@ -1221,27 +1552,7 @@ impl Vulkan {
     }
 
     fn queue_family_index(&self) -> Result<u32, String> {
-        unsafe {
-            let families = self
-                .instance
-                .get_physical_device_queue_family_properties(self.physical_device);
-            families
-                .iter()
-                .enumerate()
-                .find(|(index, family)| {
-                    family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-                        && self
-                            .surface_loader
-                            .get_physical_device_surface_support(
-                                self.physical_device,
-                                *index as u32,
-                                self.surface,
-                            )
-                            .unwrap_or(false)
-                })
-                .map(|(index, _)| index as u32)
-                .ok_or_else(|| "no graphics queue can present to this surface".into())
-        }
+        Ok(self.queue_family)
     }
 }
 
@@ -1650,6 +1961,25 @@ impl Vulkan {
         }
     }
 
+    /// Releases every pipeline built against the current render pass.
+    fn destroy_pipelines(&mut self) {
+        unsafe {
+            for pipeline in [
+                &mut self.pipeline,
+                &mut self.additive_pipeline,
+                &mut self.world_pipeline,
+                &mut self.world_blend_pipeline,
+                &mut self.world_add_pipeline,
+                &mut self.sky_pipeline,
+            ] {
+                if *pipeline != vk::Pipeline::null() {
+                    self.device.destroy_pipeline(*pipeline, None);
+                    *pipeline = vk::Pipeline::null();
+                }
+            }
+        }
+    }
+
     /// Builds the 2D pipeline against the current render pass. The render pass
     /// is rebuilt on resize, so this runs again with it.
     fn create_pipeline(&mut self) -> Result<(), String> {
@@ -1966,6 +2296,595 @@ fn read_spirv(bytes: &'static [u8]) -> Result<Vec<u32>, String> {
         .map_err(|e| format!("reading a compiled 2D shader: {e}"))
 }
 
+/// The presenting half of an offload pair: its own device and swapchain, plus
+/// a host-visible staging buffer that receives each frame's readback.
+struct Presenter {
+    device: Device,
+    queue: vk::Queue,
+    swapchain_loader: ash::khr::swapchain::Device,
+    swapchain: vk::SwapchainKHR,
+    format: vk::Format,
+    extent: vk::Extent2D,
+    images: Vec<vk::Image>,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    image_available: vk::Semaphore,
+    render_finished: Vec<vk::Semaphore>,
+    in_flight: vk::Fence,
+    staging_buffer: vk::Buffer,
+    staging_memory: vk::DeviceMemory,
+    staging_mapped: *mut u8,
+    staging_size: usize,
+    device_name: String,
+    surface_loader: ash::khr::surface::Instance,
+    surface: vk::SurfaceKHR,
+    physical_device: vk::PhysicalDevice,
+    host_memory_type: u32,
+}
+
+impl Presenter {
+    fn new(
+        instance: &Instance,
+        surface_loader: &ash::khr::surface::Instance,
+        surface: vk::SurfaceKHR,
+        physical_device: vk::PhysicalDevice,
+        queue_family: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
+        unsafe {
+            let priorities = [1.0f32];
+            let queue_info = [vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(queue_family)
+                .queue_priorities(&priorities)];
+            let extensions = [ash::khr::swapchain::NAME.as_ptr()];
+            let device_info = vk::DeviceCreateInfo::default()
+                .queue_create_infos(&queue_info)
+                .enabled_extension_names(&extensions);
+            let device = instance
+                .create_device(physical_device, &device_info, None)
+                .map_err(|e| format!("creating the presenting device: {e}"))?;
+            let queue = device.get_device_queue(queue_family, 0);
+            let swapchain_loader = ash::khr::swapchain::Device::new(instance, &device);
+
+            let properties = instance.get_physical_device_properties(physical_device);
+            let memory = instance.get_physical_device_memory_properties(physical_device);
+            let host_memory_type = memory
+                .memory_types
+                .iter()
+                .position(|kind| {
+                    kind.property_flags.contains(
+                        vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    )
+                })
+                .ok_or("the presenting device has no host-visible memory")?
+                as u32;
+            let mut presenter = Self {
+                device,
+                queue,
+                swapchain_loader,
+                swapchain: vk::SwapchainKHR::null(),
+                format: vk::Format::UNDEFINED,
+                extent: vk::Extent2D::default(),
+                images: Vec::new(),
+                command_pool: vk::CommandPool::null(),
+                command_buffer: vk::CommandBuffer::null(),
+                image_available: vk::Semaphore::null(),
+                render_finished: Vec::new(),
+                in_flight: vk::Fence::null(),
+                staging_buffer: vk::Buffer::null(),
+                staging_memory: vk::DeviceMemory::null(),
+                staging_mapped: std::ptr::null_mut(),
+                staging_size: 0,
+                device_name: CStr::from_ptr(properties.device_name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned(),
+                surface_loader: surface_loader.clone(),
+                surface,
+                physical_device,
+                host_memory_type,
+            };
+
+            let semaphore_info = vk::SemaphoreCreateInfo::default();
+            presenter.image_available = presenter
+                .device
+                .create_semaphore(&semaphore_info, None)
+                .map_err(|e| format!("creating the presenting semaphore: {e}"))?;
+            presenter.in_flight = presenter
+                .device
+                .create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )
+                .map_err(|e| format!("creating the presenting fence: {e}"))?;
+
+            let pool_info = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(queue_family)
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+            presenter.command_pool = presenter
+                .device
+                .create_command_pool(&pool_info, None)
+                .map_err(|e| format!("creating the presenting command pool: {e}"))?;
+            let allocate = vk::CommandBufferAllocateInfo::default()
+                .command_pool(presenter.command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            presenter.command_buffer = presenter
+                .device
+                .allocate_command_buffers(&allocate)
+                .map_err(|e| format!("allocating the presenting command buffer: {e}"))?[0];
+
+            presenter.recreate(width, height)?;
+            Ok(presenter)
+        }
+    }
+
+    /// Rebuilds the swapchain, its semaphores and the staging buffer. The
+    /// caller must have waited for the presenting device to go idle.
+    fn recreate(&mut self, width: u32, height: u32) -> Result<(), String> {
+        unsafe {
+            self.device
+                .wait_for_fences(&[self.in_flight], true, u64::MAX)
+                .map_err(|e| format!("waiting for the presenting frame: {e}"))?;
+            self.device
+                .queue_wait_idle(self.queue)
+                .map_err(|e| format!("waiting for the presenting queue: {e}"))?;
+            if self.swapchain != vk::SwapchainKHR::null() {
+                self.swapchain_loader.destroy_swapchain(self.swapchain, None);
+                self.swapchain = vk::SwapchainKHR::null();
+            }
+            for semaphore in self.render_finished.drain(..) {
+                self.device.destroy_semaphore(semaphore, None);
+            }
+
+            let (format, extent) = surface_format_extent(
+                &self.surface_loader,
+                self.surface,
+                self.physical_device,
+                width,
+                height,
+            )?;
+
+            let caps = self
+                .surface_loader
+                .get_physical_device_surface_capabilities(self.physical_device, self.surface)
+                .map_err(|e| format!("querying surface capabilities: {e}"))?;
+            if !caps
+                .supported_usage_flags
+                .contains(vk::ImageUsageFlags::TRANSFER_DST)
+            {
+                return Err("the presenting device cannot receive image copies".into());
+            }
+            let present_modes = self
+                .surface_loader
+                .get_physical_device_surface_present_modes(self.physical_device, self.surface)
+                .map_err(|e| format!("querying present modes: {e}"))?;
+            let present_mode = if present_modes.contains(&vk::PresentModeKHR::MAILBOX) {
+                vk::PresentModeKHR::MAILBOX
+            } else {
+                vk::PresentModeKHR::FIFO
+            };
+
+            let mut image_count = caps.min_image_count + 1;
+            if caps.max_image_count > 0 && image_count > caps.max_image_count {
+                image_count = caps.max_image_count;
+            }
+            let composite_alpha = if caps
+                .supported_composite_alpha
+                .contains(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            {
+                vk::CompositeAlphaFlagsKHR::OPAQUE
+            } else {
+                vk::CompositeAlphaFlagsKHR::INHERIT
+            };
+            let info = vk::SwapchainCreateInfoKHR::default()
+                .surface(self.surface)
+                .min_image_count(image_count)
+                .image_format(format)
+                .image_color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR)
+                .image_extent(extent)
+                .image_array_layers(1)
+                .image_usage(vk::ImageUsageFlags::TRANSFER_DST)
+                .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .pre_transform(caps.current_transform)
+                .composite_alpha(composite_alpha)
+                .present_mode(present_mode)
+                .clipped(true);
+            self.swapchain = self
+                .swapchain_loader
+                .create_swapchain(&info, None)
+                .map_err(|e| format!("creating the presenting swapchain: {e}"))?;
+            self.images = self
+                .swapchain_loader
+                .get_swapchain_images(self.swapchain)
+                .map_err(|e| format!("getting presenting swapchain images: {e}"))?;
+            let semaphore_info = vk::SemaphoreCreateInfo::default();
+            self.render_finished = (0..self.images.len())
+                .map(|_| {
+                    self.device
+                        .create_semaphore(&semaphore_info, None)
+                        .map_err(|e| format!("creating a presenting semaphore: {e}"))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+
+            self.format = format;
+            self.extent = extent;
+            self.ensure_staging(extent.width as usize * extent.height as usize * 4)
+        }
+    }
+
+    fn ensure_staging(&mut self, size: usize) -> Result<(), String> {
+        if size <= self.staging_size {
+            return Ok(());
+        }
+        unsafe {
+            if !self.staging_mapped.is_null() {
+                self.device.unmap_memory(self.staging_memory);
+                self.staging_mapped = std::ptr::null_mut();
+            }
+            if self.staging_buffer != vk::Buffer::null() {
+                self.device.destroy_buffer(self.staging_buffer, None);
+                self.staging_buffer = vk::Buffer::null();
+            }
+            if self.staging_memory != vk::DeviceMemory::null() {
+                self.device.free_memory(self.staging_memory, None);
+                self.staging_memory = vk::DeviceMemory::null();
+            }
+
+            let buffer_info = vk::BufferCreateInfo::default()
+                .size(size as vk::DeviceSize)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let buffer = self
+                .device
+                .create_buffer(&buffer_info, None)
+                .map_err(|e| format!("creating the presenting staging buffer: {e}"))?;
+            let requirements = self.device.get_buffer_memory_requirements(buffer);
+            let memory_type = self.host_memory_type;
+            let memory = self
+                .device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(requirements.size)
+                        .memory_type_index(memory_type),
+                    None,
+                )
+                .map_err(|e| format!("allocating the presenting staging buffer: {e}"))?;
+            if let Err(e) = self.device.bind_buffer_memory(buffer, memory, 0) {
+                self.device.destroy_buffer(buffer, None);
+                self.device.free_memory(memory, None);
+                return Err(format!("binding the presenting staging buffer: {e}"));
+            }
+            let mapped = match self
+                .device
+                .map_memory(memory, 0, size as vk::DeviceSize, vk::MemoryMapFlags::empty())
+            {
+                Ok(mapped) => mapped as *mut u8,
+                Err(e) => {
+                    self.device.destroy_buffer(buffer, None);
+                    self.device.free_memory(memory, None);
+                    return Err(format!("mapping the presenting staging buffer: {e}"));
+                }
+            };
+            self.staging_buffer = buffer;
+            self.staging_memory = memory;
+            self.staging_mapped = mapped;
+            self.staging_size = size;
+            Ok(())
+        }
+    }
+
+    fn present(&mut self, pixels: &[u8]) -> Result<(), String> {
+        unsafe {
+            self.device
+                .wait_for_fences(&[self.in_flight], true, u64::MAX)
+                .map_err(|e| format!("waiting for the presenting fence: {e}"))?;
+            let (image_index, _suboptimal) = match self.swapchain_loader.acquire_next_image(
+                self.swapchain,
+                u64::MAX,
+                self.image_available,
+                vk::Fence::null(),
+            ) {
+                Ok(value) => value,
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    self.recreate(self.extent.width, self.extent.height)?;
+                    return Ok(());
+                }
+                Err(e) => return Err(format!("acquiring a presenting image: {e}")),
+            };
+            let needed = self.extent.width as usize * self.extent.height as usize * 4;
+            self.ensure_staging(pixels.len().max(needed))?;
+            std::ptr::copy_nonoverlapping(
+                pixels.as_ptr(),
+                self.staging_mapped,
+                pixels.len().min(self.staging_size),
+            );
+
+            self.device
+                .reset_fences(&[self.in_flight])
+                .map_err(|e| format!("resetting the presenting fence: {e}"))?;
+            self.device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| format!("resetting the presenting command buffer: {e}"))?;
+            self.device
+                .begin_command_buffer(
+                    self.command_buffer,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .map_err(|e| format!("beginning the presenting command buffer: {e}"))?;
+
+            let image = self.images[image_index as usize];
+            let range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1);
+            let to_transfer = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(range)
+                .src_access_mask(vk::AccessFlags::NONE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            self.device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_transfer],
+            );
+
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .buffer_row_length(0)
+                .buffer_image_height(0)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .image_offset(vk::Offset3D::default())
+                .image_extent(vk::Extent3D {
+                    width: self.extent.width,
+                    height: self.extent.height,
+                    depth: 1,
+                });
+            self.device.cmd_copy_buffer_to_image(
+                self.command_buffer,
+                self.staging_buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+
+            let to_present = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(range)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::NONE);
+            self.device.cmd_pipeline_barrier(
+                self.command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_present],
+            );
+            self.device
+                .end_command_buffer(self.command_buffer)
+                .map_err(|e| format!("ending the presenting command buffer: {e}"))?;
+
+            let wait = [self.image_available];
+            let stages = [vk::PipelineStageFlags::TRANSFER];
+            let signal = [self.render_finished[image_index as usize]];
+            let command_buffers = [self.command_buffer];
+            let submit = vk::SubmitInfo::default()
+                .wait_semaphores(&wait)
+                .wait_dst_stage_mask(&stages)
+                .command_buffers(&command_buffers)
+                .signal_semaphores(&signal);
+            self.device
+                .queue_submit(self.queue, &[submit], self.in_flight)
+                .map_err(|e| format!("submitting the presenting frame: {e}"))?;
+
+            let swapchains = [self.swapchain];
+            let image_indices = [image_index];
+            let present = vk::PresentInfoKHR::default()
+                .wait_semaphores(&signal)
+                .swapchains(&swapchains)
+                .image_indices(&image_indices);
+            match self.swapchain_loader.queue_present(self.queue, &present) {
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    self.recreate(self.extent.width, self.extent.height)?;
+                }
+                Err(e) => return Err(format!("presenting the offload frame: {e}")),
+                Ok(_) => {}
+            }
+            Ok(())
+        }
+    }
+}
+
+
+impl Drop for Presenter {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            if !self.staging_mapped.is_null() {
+                self.device.unmap_memory(self.staging_memory);
+            }
+            if self.staging_buffer != vk::Buffer::null() {
+                self.device.destroy_buffer(self.staging_buffer, None);
+            }
+            if self.staging_memory != vk::DeviceMemory::null() {
+                self.device.free_memory(self.staging_memory, None);
+            }
+            for semaphore in self.render_finished.drain(..) {
+                self.device.destroy_semaphore(semaphore, None);
+            }
+            if self.image_available != vk::Semaphore::null() {
+                self.device.destroy_semaphore(self.image_available, None);
+            }
+            if self.in_flight != vk::Fence::null() {
+                self.device.destroy_fence(self.in_flight, None);
+            }
+            if self.command_pool != vk::CommandPool::null() {
+                self.device.destroy_command_pool(self.command_pool, None);
+            }
+            if self.swapchain != vk::SwapchainKHR::null() {
+                self.swapchain_loader.destroy_swapchain(self.swapchain, None);
+            }
+            self.device.destroy_device(None);
+        }
+    }
+}
+
+/// `VkSurfaceCapabilitiesKHR`'s format, extent and present mode choice, shared
+/// by the single-device swapchain and the presenting half of an offload pair.
+unsafe fn surface_format_extent(
+    surface_loader: &ash::khr::surface::Instance,
+    surface: vk::SurfaceKHR,
+    physical_device: vk::PhysicalDevice,
+    width: u32,
+    height: u32,
+) -> Result<(vk::Format, vk::Extent2D), String> {
+    let caps = surface_loader
+        .get_physical_device_surface_capabilities(physical_device, surface)
+        .map_err(|e| format!("querying surface capabilities: {e}"))?;
+    let formats = surface_loader
+        .get_physical_device_surface_formats(physical_device, surface)
+        .map_err(|e| format!("querying surface formats: {e}"))?;
+    let format = formats
+        .iter()
+        .find(|f| {
+            f.format == vk::Format::B8G8R8A8_SRGB
+                && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+        })
+        .or_else(|| formats.first())
+        .copied()
+        .ok_or("the surface reports no formats")?;
+    let extent = if caps.current_extent.width != u32::MAX {
+        caps.current_extent
+    } else {
+        vk::Extent2D {
+            width: width.clamp(caps.min_image_extent.width, caps.max_image_extent.width),
+            height: height.clamp(caps.min_image_extent.height, caps.max_image_extent.height),
+        }
+    };
+    Ok((format.format, extent))
+}
+
+/// A graphics-capable device with no requirement that it present, preferring
+/// a discrete one. `exclude` keeps the offload renderer off the display GPU.
+fn pick_render_device(
+    instance: &Instance,
+    exclude: Option<vk::PhysicalDevice>,
+) -> Option<(vk::PhysicalDevice, u32)> {
+    unsafe {
+        let devices = instance.enumerate_physical_devices().ok()?;
+        let mut best: Option<(vk::PhysicalDevice, u32, bool)> = None;
+        for device in devices {
+            if Some(device) == exclude {
+                continue;
+            }
+            let families = instance.get_physical_device_queue_family_properties(device);
+            let Some(family) = families.iter().position(|family| {
+                family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+            }) else {
+                continue;
+            };
+            let properties = instance.get_physical_device_properties(device);
+            if properties.device_type == vk::PhysicalDeviceType::CPU {
+                continue;
+            }
+            let discrete = properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
+            if best.is_none() || (discrete && !best.as_ref().unwrap().2) {
+                best = Some((device, family as u32, discrete));
+            }
+        }
+        best.map(|(device, family, _)| (device, family))
+    }
+}
+
+/// The device that can put a frame on the window. With `exclude` set, the
+/// display device is whichever presentable device is left; integrated is
+/// preferred then, since that is usually the one the display is attached to.
+fn pick_present_device(
+    instance: &Instance,
+    surface_loader: &ash::khr::surface::Instance,
+    surface: vk::SurfaceKHR,
+    exclude: Option<vk::PhysicalDevice>,
+) -> Result<(vk::PhysicalDevice, u32), String> {
+    unsafe {
+        let devices = instance
+            .enumerate_physical_devices()
+            .map_err(|e| format!("enumerating physical devices: {e}"))?;
+
+        let mut best: Option<(vk::PhysicalDevice, u32, i32)> = None;
+        for device in devices {
+            if Some(device) == exclude {
+                continue;
+            }
+            let families = instance.get_physical_device_queue_family_properties(device);
+            let present_family = families.iter().enumerate().find_map(|(index, family)| {
+                if !family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+                    return None;
+                }
+                let supports_present = surface_loader
+                    .get_physical_device_surface_support(device, index as u32, surface)
+                    .unwrap_or(false);
+                let has_formats = !surface_loader
+                    .get_physical_device_surface_formats(device, surface)
+                    .map(|formats| formats.is_empty())
+                    .unwrap_or(true);
+                if supports_present && has_formats {
+                    Some(index as u32)
+                } else {
+                    None
+                }
+            });
+
+            if let Some(family) = present_family {
+                let properties = instance.get_physical_device_properties(device);
+                if exclude.is_some() && properties.device_type == vk::PhysicalDeviceType::CPU {
+                    continue;
+                }
+                let rank = if exclude.is_some() {
+                    if properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU {
+                        2
+                    } else {
+                        1
+                    }
+                } else if properties.device_type == vk::PhysicalDeviceType::DISCRETE_GPU {
+                    2
+                } else {
+                    1
+                };
+                if best.is_none() || rank > best.as_ref().unwrap().2 {
+                    best = Some((device, family, rank));
+                }
+            }
+        }
+
+        best.map(|(device, family, _)| (device, family))
+            .ok_or_else(|| "no Vulkan device can render to this window".into())
+    }
+}
+
 fn pick_device(
     instance: &Instance,
     surface_loader: &ash::khr::surface::Instance,
@@ -2095,6 +3014,8 @@ impl Drop for Vulkan {
             if self.swapchain != vk::SwapchainKHR::null() {
                 self.swapchain_loader.destroy_swapchain(self.swapchain, None);
             }
+            self.destroy_color_target();
+            drop(self.presenter.take());
             self.surface_loader.destroy_surface(self.surface, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
