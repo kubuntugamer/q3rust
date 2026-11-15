@@ -1746,19 +1746,23 @@ impl Vulkan {
             vertices,
             mvp,
             [1.0, 1.0, 0.0, 0.0],
+            [0.0; 4],
             true,
         )
     }
 
     /// Adds one shader stage of a batch to the frame: its own texture, its own
     /// UV transform, its own blend mode, and whether the baked lightmap in the
-    /// vertex colour applies to it.
+    /// vertex colour applies to it. `turb` is `[amplitude, phase, frequency,
+    /// seconds]`, all zero for a stage with no `tcMod turb`.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_stage(
         &mut self,
         texture: &Texture,
         vertices: &[Vertex3D],
         mvp: &[f32; 16],
         uv: [f32; 4],
+        turb: [f32; 4],
         blend: BlendMode,
         lit: bool,
     ) -> Result<(), String> {
@@ -1767,7 +1771,7 @@ impl Vulkan {
             BlendMode::Blend => PipelineKind::Blend,
             BlendMode::Add => PipelineKind::Add,
         };
-        self.draw_world_with(kind, texture, vertices, mvp, uv, lit)
+        self.draw_world_with(kind, texture, vertices, mvp, uv, turb, lit)
     }
 
     fn pipeline_for(&self, kind: PipelineKind) -> vk::Pipeline {
@@ -1793,6 +1797,7 @@ impl Vulkan {
             vertices,
             mvp,
             [1.0, 1.0, 0.0, 0.0],
+            [0.0; 4],
             false,
         )
     }
@@ -1806,6 +1811,7 @@ impl Vulkan {
         vertices: &[Vertex3D],
         mvp: &[f32; 16],
         uv: [f32; 4],
+        turb: [f32; 4],
         lit: bool,
     ) -> Result<(), String> {
         if vertices.is_empty() {
@@ -1837,9 +1843,10 @@ impl Vulkan {
         self.world_used += bytes;
 
         let command_buffer = self.command_buffers[image_index as usize];
-        // The view-projection, the stage's UV transform and the lit flag. The
-        // last vec4's x is 1 for a stage the lightmap must not tint.
-        let mut constants = [0u8; 96];
+        // The view-projection, the stage's UV transform, the lit flag and the
+        // turbulent wave. The last vec4's x is 1 for a stage the lightmap must
+        // not tint; the one after it displaces the coordinates in the shader.
+        let mut constants = [0u8; 112];
         for (index, value) in mvp.iter().enumerate() {
             constants[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
         }
@@ -1848,6 +1855,10 @@ impl Vulkan {
             constants[at..at + 4].copy_from_slice(&value.to_le_bytes());
         }
         constants[80..84].copy_from_slice(&if lit { 0.0f32 } else { 1.0f32 }.to_le_bytes());
+        for (index, value) in turb.iter().enumerate() {
+            let at = 96 + index * 4;
+            constants[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
         unsafe {
             self.device
                 .cmd_bind_pipeline(
@@ -2269,12 +2280,13 @@ impl Vulkan {
                 .create_sampler(&repeat_info, None)
                 .map_err(|e| format!("creating the repeating texture sampler: {e}"))?;
 
-            // 16 bytes for the 2D mapping, 96 for the world's view-projection,
-            // UV transform and lit flag; one range has to cover both pushes.
+            // 16 bytes for the 2D mapping, 112 for the world's view-projection,
+            // UV transform, lit flag and turbulent wave; one range has to cover
+            // both pushes.
             let push_range = vk::PushConstantRange::default()
                 .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
                 .offset(0)
-                .size(96);
+                .size(112);
             self.pipeline_layout = self
                 .device
                 .create_pipeline_layout(

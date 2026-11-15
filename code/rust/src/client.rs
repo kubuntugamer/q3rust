@@ -1818,9 +1818,20 @@ impl Client {
                     stage.uv[2] * seconds,
                     stage.uv[3] * seconds,
                 ];
-                self.renderer
-                    .vk
-                    .draw_stage(texture, vertices, &mvp, uv, stage.blend, stage.lit)?;
+                // The turbulent wave is animated here, since only the clock
+                // changes between frames.
+                let turb = stage.turb.map_or([0.0; 4], |wave| {
+                    [wave.amplitude, wave.phase, wave.frequency, seconds]
+                });
+                self.renderer.vk.draw_stage(
+                    texture,
+                    vertices,
+                    &mvp,
+                    uv,
+                    turb,
+                    stage.blend,
+                    stage.lit,
+                )?;
             }
         }
 
@@ -1832,6 +1843,7 @@ impl Client {
                 &mark,
                 &mvp,
                 [1.0, 1.0, 0.0, 0.0],
+                [0.0; 4],
                 BlendMode::Opaque,
                 true,
             )?;
@@ -1855,6 +1867,7 @@ impl Client {
                 &glow,
                 &mvp,
                 [1.0, 1.0, 0.0, 0.0],
+                [0.0; 4],
                 BlendMode::Add,
                 false,
             )?;
@@ -1870,6 +1883,7 @@ impl Client {
                     &line,
                     &mvp,
                     [1.0, 1.0, 0.0, 0.0],
+                    [0.0; 4],
                     BlendMode::Add,
                     false,
                 )?;
@@ -1884,6 +1898,7 @@ impl Client {
                 &shot,
                 &mvp,
                 [1.0, 1.0, 0.0, 0.0],
+                [0.0; 4],
                 BlendMode::Opaque,
                 true,
             )?;
@@ -1898,6 +1913,7 @@ impl Client {
                     &posts,
                     &mvp,
                     [1.0, 1.0, 0.0, 0.0],
+                    [0.0; 4],
                     BlendMode::Opaque,
                     true,
                 )?;
@@ -1921,6 +1937,7 @@ impl Client {
                                 &surface.vertices,
                                 &placed,
                                 [1.0, 1.0, 0.0, 0.0],
+                                [0.0; 4],
                                 BlendMode::Opaque,
                                 surface.lit,
                             )?;
@@ -1940,6 +1957,7 @@ impl Client {
                 &flying,
                 &mvp,
                 [1.0, 1.0, 0.0, 0.0],
+                [0.0; 4],
                 BlendMode::Opaque,
                 true,
             )?;
@@ -1958,6 +1976,7 @@ impl Client {
                         field.vertices(),
                         &mvp,
                         [1.0, 1.0, 0.0, 0.0],
+                        [0.0; 4],
                         BlendMode::Opaque,
                         true,
                     )?;
@@ -1991,6 +2010,7 @@ impl Client {
                             &surface.vertices,
                             &placed,
                             [1.0, 1.0, 0.0, 0.0],
+                            [0.0; 4],
                             BlendMode::Opaque,
                             surface.lit,
                         )?;
@@ -2020,6 +2040,7 @@ impl Client {
                     &surface.vertices,
                     &fitted,
                     [1.0, 1.0, 0.0, 0.0],
+                    [0.0; 4],
                     BlendMode::Opaque,
                     surface.lit,
                 )?;

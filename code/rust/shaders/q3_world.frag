@@ -9,6 +9,7 @@ layout(push_constant) uniform Push {
     mat4 view_projection;
     vec4 uv_transform;
     vec4 stage_mode;
+    vec4 turbulence;
 } push;
 
 layout(location = 0) in vec2 uv;

@@ -20,8 +20,8 @@ use crate::bsp::{Bsp, BspFace, DrawVert, LIGHTMAP_SIZE, SURFACE_PATCH};
 use crate::items::{self, ItemMark};
 use crate::model::Md3Model;
 use crate::shader::{
-    Parser, ShaderScript, ShaderStage, ShaderTextIndex, TexMod, TextureMap, CONTENTS_FOG,
-    GLS_DSTBLEND_ONE, GLS_SRCBLEND_ONE,
+    Parser, ShaderScript, ShaderStage, ShaderTextIndex, TexMod, TextureMap, WaveForm,
+    CONTENTS_FOG, GLS_DSTBLEND_ONE, GLS_SRCBLEND_ONE,
 };
 use crate::texture;
 use crate::vk::{BlendMode, Texture, Vertex3D, Vulkan};
@@ -219,6 +219,8 @@ pub struct Stage {
     pub blend: BlendMode,
     /// `[scale_s, scale_t, scroll_s, scroll_t]`. Scroll is per second.
     pub uv: [f32; 4],
+    /// The stage's `tcMod turb`, applied in the vertex shader each frame.
+    pub turb: Option<WaveForm>,
     pub lit: bool,
 }
 
@@ -463,6 +465,7 @@ impl World {
                     texture,
                     blend: spec.blend,
                     uv: spec.uv,
+                    turb: spec.turb,
                     lit: spec.lit,
                 });
             }
@@ -947,6 +950,7 @@ struct StageSpec {
     image: String,
     blend: BlendMode,
     uv: [f32; 4],
+    turb: Option<WaveForm>,
     lit: bool,
 }
 
@@ -963,6 +967,7 @@ fn stage_list(index: &ShaderTextIndex, name: &str) -> Vec<StageSpec> {
                 image: image.to_string(),
                 blend: blend_mode(stage.state_bits),
                 uv: stage_transform(&stage.bundle.tex_mods),
+                turb: stage_turbulence(&stage.bundle.tex_mods),
                 // Only the first pass carries the surface's lightmap.
                 lit: stages.is_empty(),
             });
@@ -976,10 +981,21 @@ fn stage_list(index: &ShaderTextIndex, name: &str) -> Vec<StageSpec> {
             image: name.to_string(),
             blend: BlendMode::Opaque,
             uv: [1.0, 1.0, 0.0, 0.0],
+            turb: None,
             lit: true,
         });
     }
     stages
+}
+
+/// The first `tcMod turb` on a stage. The C applies every texmod in slot
+/// order; turbulence is the only one that displaces the coordinates per
+/// vertex here, so one wave is all the vertex shader carries.
+fn stage_turbulence(tex_mods: &[TexMod]) -> Option<WaveForm> {
+    tex_mods.iter().find_map(|tex_mod| match tex_mod {
+        TexMod::Turbulent { wave } => Some(*wave),
+        _ => None,
+    })
 }
 
 /// The image a stage draws with. The lightmap is already in the vertex colour
@@ -1007,8 +1023,8 @@ fn blend_mode(state_bits: u32) -> BlendMode {
 }
 
 /// The stage's static texture-coordinate transform: scale and per-second
-/// scroll. Rotation, turbulent and stretch need the clock per vertex and are
-/// not applied yet.
+/// scroll. Rotation and stretch need the clock per vertex and are not applied
+/// yet; turbulence is, in the vertex shader.
 fn stage_transform(tex_mods: &[TexMod]) -> [f32; 4] {
     let mut scale = [1.0f32, 1.0];
     let mut scroll = [0.0f32, 0.0];
@@ -1687,6 +1703,32 @@ mod tests {
         assert!(sky_outerbox(&shader_index(&[script.to_string()]), "textures/stone").is_none());
         // A name that is not in the scripts at all is equally absent.
         assert!(sky_outerbox(&shader_index(&[script.to_string()]), "textures/other").is_none());
+    }
+
+    #[test]
+    fn a_turbulent_shader_stage_carries_its_wave() {
+        let script = "textures/liquid/test\n{\n {\n  map textures/liquid/test.tga\n  tcMod turb 0 .2 0 9\n }\n}\n";
+        let stages = stage_list(&shader_index(&[script.to_string()]), "textures/liquid/test");
+        assert_eq!(stages.len(), 1);
+        let wave = stages[0].turb.expect("tcMod turb should reach the stage");
+        assert!((wave.amplitude - 0.2).abs() < 1e-6, "{}", wave.amplitude);
+        assert!((wave.frequency - 9.0).abs() < 1e-6, "{}", wave.frequency);
+    }
+
+    #[test]
+    fn a_stage_with_turbulence_keeps_its_wave() {
+        let wave = WaveForm {
+            amplitude: 0.02,
+            phase: 1.5,
+            frequency: 0.5,
+            ..Default::default()
+        };
+        let mods = [
+            TexMod::Scroll { scroll: [1.0, 0.0] },
+            TexMod::Turbulent { wave },
+        ];
+        assert_eq!(stage_turbulence(&mods), Some(wave));
+        assert!(stage_turbulence(&[TexMod::Scroll { scroll: [1.0, 0.0] }]).is_none());
     }
 
     #[test]
