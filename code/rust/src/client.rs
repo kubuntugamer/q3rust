@@ -1426,6 +1426,14 @@ impl Client {
              cg_fov widens with the aspect ratio; the vertical view stays 4:3",
         );
         console::print(&banner);
+        // `Q3_CONSOLE=0` starts with the console closed, so a windowed run
+        // shows the map instead of the log.
+        if matches!(
+            std::env::var("Q3_CONSOLE").as_deref(),
+            Ok("0") | Ok("closed") | Ok("off")
+        ) {
+            console::lock().set_open(false);
+        }
 
         Ok(Client {
             _sdl: sdl,
@@ -1784,7 +1792,20 @@ impl Client {
         };
 
         let origin = prediction.origin();
-        let camera = Camera {
+        // `Q3_CAM="x y z yaw pitch"` pins the eye so a run can be compared
+        // with another; the predicted player keeps playing underneath.
+        let fixed_camera = std::env::var("Q3_CAM").ok().and_then(|text| {
+            let values: Vec<f32> = text
+                .split_whitespace()
+                .filter_map(|value| value.parse().ok())
+                .collect();
+            (values.len() == 5).then(|| Camera {
+                origin: [values[0], values[1], values[2]],
+                yaw: values[3],
+                pitch: values[4],
+            })
+        });
+        let camera = fixed_camera.unwrap_or(Camera {
             origin: [
                 origin[0],
                 origin[1],
@@ -1792,7 +1813,7 @@ impl Client {
             ],
             yaw: prediction.yaw(),
             pitch: prediction.pitch(),
-        };
+        });
         let fov = self
             .cvars
             .find("cg_fov")
