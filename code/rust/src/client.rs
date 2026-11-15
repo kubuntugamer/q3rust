@@ -1382,6 +1382,10 @@ impl Client {
             ),
             None => "game data: none mounted".to_string(),
         };
+        // Also on stdout: the in-game console is not visible to a logged or
+        // automated run, and the renderer line carries the offload transfer
+        // mode.
+        println!("renderer: Vulkan, {}", renderer.device_name());
         let mut banner = format!(
             "Quake III Arena - Rust client {}\nrenderer: Vulkan, {}\n{audio_line}\n{data_line}\
              \n{display_line}\n",
