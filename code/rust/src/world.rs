@@ -335,6 +335,9 @@ pub struct Batch {
     pub deforms: Vec<DeformStage>,
     /// `shader.sort`: opaque batches first, then decals, then blends.
     pub sort: i32,
+    /// `deformVertexes autosprite`: every quad in the batch is rebuilt as a
+    /// camera-facing square.
+    pub autosprite: bool,
 }
 
 /// `rgbGen wave` and `alphaGen wave`: the colour a stage draws with, taken
@@ -376,6 +379,71 @@ pub fn deform_vertices(
         }
     }
     moved
+}
+
+/// `AutospriteDeform`: every quad of four vertices is rebuilt around its own
+/// midpoint as a square in the camera's right/up plane, so a flare always
+/// faces the eye. The triangles keep their winding and their place in the
+/// texture by carrying their corner's uv across to the new square.
+///
+/// The quads are neither square nor a unit in uv in every map, so the corners
+/// are found from the uv bounds rather than assumed to be 0..1.
+///
+/// `radius` is the C's `0.707 * |corner - midpoint|`, which makes the square
+/// the same size as the quad it replaces.
+pub fn autosprite(vertices: &[Vertex3D], right: [f32; 3], up: [f32; 3]) -> Vec<Vertex3D> {
+    let mut out = vertices.to_vec();
+    for quad in out.chunks_mut(6) {
+        if quad.len() < 6 {
+            break;
+        }
+        let mut corners: Vec<[f32; 3]> = Vec::with_capacity(4);
+        for vertex in quad.iter() {
+            if !corners.iter().any(|corner| corner == &vertex.pos) {
+                corners.push(vertex.pos);
+            }
+        }
+        if corners.len() < 3 {
+            continue;
+        }
+        let scale = 1.0 / corners.len() as f32;
+        let mut mid = [0.0f32; 3];
+        for corner in &corners {
+            for axis in 0..3 {
+                mid[axis] += corner[axis] * scale;
+            }
+        }
+        let delta = [
+            corners[0][0] - mid[0],
+            corners[0][1] - mid[1],
+            corners[0][2] - mid[2],
+        ];
+        let radius = (delta[0] * delta[0]
+            + delta[1] * delta[1]
+            + delta[2] * delta[2])
+            .sqrt()
+            * 0.707;
+
+        let (mut u_min, mut u_max) = (f32::INFINITY, f32::NEG_INFINITY);
+        let (mut v_min, mut v_max) = (f32::INFINITY, f32::NEG_INFINITY);
+        for vertex in quad.iter() {
+            u_min = u_min.min(vertex.uv[0]);
+            u_max = u_max.max(vertex.uv[0]);
+            v_min = v_min.min(vertex.uv[1]);
+            v_max = v_max.max(vertex.uv[1]);
+        }
+        let u_span = (u_max - u_min).max(1e-6);
+        let v_span = (v_max - v_min).max(1e-6);
+
+        for vertex in quad.iter_mut() {
+            let s = (vertex.uv[0] - u_min) / u_span * 2.0 - 1.0;
+            let t = (vertex.uv[1] - v_min) / v_span * 2.0 - 1.0;
+            for axis in 0..3 {
+                vertex.pos[axis] = mid[axis] + right[axis] * radius * s + up[axis] * radius * t;
+            }
+        }
+    }
+    out
 }
 
 /// `deformVertexes wave`: a vertex moves along its own normal by the wave's
@@ -686,6 +754,7 @@ impl World {
             }
 
             let deforms = shader_deforms(&index, &name);
+            let autosprite = shader_autosprite(&index, &name);
             let sort = batch_sort(&index, &name, &specs);
             let first = world.vertices.len();
             let count = vertices.len();
@@ -696,6 +765,7 @@ impl World {
                 stages,
                 deforms,
                 sort,
+                autosprite,
             });
         }
 
@@ -1191,6 +1261,19 @@ fn batch_sort(index: &ShaderTextIndex, name: &str, stages: &[StageSpec]) -> i32 
 
 /// The shader's deformations this renderer applies. The other kinds are not
 /// applied yet.
+/// Whether the shader asks for `deformVertexes autosprite`, which rebuilds
+/// every quad to face the eye.
+fn shader_autosprite(index: &ShaderTextIndex, name: &str) -> bool {
+    shader_script(index, name)
+        .map(|script| {
+            script
+                .deforms
+                .iter()
+                .any(|deform| deform.deform == Deform::Autosprite)
+        })
+        .unwrap_or(false)
+}
+
 fn shader_deforms(index: &ShaderTextIndex, name: &str) -> Vec<DeformStage> {
     shader_script(index, name)
         .map(|script| {
@@ -1574,8 +1657,8 @@ pub fn projection(aspect: f32, fov_x_degrees: f32) -> [f32; 16] {
     matrix
 }
 
-/// The view matrix for a camera: rows are right, up and back.
-pub fn view(camera: &Camera) -> [f32; 16] {
+/// The camera's right and up axes, the basis a sprite is built in.
+pub fn camera_axes(camera: &Camera) -> ([f32; 3], [f32; 3]) {
     let (sin_yaw, cos_yaw) = camera.yaw.to_radians().sin_cos();
     let (sin_pitch, cos_pitch) = camera.pitch.to_radians().sin_cos();
 
@@ -1590,6 +1673,20 @@ pub fn view(camera: &Camera) -> [f32; 16] {
         right[2] * forward[0] - right[0] * forward[2],
         right[0] * forward[1] - right[1] * forward[0],
     ];
+    (right, up)
+}
+
+/// The view matrix for a camera: rows are right, up and back.
+pub fn view(camera: &Camera) -> [f32; 16] {
+    let (sin_yaw, cos_yaw) = camera.yaw.to_radians().sin_cos();
+    let (sin_pitch, cos_pitch) = camera.pitch.to_radians().sin_cos();
+
+    let forward = [
+        cos_pitch * cos_yaw,
+        cos_pitch * sin_yaw,
+        -sin_pitch,
+    ];
+    let (right, up) = camera_axes(camera);
     let eye = camera.origin;
 
     let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -2327,6 +2424,39 @@ mod tests {
         // The unstretched wave is flat across the surface.
         let flat = deform_vertices(&vertices, &[deform], 0.0);
         assert_eq!(flat[0].pos[2], 3.0);
+    }
+
+    #[test]
+    fn an_autosprite_quad_turns_to_face_the_camera() {
+        // A quad lying flat on the floor, two units across.
+        let corner = |x: f32, y: f32| Vertex3D {
+            pos: [x, 0.0, y],
+            uv: [(x + 1.0) * 0.5, (y + 1.0) * 0.5],
+            color: [255; 4],
+            normal: [0.0, 1.0, 0.0],
+        };
+        let quad = [
+            corner(-1.0, -1.0),
+            corner(1.0, -1.0),
+            corner(1.0, 1.0),
+            corner(-1.0, -1.0),
+            corner(1.0, 1.0),
+            corner(-1.0, 1.0),
+        ];
+
+        // Looking along +y, so the sprite is built in the x/z plane.
+        let sprite = autosprite(&quad, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
+        for vertex in &sprite {
+            assert!(vertex.pos[1].abs() < 1e-6, "{:?}", vertex.pos);
+        }
+        let xs: Vec<f32> = sprite.iter().map(|vertex| vertex.pos[0]).collect();
+        let zs: Vec<f32> = sprite.iter().map(|vertex| vertex.pos[2]).collect();
+        // `0.707` is the C's truncation of half of sqrt(2), so the square is
+        // a hair under the original quad's size.
+        assert!((xs.iter().cloned().fold(f32::MIN, f32::max) - 1.0).abs() < 1e-3);
+        assert!((xs.iter().cloned().fold(f32::MAX, f32::min) + 1.0).abs() < 1e-3);
+        assert!((zs.iter().cloned().fold(f32::MAX, f32::min) + 1.0).abs() < 1e-3);
+        assert!((zs.iter().cloned().fold(f32::MIN, f32::max) - 1.0).abs() < 1e-3);
     }
 
     #[test]

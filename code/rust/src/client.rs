@@ -1800,6 +1800,8 @@ impl Client {
         let (width, height) = self.renderer.size();
         let aspect = width as f32 / height.max(1) as f32;
         let mvp = world::view_projection(&camera, aspect, fov);
+        // Sprites are rebuilt in the eye's own plane, which turns with it.
+        let (camera_right, camera_up) = world::camera_axes(&camera);
         // `tcGen environment` reflects about the eye, which moved this frame.
         self.renderer.vk.set_view_origin(camera.origin);
 
@@ -1820,6 +1822,13 @@ impl Client {
             } else {
                 moved = world::deform_vertices(source, &batch.deforms, seconds);
                 moved.as_slice()
+            };
+            let sprited;
+            let vertices = if batch.autosprite {
+                sprited = world::autosprite(vertices, camera_right, camera_up);
+                sprited.as_slice()
+            } else {
+                vertices
             };
             for stage in &batch.stages {
                 let (_, texture) = &world.textures()[stage.texture_index(seconds)];
