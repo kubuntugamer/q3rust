@@ -649,6 +649,16 @@ impl Vulkan {
                 .map_err(|e| format!("ending the command buffer: {e}"))?;
 
             if self.presenter.is_some() {
+                if self.zero_copy {
+                    // The presenter reads the exported image on its own device.
+                    // Let it finish that read before this device overwrites the
+                    // image, but not before: waiting here instead of after the
+                    // present lets the other GPU copy frame N while this one
+                    // draws frame N + 1.
+                    if let Some(presenter) = self.presenter.as_mut() {
+                        presenter.wait_for_present()?;
+                    }
+                }
                 let command_buffers = [command_buffer];
                 let submit = vk::SubmitInfo::default().command_buffers(&command_buffers);
                 self.device
@@ -3211,13 +3221,18 @@ impl Presenter {
                 Ok(_) => {}
             }
             self.dmabuf_ready = true;
+            Ok(())
+        }
+    }
 
-            // The render device will draw the next frame into the same image,
-            // so the copy must finish before this returns.
+    /// Waits for the last DMA-BUF copy to finish reading the imported image.
+    /// The render device calls this before it overwrites the image, which is a
+    /// frame later than the copy itself, so the wait usually returns at once.
+    fn wait_for_present(&mut self) -> Result<(), String> {
+        unsafe {
             self.device
                 .wait_for_fences(&[self.in_flight], true, u64::MAX)
-                .map_err(|e| format!("waiting for the presenting copy: {e}"))?;
-            Ok(())
+                .map_err(|e| format!("waiting for the presenting copy: {e}"))
         }
     }
 
